@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Capture & Inspect",
+  "version": "1.2.0",
+  "description": "Clean full-page screenshots, an element inspector that copies AI-ready style context, and a palette extractor that pulls a site's colors as design tokens.",
+  "permissions": ["activeTab", "scripting", "storage", "unlimitedStorage", "clipboardWrite"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Capture full-page screenshot",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
