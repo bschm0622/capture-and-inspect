@@ -61,6 +61,8 @@ async function checkSite(site) {
   const cap = await captureSite(ext.dir, site, { headless: !args.headed, timeoutMs: args.timeout * 1000 });
   const rec = {
     host: site.host, url: site.url, pass: false, durationMs: cap.durationMs,
+    // From the start: page loaded, and capture returned (load + prepare + tiles).
+    phases: cap.phases || null,
     tileCount: cap.tileCount ?? null, error: cap.error || null, navRetry: cap.navRetry || null,
     checks: {}, browserVersion: cap.browserVersion
   };
