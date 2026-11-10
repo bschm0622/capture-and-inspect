@@ -69,6 +69,25 @@ async function runCapture(tab) {
   notify({ phase: 'prepare' });
 
   try {
+    // Switch off GSAP ScrollTrigger before measuring the page. Pinned
+    // scroll-storytelling sections add screens of scroll distance, so tiling
+    // through them repeats the same section. Runs in the page's own world
+    // because ScrollTrigger lives on the page's window, not the extension's.
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: 'MAIN',
+      func: unpinScrollAnimations
+    }).catch(() => {});
+
+    // Stop auto-advancing carousels. A hero slideshow that changes slide
+    // while the tiles are being shot (the Children's Museum turns every 7s)
+    // shows one slide above the seam and another below it.
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: 'MAIN',
+      func: stopCarousels
+    }).catch(() => {});
+
     // Inject the page-side worker (activeTab grant covers this tab).
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -96,10 +115,17 @@ async function runCapture(tab) {
     );
     const ctx = canvas.getContext('2d');
 
+    // Some headers shrink once the page scrolls, and Chrome then moves the
+    // scroll position to keep the same content in view. `shift` tracks how far
+    // the page has moved that way, so tiles keep landing where they belong in
+    // the original layout instead of leaving a gap or overlapping.
+    let shift = 0;
     for (let i = 0; i < tileCount; i++) {
-      const requestedY = Math.min(i * viewportHeight, maxScroll);
+      const requestedY = Math.max(0, Math.min(i * viewportHeight, maxScroll) - shift);
       const res = await sendToTab(tab.id, { cmd: 'tile', y: requestedY, index: i, total: tileCount });
       if (!res || !res.ok) throw new Error(res && res.error || 'tile failed');
+      const clampedAtBottom = res.actualY >= res.pageHeight - viewportHeight - 1;
+      if (res.actualY !== requestedY && !clampedAtBottom) shift += requestedY - res.actualY;
 
       setBadge(`${i + 1}/${tileCount}`, '#555');
       notify({ phase: 'tile', index: i, total: tileCount });
@@ -109,7 +135,7 @@ async function runCapture(tab) {
 
       // captureVisibleTab returns device pixels (vh*dpr tall). Place the tile
       // at the actual scroll offset, rescaled to our output scale.
-      const destY = Math.round(res.actualY * scale);
+      const destY = Math.round((res.actualY + shift) * scale);
       const destH = Math.round(bmp.height * (scale / dpr));
       const destW = Math.round(bmp.width * (scale / dpr));
       ctx.drawImage(bmp, 0, 0, bmp.width, bmp.height, 0, destY, destW, destH);
@@ -123,7 +149,11 @@ async function runCapture(tab) {
 
     let host = 'page';
     try { host = new URL(tab.url).hostname; } catch (_) {}
-    const date = new Date().toISOString().slice(0, 10);
+    // Local date, not UTC: an evening capture shouldn't be named for tomorrow.
+    const now = new Date();
+    const date = [now.getFullYear(), now.getMonth() + 1, now.getDate()]
+      .map((n) => String(n).padStart(2, '0'))
+      .join('-');
     const baseName = `${host}_${date}`;
 
     // Hand the stitched image to the editor tab, which handles crop, format
@@ -202,6 +232,74 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 chrome.action.onClicked.addListener((tab) => { runCapture(tab); });
+
+// Injected into the page (MAIN world), so it must be self-contained. Kills
+// every ScrollTrigger, which removes pin spacers and puts pinned sections
+// back in normal flow, then jumps each animation to its end state so the
+// capture shows the finished design. Smooth-scroll libraries go too, since
+// they fight the tile-by-tile scrolling. The page stays this way until it
+// reloads.
+function unpinScrollAnimations() {
+  const ST = window.ScrollTrigger ||
+    (window.gsap && window.gsap.core && window.gsap.core.globals().ScrollTrigger);
+  if (ST) {
+    const triggers = ST.getAll();
+    const animations = triggers.map((t) => t.animation).filter(Boolean);
+    triggers.forEach((t) => t.kill(true, true));
+    animations.forEach((a) => a.progress(1));
+  }
+  for (const s of [window.lenis, window.__lenis, window.locomotiveScroll]) {
+    if (s && typeof s.destroy === 'function') s.destroy();
+  }
+  window.scrollTo(0, 0);
+  return ST ? ST.getAll().length : -1;
+}
+
+function stopCarousels() {
+  let stopped = 0;
+  const attempt = (fn) => { try { if (fn() !== false) stopped++; } catch (e) {} };
+
+  if (window.UIkit) {
+    document.querySelectorAll('[uk-slideshow], [data-uk-slideshow], [uk-slider], [data-uk-slider]').forEach((el) => {
+      const c = UIkit.getComponent(el, 'slideshow') || UIkit.getComponent(el, 'slider');
+      if (!c) return;
+      attempt(() => {
+        c.autoplay = false;
+        if (c.$props) c.$props.autoplay = false;
+        c.stopAutoplay();
+      });
+    });
+  }
+
+  document.querySelectorAll('.swiper, .swiper-container, swiper-container').forEach((el) => {
+    if (el.swiper && el.swiper.autoplay) attempt(() => el.swiper.autoplay.stop());
+  });
+
+  const $ = window.jQuery;
+  if ($ && $.fn) {
+    if ($.fn.slick) attempt(() => $('.slick-initialized').slick('slickPause'));
+    if ($.fn.owlCarousel) attempt(() => $('.owl-carousel').trigger('stop.owl.autoplay'));
+  }
+
+  if (window.Flickity) {
+    document.querySelectorAll('.flickity-enabled').forEach((el) => {
+      const f = window.Flickity.data(el);
+      if (f) attempt(() => f.stopPlayer());
+    });
+  }
+
+  // Anything else: press a visible pause button that belongs to a carousel.
+  const carousel = '[aria-roledescription="carousel"], [class*="slide" i], [class*="carousel" i], [class*="swiper" i], [class*="splide" i], [class*="glide" i]';
+  document.querySelectorAll('button, [role="button"]').forEach((btn) => {
+    const label = `${btn.getAttribute('aria-label') || ''} ${btn.getAttribute('title') || ''} ${btn.textContent || ''}`.trim();
+    if (!/^(pause|stop)\b/i.test(label) || !btn.closest(carousel)) return;
+    const r = btn.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return;
+    attempt(() => { btn.click(); btn.blur(); });
+  });
+
+  return stopped;
+}
 
 function blobToDataUrl(blob) {
   return new Promise((resolve, reject) => {
