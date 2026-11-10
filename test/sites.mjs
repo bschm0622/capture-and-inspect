@@ -10,7 +10,7 @@
 // generic detectors.
 
 import { seams, repeatedOverlays, boundaries } from './lib/detectors.mjs';
-import { flatShare, findStrip, seamRepeats, showsIn, inkLevel, result } from './lib/regions.mjs';
+import { flatShare, findStrip, seamRepeats, showsIn, inkLevel, textContrast, result } from './lib/regions.mjs';
 import { cols } from './lib/image.mjs';
 
 // Floating extras (cookie banners, popups, promo and widget buttons) found on
@@ -488,6 +488,83 @@ export const SITES = [
       // The fixed header must still head the capture.
       'fixed-nav-kept': navKept
     }
+  },
+  {
+    // WP Rocket holds the page's scripts until the first mouse move, and
+    // with them the lazy section backgrounds and the map.
+    host: 'roofingbymidsouth.com',
+    url: 'https://roofingbymidsouth.com',
+    collect: () => {
+      const R = (el) => { const r = el.getBoundingClientRect(); return { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; };
+      const luma = (c) => { const m = c.match(/[\d.]+/g).map(Number); return Math.round((m[0] * 77 + m[1] * 150 + m[2] * 29) / 256); };
+      const find = (re) => {
+        const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        for (let n; (n = walk.nextNode());) if (re.test(n.textContent) && n.parentElement.getBoundingClientRect().height > 0) return n.parentElement;
+        return null;
+      };
+      const texts = [
+        ['storm process card', /roofing experts thoroughly inspect/i],
+        ['insurance claims section', /Once we take on a project/i],
+        ['contact section', /Nashville roofers is eager/i]
+      ].map(([what, re]) => { const el = find(re); return el ? { what, ...R(el), luma: luma(getComputedStyle(el).color) } : { what, missing: true }; });
+      let sec = [...document.querySelectorAll('h1, h2, h3, h4')].find((e) => /areas we serve/i.test(e.textContent) && e.getBoundingClientRect().height > 0);
+      while (sec && sec.parentElement && sec.getBoundingClientRect().width < innerWidth * 0.9) sec = sec.parentElement;
+      return { texts, areas: sec ? R(sec) : null };
+    },
+    checks: {
+      // The white text sits on a lazily loaded background photo or dark
+      // panel; with the loader asleep it was white on the white page.
+      'text-on-missing-background'({ img, facts }) {
+        const ts = facts.texts || [];
+        if (!ts.length) return result(false, null, 'no texts collected');
+        const flags = [];
+        const parts = ts.map((t) => {
+          if (t.missing) { flags.push({ y0: 0, y1: 0, note: `${t.what} text not found on the page` }); return `${t.what} missing`; }
+          const c = textContrast(img, t, t.luma);
+          if (c == null || c < 0.25) flags.push({ y0: t.top, y1: t.top + t.h, note: `${t.what}: ${Math.round((c || 0) * 100)}% of the box differs from the text colour` });
+          return `${t.what} ${Math.round((c || 0) * 100)}%`;
+        });
+        return result(flags.length === 0, flags.length, `share of each text box that differs from its text colour: ${parts.join(', ')} (fail under 25%)`, flags);
+      },
+      // The service-area map fills the right half of "Areas we serve".
+      'map-missing'({ img, facts }) {
+        const a = facts.areas;
+        if (!a) return result(false, null, '"Areas we serve" section not found on the page');
+        const f = flatShare(img, { y0: a.top, y1: a.top + a.h, x: a.left + a.w * 0.6, w: a.w * 0.4 });
+        return result(f < 0.5, +f.toFixed(2), `${Math.round(f * 100)}% of rows flat beside the area list (fail at 50%)`, f < 0.5 ? [] : [{ y0: a.top, y1: a.top + a.h, note: 'map missing' }]);
+      }
+    }
+  },
+  {
+    // A delay loader (fmlightning) holds the scripts that reveal most
+    // sections and draw the reviews widget until the first mouse move.
+    host: 'www.semperfiheatingcooling.com',
+    url: 'https://www.semperfiheatingcooling.com',
+    collect: () => {
+      const R = (el) => { const r = el.getBoundingClientRect(); return { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; };
+      const head = (re) => [...document.querySelectorAll('h1, h2, h3, h4')].find((e) => re.test(e.textContent) && e.getBoundingClientRect().width > 0);
+      const who = head(/Trusted HVAC & Plumbing Solutions/i);
+      const rev = head(/Reviews from Your Satisfied Neighbors/i);
+      let panel = rev;
+      while (panel && panel.parentElement && panel.getBoundingClientRect().height < 350) panel = panel.parentElement;
+      return { who: who ? R(who) : null, reviews: rev ? { head: R(rev), panel: R(panel) } : null };
+    },
+    checks: {
+      // "Who we are": the heading stayed invisible, waiting for its reveal.
+      'section-text-missing'({ img, facts }) {
+        if (!facts.who) return result(false, null, '"Trusted HVAC & Plumbing Solutions" heading not found on the page');
+        const ink = inkLevel(img, facts.who);
+        return result(ink != null && ink < 128, ink, `darkest 2% of the heading box at luma ${ink} (fail at 128 or lighter)`, ink != null && ink < 128 ? [] : [{ y0: facts.who.top, y1: facts.who.top + facts.who.h, note: 'heading missing' }]);
+      },
+      // The reviews widget left its panel empty below the heading.
+      'reviews-widget-empty'({ img, facts }) {
+        const r = facts.reviews;
+        if (!r) return result(false, null, 'reviews heading not found on the page');
+        const y0 = r.head.top + r.head.h + 10, y1 = r.panel.top + r.panel.h;
+        const f = flatShare(img, { y0, y1, x: r.panel.left, w: r.panel.w * 0.55 });
+        return result(f != null && f < 0.6, f == null ? null : +f.toFixed(2), `${Math.round((f || 0) * 100)}% of rows flat in the left of the reviews panel (fail at 60%)`, f != null && f < 0.6 ? [] : [{ y0, y1, note: 'reviews empty' }]);
+      }
+    }
   }
 ];
 
@@ -512,6 +589,10 @@ export const KNOWN = {
   'carousel-kept-rotating': 'Carousel kept rotating during the capture',
   'background-follows-section': 'Page background recoloured by scroll, cut at a tile edge',
   'floating-extras-captured': 'Cookie banner, popup or floating button captured over the page',
-  'fixed-nav-kept': 'Fixed site header hidden along with the floating extras'
+  'fixed-nav-kept': 'Fixed site header hidden along with the floating extras',
+  'text-on-missing-background': 'Scripts held until the first mouse move: white text on a background that never loaded',
+  'map-missing': 'Scripts held until the first mouse move: the map never loaded',
+  'section-text-missing': 'Scripts held until the first mouse move: a section never revealed',
+  'reviews-widget-empty': 'Scripts held until the first mouse move: the reviews widget stayed empty'
 };
 

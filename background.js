@@ -423,6 +423,15 @@ async function runCapture(tab) {
   notify({ phase: 'prepare' });
 
   try {
+    // Inject the page-side worker (activeTab grant covers this tab) and let
+    // it wake the page first: scripts held back until the first mouse move
+    // start carousels and scroll animations the steps below must see.
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['content.js']
+    });
+    await sendToTab(tab.id, { cmd: 'wake' }).catch(() => {});
+
     // Switch off GSAP ScrollTrigger before measuring the page. Pinned
     // scroll-storytelling sections add screens of scroll distance, so tiling
     // through them repeats the same section. Runs in the page's own world
@@ -441,12 +450,6 @@ async function runCapture(tab) {
       world: 'MAIN',
       func: stopCarousels
     }).catch(() => {});
-
-    // Inject the page-side worker (activeTab grant covers this tab).
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ['content.js']
-    });
 
     const info = await sendToTab(tab.id, { cmd: 'prepare' });
     if (!info || !info.ok) throw new Error(info && info.error || 'prepare failed');

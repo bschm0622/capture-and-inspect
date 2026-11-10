@@ -14,6 +14,8 @@
   // JS-driven scroll animations (framer-motion springs, GSAP) aren't sped up
   // by the CSS duration clamp, so give each tile enough time to settle.
   const SETTLE_GRACE_MS = 550;
+  // Longest a pre-scroll stop waits for the images it brought on screen.
+  const PRESCROLL_IMAGES_MS = 300;
 
   const scroller = document.scrollingElement || document.documentElement;
   let originalScrollY = 0;
@@ -95,22 +97,144 @@
     });
   }
 
-  // Wait for images currently intersecting the viewport to finish loading.
+  // Wait for images on screen to finish loading: <img> (whichever source a
+  // <picture> or srcset picked) and CSS background images, which lazy
+  // loaders such as WP Rocket's set only once a section scrolls into view.
+  // An image that already failed is done; waiting on it would only cost
+  // the timeout. A background is looked up through an Image with the same
+  // URL, which is complete at once when the browser already has it.
   async function waitForVisibleImages(timeoutMs = 1500) {
     const vh = window.innerHeight;
-    const imgs = Array.from(document.images).filter((img) => {
-      const r = img.getBoundingClientRect();
-      return r.bottom > 0 && r.top < vh && r.width > 0;
+    const vw = document.documentElement.clientWidth;
+    // Across as well as down: a slider's off-screen slides sit beside the
+    // screen, and their lazy images don't load until the slide comes in.
+    const onScreen = (el) => {
+      const r = el.getBoundingClientRect();
+      return r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw && r.width > 0 && r.height > 0;
+    };
+    const loaded = (img) => new Promise((resolve) => {
+      img.addEventListener('load', resolve, { once: true });
+      img.addEventListener('error', resolve, { once: true });
     });
-    const pending = imgs
-      .filter((img) => !img.complete || img.naturalWidth === 0)
-      .map((img) => new Promise((resolve) => {
-        const done = () => resolve();
-        img.addEventListener('load', done, { once: true });
-        img.addEventListener('error', done, { once: true });
-      }));
+    const pending = Array.from(document.images)
+      .filter((img) => !img.complete && onScreen(img))
+      .map(loaded);
+    const urls = new Set();
+    allElements().forEach((el) => {
+      const bg = getComputedStyle(el).backgroundImage;
+      if (bg === 'none' || !bg.includes('url(') || !onScreen(el)) return;
+      for (const m of bg.matchAll(/url\(["']?([^"')]+)["']?\)/g)) {
+        if (!m[1].startsWith('data:')) urls.add(m[1]);
+      }
+    });
+    for (const url of urls) {
+      const probe = new Image();
+      probe.src = url;
+      if (!probe.complete) pending.push(loaded(probe));
+    }
     if (!pending.length) return;
     await Promise.race([Promise.all(pending), sleep(timeoutMs)]);
+  }
+
+  // Script types the browser runs or that only hold data. A script of any
+  // other type on a page is one a loader is holding back (WP Rocket's
+  // text/rocketlazyloadscript, NitroPack, Perfmatters, LiteSpeed); the
+  // loader swaps it for a runnable copy when it lets it go.
+  const RUNNABLE = /^(|text\/javascript|application\/javascript|text\/ecmascript|application\/ecmascript|module|importmap|speculationrules|application\/(ld\+)?json)$/i;
+  const heldScripts = () => Array.from(document.scripts).filter((s) => !RUNNABLE.test((s.type || '').trim())).length;
+
+  // Where to point the wake-up mouse: over plain page content, so nothing
+  // a script hovers there afterwards (some loaders tell the element under
+  // the mouse that it entered once their scripts are in) opens a menu or
+  // lights up a button in the capture.
+  function restingPoint() {
+    const vw = document.documentElement.clientWidth;
+    const vh = window.innerHeight;
+    const live = 'a, button, input, select, textarea, label, summary, iframe, video, [role="button"], [role="menuitem"], [role="tab"], [tabindex], [onmouseover], nav, header, [role="navigation"], [role="banner"]';
+    const spots = [[0.5, 0.5], [0.5, 0.75], [0.25, 0.6], [0.75, 0.6], [0.5, 0.9], [0.1, 0.5]];
+    for (const [fx, fy] of spots) {
+      const x = Math.round(vw * fx), y = Math.round(vh * fy);
+      const el = document.elementFromPoint(x, y);
+      if (el && !el.closest(live) && !pinnedToScreen(el)) return { el, x, y };
+    }
+    return { el: document.body, x: Math.round(vw / 2), y: Math.round(vh / 2) };
+  }
+
+  // Many sites hold back scripts, and with them carousels, review widgets,
+  // maps, entrance reveals and lazy backgrounds, until the visitor first
+  // moves the mouse or touches the page: WP Rocket's "delay JavaScript",
+  // NitroPack, Perfmatters, LiteSpeed, Trustindex. The capture only scrolls
+  // by script, which none of them count, so without this the page is shot
+  // half-built. None of them check that the input is real, so a mouse that
+  // moves and comes to rest over plain content is enough: the events go
+  // to the element under it and bubble up to the document and window,
+  // where the loaders listen. A mousemove is what most wait for (WP Rocket
+  // ignores the first one, so two); mouseover covers those that wait for it
+  // instead. No clicks, keys, touches or wheel: those can open, close or
+  // move things.
+  //
+  // Then wait for the page to finish reacting: held scripts running, the
+  // scripts and stylesheets they add loading, new elements and page height
+  // settling. Runs before the page-world steps in background.js, so the
+  // carousels and scroll animations the woken scripts start are stopped
+  // with the rest. A page with nothing to wake shows no change within a
+  // moment and is left at once; a chatty one is cut off at the ceiling.
+  async function wakePage() {
+    const QUIET_MS = 400, NOTHING_MS = 300, CEILING_MS = 5000;
+    const t0 = performance.now();
+    if (document.readyState !== 'complete' && heldScripts() > 0) {
+      // Loaders start the scripts they hold only after the page's load
+      // (which some pages, still streaming something, never reach).
+      await Promise.race([new Promise((r) => window.addEventListener('load', r, { once: true })), sleep(CEILING_MS)]);
+    }
+    let last = 0;
+    const pending = new Set();
+    const mark = () => { last = performance.now(); };
+    const watch = (el) => {
+      pending.add(el);
+      const done = () => { if (pending.delete(el)) mark(); };
+      el.addEventListener('load', done, { once: true });
+      el.addEventListener('error', done, { once: true });
+      setTimeout(done, CEILING_MS);
+    };
+    const mo = new MutationObserver((list) => {
+      for (const m of list) {
+        for (const n of m.addedNodes) {
+          if (n.nodeType !== 1) continue;
+          mark();
+          if (n.matches('script[src], link[rel="stylesheet"]')) watch(n);
+        }
+      }
+    });
+    mo.observe(document, { childList: true, subtree: true });
+    const { el, x, y } = restingPoint();
+    const at = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, screenX: x, screenY: y };
+    const send = (Type, type) => { try { el.dispatchEvent(new Type(type, at)); } catch (_) {} };
+    const sent = performance.now();
+    let held = heldScripts();
+    let h = pageHeight();
+    send(PointerEvent, 'pointerover');
+    send(MouseEvent, 'mouseover');
+    send(PointerEvent, 'pointermove');
+    send(MouseEvent, 'mousemove');
+    await sleep(50);
+    at.clientX = at.screenX = x + 3;
+    send(PointerEvent, 'pointermove');
+    send(MouseEvent, 'mousemove');
+    const heldBefore = held;
+    let woke = false;
+    for (;;) {
+      await sleep(50);
+      const now = performance.now();
+      const nh = pageHeight(), nheld = heldScripts();
+      if (nh !== h || nheld !== held) { h = nh; held = nheld; mark(); }
+      if (last) woke = true;
+      if (now - sent >= CEILING_MS) break;
+      if (!last && now - sent >= NOTHING_MS) break;
+      if (last && now - last >= QUIET_MS && !pending.size) break;
+    }
+    mo.disconnect();
+    return { woke, wakeMs: Math.round(performance.now() - t0), heldScripts: [heldBefore, held] };
   }
 
   // A playing video that spans two tiles shows a different frame in each,
@@ -532,9 +656,13 @@
       }
     };
     document.addEventListener('transitionend', recoloured, true);
+    // Each stop lasts until the images it brought on screen have loaded, up
+    // to a limit: a lazy loader that swapped in a source has then done its
+    // part, and the later tiles find the images ready.
     for (let y = 0; y < h; y += vh) {
       scroller.scrollTo(0, y);
       await sleep(60);
+      await waitForVisibleImages(PRESCROLL_IMAGES_MS);
       sampleScrollEffects();
     }
     // One extra stop at the very bottom, looked at twice: fades started by
@@ -631,9 +759,16 @@
   // opaque, and isn't one.
   function isScrimOrDialog(el) {
     if (el.matches(DIALOG) || [...el.querySelectorAll(DIALOG)].some(shows)) return true;
-    if (el.querySelector('img, picture, video, canvas, iframe, svg image')) return false;
     const vw = document.documentElement.clientWidth;
     const vh = window.innerHeight;
+    // Only a picture that fills most of the screen makes the layer a
+    // background. A popup's card can hold pictures of its own (Lindsey
+    // Brothers' Elementor event flyer, which has no dialog role).
+    const fills = (m) => {
+      const r = m.getBoundingClientRect();
+      return r.width * r.height >= vw * vh * 0.5;
+    };
+    if ([...el.querySelectorAll('img, picture, video, canvas, iframe, svg image')].some(fills)) return false;
     const layers = [el, ...Array.from(el.children)].filter((c) => {
       const r = c.getBoundingClientRect();
       return r.width >= vw * 0.9 && r.height >= vh * 0.9;
@@ -1011,7 +1146,9 @@
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     (async () => {
       try {
-        if (msg.cmd === 'prepare') {
+        if (msg.cmd === 'wake') {
+          sendResponse({ ok: true, ...await wakePage() });
+        } else if (msg.cmd === 'prepare') {
           originalScrollY = scroller.scrollTop || window.scrollY || 0;
           unlockScroll();
           pauseLoopingAnimations();
@@ -1057,6 +1194,9 @@
           if (msg.index > 0) pinFirstScreen();
           applyFades();
           await sleep(SETTLE_GRACE_MS);
+          // Lazy loaders that wait for the scroll to stop (a debounced
+          // handler) only swap their images in during the settle wait.
+          await waitForVisibleImages();
           hideOverlays(msg.index);
           if (msg.index > 0) pinFirstScreen();
           applyFades();

@@ -116,4 +116,18 @@ export function inkLevel(img, { top, left, w, h }, share = 0.02) {
   return 255;
 }
 
+// Whether text can be seen against what is behind it in the capture: the
+// share of a text box's pixels whose luma differs from the text's own
+// colour (`luma`, from its computed colour) by more than `tol`. Text on a
+// background that never loaded (white text on the white page) leaves a box
+// of nearly its own colour and scores near 0; text on its real background
+// scores well over half, since most of a text box is background.
+export function textContrast(img, { top, left, w, h }, luma, tol = 40) {
+  const [x0, x1] = cols(img, left, w);
+  const y0 = Math.max(0, Math.round(top)), y1 = Math.min(img.H, Math.round(top + h));
+  let n = 0, apart = 0;
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { n++; if (Math.abs(img.luma[y * img.W + x] - luma) > tol) apart++; }
+  return n ? apart / n : null;
+}
+
 export const result =(pass, value, detail, flags = []) => ({ pass, value, detail, flags });

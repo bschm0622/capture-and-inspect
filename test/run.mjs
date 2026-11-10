@@ -82,6 +82,11 @@ async function checkSite(site) {
   // What the content script reported for each tile: where it was asked to
   // scroll, where it landed and how tall the page was at that moment.
   rec.prepare = cap.prepare || null;
+  // How the extension woke the page (null before it did) and how long the
+  // capture itself took, page load left out.
+  rec.wake = cap.wake ?? null;
+  rec.pageTime = cap.pageTime ?? null;
+  rec.captureMs = cap.phases.captured != null ? cap.phases.captured - cap.phases.loaded : null;
   rec.tileLog = (cap.tiles || []).map(({ ok, ...t }) => t);
   // The extension's own report on the capture (null before it had one), and
   // where it placed each shot.

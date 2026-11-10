@@ -73,8 +73,9 @@ function instrumentWorker() {
   chrome.tabs.sendMessage = (tabId, msg, ...rest) => {
     const cb = rest.find((r) => typeof r === 'function');
     if (!cb) return send(tabId, msg, ...rest);
+    const t0 = Date.now();
     return send(tabId, msg, ...rest.filter((r) => r !== cb), (resp) => {
-      if (msg && msg.cmd !== 'finish') h.messages.push({ cmd: msg.cmd, y: msg.y, resp });
+      if (msg && msg.cmd !== 'finish') h.messages.push({ cmd: msg.cmd, y: msg.y, resp, ms: Date.now() - t0 });
       cb(resp);
     });
   };
@@ -176,6 +177,12 @@ export async function captureSite(extDir, site, { headless = true, timeoutMs = 2
     out.draws = res.draws;
     const prep = res.messages.find((m) => m.cmd === 'prepare');
     out.prepare = prep && prep.resp;
+    const wake = res.messages.find((m) => m.cmd === 'wake');
+    out.wake = wake ? wake.resp : null;
+    // Time spent in the page: waking it, preparing it, and every tile
+    // (which leaves out the worker's capture throttle and stitching).
+    const sum = (cmd) => res.messages.filter((m) => m.cmd === cmd).reduce((s, m) => s + (m.ms || 0), 0);
+    out.pageTime = { wake: sum('wake'), prepare: sum('prepare'), tiles: sum('tile') };
     out.tiles = res.messages.filter((m) => m.cmd === 'tile').map((m) => ({ requestedY: m.y, ...m.resp }));
 
     // Facts after the capture: the extension has restored the page, and lazy
