@@ -101,4 +101,19 @@ export function showsIn(img, shot, rect, { light = false } = {}) {
   return ink < 20 ? null : same / ink;
 }
 
+// How dark the darkest marks in a box are: the luma below which the
+// darkest `share` of its pixels fall. Dark text or figures at full strength
+// read 20-70; the same faded to 40% over white reads 150 or more.
+export function inkLevel(img, { top, left, w, h }, share = 0.02) {
+  const [x0, x1] = cols(img, left, w);
+  const y0 = Math.max(0, Math.round(top)), y1 = Math.min(img.H, Math.round(top + h));
+  const hist = new Array(256).fill(0);
+  let n = 0;
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { hist[img.luma[y * img.W + x]]++; n++; }
+  if (!n) return null;
+  let c = 0;
+  for (let v = 0; v < 256; v++) { c += hist[v]; if (c >= n * share) return v; }
+  return 255;
+}
+
 export const result =(pass, value, detail, flags = []) => ({ pass, value, detail, flags });

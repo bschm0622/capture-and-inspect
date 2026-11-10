@@ -70,6 +70,22 @@ const MATCH_OK = 6;      // mean |Δluma| under this counts as the same pixels
 const GRID_PX = 4;       // CSS px per column of the matching grid
 const GROWTH_TILES = 2;  // room for the page to grow during the capture, in screens
 
+// Two tiles placed right show the same pixels where they overlap. Where they
+// don't, in part of the width, the page changed between the two shots: a tab
+// or slide that turned on a timer, a fade that moved on, an image that
+// finished loading. The tile above is then shot again right before this one,
+// so the two agree in time. Bounded, since some things never hold still (a
+// canvas animation), and what is left is reported.
+const AGREE_CELL = 24;     // |Δluma| at which a grid cell counts as changed
+const AGREE_SHARE = 0.03;  // share of a column block's cells that may change
+// A tile half a pixel off the grid (the clamped bottom one) renders text a
+// little differently from either neighbouring row, up to 5% of a block's
+// cells on the regression set, so it gets more room.
+const AGREE_SHARE_FRACTIONAL = 0.08;
+const AGREE_BLOCKS = 16;
+const RESHOOTS_PER_SEAM = 1;
+const MAX_RESHOOTS = 3;
+
 // Luma of a bitmap on a coarse grid: one row per CSS px and one column per
 // GRID_PX, plenty to tell where two tiles line up and cheap to compare.
 function lumaGrid(bmp, w, h) {
@@ -173,6 +189,43 @@ function placeTile(sig, w, seam, predicted, tile, tileH, hidden) {
   return { top: predicted, match: 'mismatch', score: round(at0), best: round(scores[best]) };
 }
 
+// How many column blocks of a tile placed at `top` differ from what the
+// canvas already shows over their overlap, and the largest share of changed
+// cells in any block, leaving out overlays the page hid since the last
+// shot. Null when they barely overlap.
+// The bottom tile can sit half a pixel off the grid (the page's last scroll
+// position is fractional), so a cell only counts as changed when it differs
+// from the tile's rows on both sides.
+function disagreement(sig, w, seam, top, tile, tileH, hidden) {
+  const t0 = Math.floor(top), t1 = Math.ceil(top);
+  const y0 = Math.max(0, t1), y1 = Math.min(Math.floor(seam), t0 + tileH);
+  if (y1 - y0 < 8) return null;
+  const use = new Uint8Array((y1 - y0) * w).fill(1);
+  for (const h of hidden) {
+    const x0 = Math.max(0, Math.floor(h.left / GRID_PX)), x1 = Math.min(w, Math.ceil(h.right / GRID_PX));
+    for (let y = Math.max(y0, Math.floor(h.top)); y < Math.min(y1, Math.ceil(h.bottom)); y++) {
+      use.fill(0, (y - y0) * w + x0, (y - y0) * w + Math.max(x0, x1));
+    }
+  }
+  let blocks = 0, worst = 0;
+  for (let b = 0; b < AGREE_BLOCKS; b++) {
+    const xa = Math.floor(w * b / AGREE_BLOCKS), xb = Math.floor(w * (b + 1) / AGREE_BLOCKS);
+    let n = 0, d = 0;
+    for (let y = y0; y < y1; y++) {
+      const a = y * w, t = (y - t0) * w, s = (y - t1) * w, u = (y - y0) * w;
+      for (let x = xa; x < xb; x++) {
+        if (!use[u + x]) continue;
+        n++;
+        if (Math.min(Math.abs(sig[a + x] - tile[t + x]), Math.abs(sig[a + x] - tile[s + x])) > AGREE_CELL) d++;
+      }
+    }
+    if (n < 40) continue;
+    if (d / n > (t0 === t1 ? AGREE_SHARE : AGREE_SHARE_FRACTIONAL)) blocks++;
+    worst = Math.max(worst, d / n);
+  }
+  return { y0, y1, blocks, worst: Math.round(worst * 1000) / 1000 };
+}
+
 async function stitchTiles(tab, info) {
   const { pageHeight, viewportHeight: vh, pageWidth, dpr } = info;
   const warnings = [];
@@ -208,6 +261,22 @@ async function stitchTiles(tab, info) {
   let prevTop = 0; // where the last tile drawn sits in the capture (CSS px)
   let hidden = []; // overlays it showed that the page has hidden since, in capture px
   const holes = [];
+  let last = null; // the last tile drawn: where it was shot and which rows it painted
+  let reshoots = 0, seamReshoots = 0;
+
+  // Draw rows [from, to) of the canvas (output px) from a tile placed at
+  // `top`, and copy them into the matching grid.
+  const paint = (bmp, tileGrid, tileH, top, from, to) => {
+    const topOut = Math.round(top * scale);
+    const sy = (from - topOut) * dpr / scale;
+    const sh = (to - from) * dpr / scale;
+    ctx.drawImage(bmp, 0, sy, bmp.width, sh, 0, from, Math.round(bmp.width * scale / dpr), to - from);
+    const t0 = Math.round(top);
+    for (let c = Math.ceil(from / scale); c < Math.min(gh, Math.ceil(to / scale)); c++) {
+      const t = c - t0;
+      if (t >= 0 && t < tileH) grid.set(tileGrid.subarray(t * gw, (t + 1) * gw), c * gw);
+    }
+  };
 
   for (let i = 0; ;) {
     if (shots++ >= maxShots) {
@@ -246,7 +315,7 @@ async function stitchTiles(tab, info) {
     const bmp = await dataUrlToBitmap(await throttledCapture(tab.windowId));
     const tileH = Math.round(bmp.height / dpr);
     const tileGrid = lumaGrid(bmp, gw, tileH);
-    let match = null;
+    let match = null, agree = null;
     if (i > 0) {
       match = placeTile(grid, gw, seam, top, tileGrid, tileH, hidden);
       if (match.match === 'moved') {
@@ -266,7 +335,32 @@ async function stitchTiles(tab, info) {
         // loading or an overlay hidden after the first tile, and the
         // measurement stands.)
         warnings.push({ kind: 'overlap-mismatch', y0: Math.round(top), y1: Math.round(seam), note: `tile ${i + 1} doesn't match the tile above where it overlaps it; placed by scroll position` });
+      } else {
+        agree = disagreement(grid, gw, seam, top, tileGrid, tileH, hidden);
       }
+    }
+
+    // The page changed between this shot and the one above. Shoot that one
+    // again, then this one, back to back. The repeat keeps the page's
+    // anchors from this shot, so this one is still measured from here.
+    if (agree && agree.blocks > 0 && last && seamReshoots < RESHOOTS_PER_SEAM && reshoots < MAX_RESHOOTS) {
+      seamReshoots++;
+      reshoots++;
+      placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, match, agree, retake: true });
+      bmp.close();
+      const again = await sendToTab(tab.id, { cmd: 'tile', y: last.actualY, index: last.index, total, keepAnchors: true });
+      if (!again || !again.ok) throw new Error(again && again.error || 'tile failed');
+      if (Math.abs(again.actualY - last.actualY) < 1) {
+        const b2 = await dataUrlToBitmap(await throttledCapture(tab.windowId));
+        const h2 = Math.round(b2.height / dpr);
+        paint(b2, lumaGrid(b2, gw, h2), h2, last.top, last.from, cursor);
+        b2.close();
+        placements.push({ index: last.index, y: last.actualY, actualY: again.actualY, top: last.top, reshot: true });
+      }
+      continue;
+    }
+    if (agree && agree.blocks > 0) {
+      warnings.push({ kind: 'tiles-disagree', y0: agree.y0, y1: agree.y1, note: `tile ${i + 1} differs from the tile above where they overlap (${agree.blocks} of ${AGREE_BLOCKS} column blocks): the page changed between the shots` });
     }
 
     // captureVisibleTab returns device pixels (vh*dpr tall). Draw only the
@@ -277,21 +371,16 @@ async function stitchTiles(tab, info) {
     const to = Math.min(topOut + tileOut, canvas.height);
     if (from > cursor) holes.push([cursor, from]);
     if (to > from) {
-      const sy = (from - topOut) * dpr / scale;
-      const sh = (to - from) * dpr / scale;
-      ctx.drawImage(bmp, 0, sy, bmp.width, sh, 0, from, Math.round(bmp.width * scale / dpr), to - from);
-      const t0 = Math.round(top);
-      for (let c = Math.ceil(from / scale); c < Math.min(gh, Math.ceil(to / scale)); c++) {
-        const t = c - t0;
-        if (t >= 0 && t < tileH) grid.set(tileGrid.subarray(t * gw, (t + 1) * gw), c * gw);
-      }
+      paint(bmp, tileGrid, tileH, top, from, to);
       cursor = to;
     }
     bmp.close();
-    placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, match });
+    placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, match, agree });
+    last = { index: i, actualY: res.actualY, top, from: Math.min(from, cursor) };
 
     i++;
     retakes = 0;
+    seamReshoots = 0;
     lift = 0;
     prevTop = top;
     hidden = [];
@@ -458,18 +547,44 @@ chrome.action.onClicked.addListener((tab) => { runCapture(tab); });
 
 // Injected into the page (MAIN world), so it must be self-contained. Kills
 // every ScrollTrigger, which removes pin spacers and puts pinned sections
-// back in normal flow, then jumps each animation to its end state so the
-// capture shows the finished design. Smooth-scroll libraries go too, since
-// they fight the tile-by-tile scrolling. The page stays this way until it
-// reloads.
+// back in normal flow, then leaves each animation at whichever end shows
+// its targets more: the finished state for an entrance, the start for an
+// exit. mattinglygc.com's hero column fades out as the page scrolls away
+// (`to {opacity: 0}`), and jumped to its end it vanished from the capture.
+// With nothing to choose between them (a slide, a scrubbed parallax), the
+// finished state. Smooth-scroll libraries go too, since they fight the
+// tile-by-tile scrolling. The page stays this way until it reloads.
 function unpinScrollAnimations() {
   const ST = window.ScrollTrigger ||
     (window.gsap && window.gsap.core && window.gsap.core.globals().ScrollTrigger);
   if (ST) {
+    const gsap = window.gsap;
+    const targetsOf = (a) => {
+      try {
+        if (a.targets) return a.targets();
+        return a.getChildren(true, true, false).flatMap((c) => (c.targets ? c.targets() : []));
+      } catch (e) { return []; }
+    };
+    const shown = (els) => els.reduce((s, el) => {
+      const v = gsap && gsap.getProperty ? Number(gsap.getProperty(el, 'opacity')) : Number(getComputedStyle(el).opacity);
+      return s + (Number.isFinite(v) ? v : 1);
+    }, 0);
     const triggers = ST.getAll();
     const animations = triggers.map((t) => t.animation).filter(Boolean);
+    const ends = animations.map((a) => {
+      try {
+        const els = targetsOf(a).filter((el) => el instanceof Element);
+        const was = a.progress();
+        a.progress(0);
+        const atStart = shown(els);
+        a.progress(1);
+        const atEnd = shown(els);
+        a.progress(was);
+        return atStart > atEnd + 0.01 ? 0 : 1;
+      } catch (e) { return 1; }
+    });
     triggers.forEach((t) => t.kill(true, true));
-    animations.forEach((a) => a.progress(1));
+    animations.forEach((a, i) => { try { a.progress(ends[i]); } catch (e) {} });
   }
   for (const s of [window.lenis, window.__lenis, window.locomotiveScroll]) {
     if (s && typeof s.destroy === 'function') s.destroy();
@@ -494,21 +609,47 @@ function stopCarousels() {
     });
   }
 
-  document.querySelectorAll('.swiper, .swiper-container, swiper-container').forEach((el) => {
+  // The rest are found by the instance their library leaves on the element,
+  // not by class name, which themes change: Premier Roofing's Swiper is an
+  // Avada `awb-swiper` with no `.swiper` class anywhere. Glide, Embla, Keen
+  // and Splide keep their instances to themselves; only a pause button (below)
+  // reaches those.
+  const $ = window.jQuery;
+  const BSCarousel = window.bootstrap && window.bootstrap.Carousel;
+  const Flickity = window.Flickity;
+  // Pages often start a slider again when it scrolls into view (17A's "What
+  // we do" calls slickPlay from an IntersectionObserver), so slick's own
+  // start is switched off on the instance as well, for as long as the page
+  // stays loaded.
+  document.querySelectorAll('*').forEach((el) => {
     if (el.swiper && el.swiper.autoplay) attempt(() => el.swiper.autoplay.stop());
+    if (el.slick && typeof el.slick.slickPause === 'function') {
+      attempt(() => {
+        el.slick.slickPause();
+        el.slick.slickPlay = () => {};
+        el.slick.autoPlay = () => {};
+      });
+    }
+    if (el.splide && el.splide.Components && el.splide.Components.Autoplay) attempt(() => el.splide.Components.Autoplay.pause());
+    if (Flickity && Flickity.data) {
+      const f = Flickity.data(el);
+      if (f) attempt(() => f.stopPlayer());
+    }
+    if (BSCarousel && BSCarousel.getInstance) {
+      const c = BSCarousel.getInstance(el);
+      if (c) attempt(() => c.pause());
+    }
+    // (hasData first: asking jQuery for data on an element creates a store.)
+    if ($ && $.hasData && $.hasData(el)) {
+      if ($.data(el, 'owl.carousel')) attempt(() => $(el).trigger('stop.owl.autoplay'));
+      if ($.data(el, 'bs.carousel')) attempt(() => $(el).carousel('pause'));
+    }
   });
 
-  const $ = window.jQuery;
+  // And by class, for older slick and Owl builds that leave no instance.
   if ($ && $.fn) {
     if ($.fn.slick) attempt(() => $('.slick-initialized').slick('slickPause'));
     if ($.fn.owlCarousel) attempt(() => $('.owl-carousel').trigger('stop.owl.autoplay'));
-  }
-
-  if (window.Flickity) {
-    document.querySelectorAll('.flickity-enabled').forEach((el) => {
-      const f = window.Flickity.data(el);
-      if (f) attempt(() => f.stopPlayer());
-    });
   }
 
   // Anything else: press a visible pause button that belongs to a carousel.

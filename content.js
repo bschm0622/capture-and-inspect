@@ -26,7 +26,11 @@
   let firstScreen = new Map();   // element -> transform at scroll 0
   let pinned = [];               // elements held at their scroll-0 transform
   let scrollLinked = new Map();  // element -> {ys, xs, tf} seen while pre-scrolling
+  let topOffsets = new Map();    // element on the first screen -> vertical offset before pre-scrolling
+  let fades = new Map();         // element -> {min, max, last, near, linked} opacity seen while pre-scrolling
+  let held = [];                 // [{el, max}] scroll-linked fades and the most visible opacity they reached
   let backdrops = new Map();     // full-screen fixed layer -> colors seen while pre-scrolling
+  let pageColors = new Map();    // html and body -> background colors seen while pre-scrolling
   let pausedAnimations = [];     // looping CSS animations held still during capture
   let anchors = [];              // [{el, y}] page content seen in the last tile, and where it sat
   let covered = [];              // screen rects of overlays hidden during this tile
@@ -59,6 +63,8 @@
         scroll-behavior: auto !important;
       }
       [data-cleanshot-pin] { transform: var(--cleanshot-tf) !important; }
+      [data-cleanshot-fade] { opacity: var(--cleanshot-op) !important; }
+      [data-cleanshot-probe] { transition: none !important; }
       [data-cleanshot-parallax] { position: absolute !important; transform: none !important; }
       [data-cleanshot-parallax] > * { transform: none !important; }
       [data-cleanshot-unpin] { position: relative !important; inset: 0 auto auto 0 !important; transform: none !important; }
@@ -111,9 +117,11 @@
   // which stitches into visible bands. Pause each video the first time it is
   // on screen with a frame ready, and on later tiles put it back on that same
   // frame if the page's own code started it again.
+  // Players such as Wistia keep their video inside a shadow root
+  // (honeycombair.com's testimonial), so look there too.
   async function freezeVideos(timeoutMs = 1500) {
     const vh = window.innerHeight;
-    const visible = Array.from(document.querySelectorAll('video')).filter((v) => {
+    const visible = allElements().filter((v) => v instanceof HTMLVideoElement).filter((v) => {
       const r = v.getBoundingClientRect();
       return r.bottom > 0 && r.top < vh && r.width > 0;
     });
@@ -162,6 +170,34 @@
     });
   }
 
+  // The pre-scroll ends with a jump back to the top, and a busy page can
+  // take a moment to move its parallax back (the Children's Museum hero sat
+  // 315px down, where the bottom of the page leaves it, for a few frames).
+  // Recorded then, that wrong offset would be held for every later tile.
+  // So wait until whatever moved vertically during the pre-scroll is back
+  // where it was before it, or has stopped moving.
+  async function settleAtTop() {
+    const offsetY = (el) => {
+      const tf = getComputedStyle(el).transform;
+      return tf === 'none' ? 0 : new DOMMatrix(tf).m42;
+    };
+    const moved = [...topOffsets].filter(([el]) => {
+      const s = scrollLinked.get(el);
+      return el.isConnected && s && s.ys.size > 1 && s.xs.size <= 1;
+    });
+    topOffsets = new Map();
+    if (!moved.length) return;
+    let last = null;
+    for (let t = 0; t < 1500; t += 50) {
+      const now = moved.map(([el]) => offsetY(el));
+      if (moved.every(([, y], k) => Math.abs(now[k] - y) <= 1)) return;
+      // Still: as settled as it gets, even if not where it started.
+      if (last && t >= 300 && now.every((y, k) => Math.abs(y - last[k]) <= 0.5)) return;
+      last = now;
+      await sleep(50);
+    }
+  }
+
   function pinFirstScreen() {
     for (const [el, tf] of firstScreen) {
       if (el.hasAttribute('data-cleanshot-pin')) continue;
@@ -178,19 +214,54 @@
   // away from their text. While pre-scrolling, note the elements whose
   // vertical offset keeps changing with the scroll. Sideways movement is
   // left out, since that's a carousel or marquee rather than parallax.
-  function sampleScrollEffects() {
+  //
+  // Opacity is noted the same way. Webflow interactions and similar scripts
+  // fade content by scroll position (17A's impact figures light up one by
+  // one as they near the top of the screen), so a tile that shows one low on
+  // the screen catches it faded, and a heading cut by a tile edge comes out
+  // half there. A change counts as scroll-linked when it happens while the
+  // element is on or near the screen; a tab or slide that changes on a timer
+  // while it is out of sight doesn't count.
+  //
+  // The page's own background colour (html, body) is noted too: some themes
+  // recolour it to match the section in view (hitt.com goes black and back).
+  function sampleScrollEffects(fadesOnly = false) {
     const vw = document.documentElement.clientWidth;
     const vh = window.innerHeight;
+    const atTop = scroller.scrollTop === 0 && !topOffsets.size;
+    for (const el of [document.documentElement, document.body]) {
+      if (!el) continue;
+      if (!pageColors.has(el)) pageColors.set(el, new Set());
+      pageColors.get(el).add(getComputedStyle(el).backgroundColor);
+    }
     allElements().forEach((el) => {
       const cs = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
       if (cs.position === 'fixed') {
-        const r = el.getBoundingClientRect();
         if (r.width >= vw * 0.9 && r.height >= vh * 0.9) {
           if (!backdrops.has(el)) backdrops.set(el, new Set());
           backdrops.get(el).add(cs.backgroundColor);
         }
       }
+      const near = r.height > 0 && r.bottom > -vh / 2 && r.top < vh * 1.5;
+      const op = Number(cs.opacity);
+      const f = fades.get(el);
+      if (!f) {
+        fades.set(el, { min: op, max: op, last: op, near, linked: false });
+      } else {
+        if (Math.abs(op - f.last) > 0.01 && (near || f.near)) f.linked = true;
+        f.min = Math.min(f.min, op);
+        f.max = Math.max(f.max, op);
+        f.last = op;
+        f.near = near;
+      }
+      // (A second look at the same scroll position says nothing about
+      // what moves with the scroll.)
+      if (fadesOnly) return;
       const tf = cs.transform;
+      if (atTop && r.height > 0 && r.top < vh && r.bottom > 0) {
+        topOffsets.set(el, tf === 'none' ? 0 : new DOMMatrix(tf).m42);
+      }
       let seen = scrollLinked.get(el);
       if (!seen) {
         if (tf === 'none') return;
@@ -219,25 +290,117 @@
     scrollLinked = new Map();
   }
 
+  // Hold each scroll-linked fade at the most visible value it reached, which
+  // is how a visitor sees it once it's comfortably in view. Only page
+  // content: not anything that floats over the page, and not the inside of
+  // an SVG (Lottie animates its layers' opacity on a clock). Layers stacked
+  // in the same place (a crossfading slideshow, tab panels) only ever show
+  // one at a time, so they're left to the page as well.
+  function holdFades() {
+    const list = [];
+    for (const [el, f] of fades) {
+      if (!f.linked || f.max - f.min < 0.05 || !el.isConnected) continue;
+      if (!(el instanceof HTMLElement) || el.closest('svg') || pinnedToScreen(el)) continue;
+      list.push({ el, max: f.max, r: el.getBoundingClientRect() });
+    }
+    fades = new Map();
+    const area = (r) => Math.max(0, r.width) * Math.max(0, r.height);
+    const stacked = (a, b) => {
+      if (a.el.contains(b.el) || b.el.contains(a.el)) return false;
+      const w = Math.min(a.r.right, b.r.right) - Math.max(a.r.left, b.r.left);
+      const h = Math.min(a.r.bottom, b.r.bottom) - Math.max(a.r.top, b.r.top);
+      return w > 0 && h > 0 && w * h > 0.5 * Math.min(area(a.r), area(b.r));
+    };
+    held = list.filter((a) => !list.some((b) => b !== a && stacked(a, b)))
+      .map(({ el, max }) => ({ el, max }));
+  }
+
+  // Before each tile, let go of the holds and read where the page has each
+  // fade now. One still below the most it has reached is held there; one at
+  // or past it (a fade-in that has since finished, maybe beyond what the
+  // pre-scroll caught mid-way) is left to the page, and raises the mark for
+  // later tiles. Through the stylesheet, since the page's script keeps
+  // writing inline opacity. Transitions are off while this happens: letting
+  // go would otherwise start one, and the value read back would be where it
+  // starts, the held one.
+  function applyFades() {
+    if (!held.length) return;
+    held.forEach((h) => {
+      h.el.setAttribute('data-cleanshot-probe', '');
+      h.el.removeAttribute('data-cleanshot-fade');
+    });
+    const now = held.map((h) => Number(getComputedStyle(h.el).opacity));
+    held.forEach((h, k) => {
+      if (now[k] >= h.max - 0.01) {
+        h.max = Math.max(h.max, now[k]);
+        return;
+      }
+      h.el.style.setProperty('--cleanshot-op', String(h.max));
+      h.el.setAttribute('data-cleanshot-fade', '');
+    });
+    held.forEach((h) => getComputedStyle(h.el).opacity);
+    held.forEach((h) => h.el.removeAttribute('data-cleanshot-probe'));
+  }
+
+  // The blocks a page is stacked from, top to bottom: go down through
+  // wrappers that hold most of the page, keeping what sits beside each one
+  // (header, footer), and take the children of the last.
+  function pageSections() {
+    const vw = document.documentElement.clientWidth;
+    const y = scroller.scrollTop;
+    const H = pageHeight();
+    const out = [];
+    const wide = (el) => {
+      const r = el.getBoundingClientRect();
+      return r.height > 50 && r.width > vw * 0.5;
+    };
+    let box = document.body;
+    for (let depth = 0; box && depth < 12; depth++) {
+      const kids = Array.from(box.children).filter(wide);
+      const big = kids.find((c) => c.getBoundingClientRect().height >= H * 0.6);
+      if (!big) { out.push(...kids); break; }
+      out.push(...kids.filter((c) => c !== big));
+      box = big;
+    }
+    return out
+      .map((el) => ({ el, top: el.getBoundingClientRect().top + y }))
+      .sort((a, b) => a.top - b.top)
+      .map((s) => s.el);
+  }
+
   // Some pages (Design Museum Danmark) paint the whole screen with one fixed
   // layer and recolor it to match the section in view, switching the text
   // color with it. Hidden like any other fixed overlay, that leaves white
   // sections with white text. Visit each marked section once, note the
   // layer's color there and freeze the section's text colors, then turn the
   // layer into a page-tall backdrop striped with those colors.
+  //
+  // Others recolour the page itself, html or body (hitt.com turns black for
+  // "The HITT Experience" and white again after it). A screen then has one
+  // colour all over, so each tile paints the whole of its height in
+  // whatever colour its scroll position chose, and the change lands at a
+  // tile edge, cutting through a heading. The same visit-and-stripe fixes
+  // it: each section gets the colour the page gives it while it's centered
+  // on screen. Sections are the marked ones, or failing that the blocks the
+  // page is built from.
   async function paintBackdrop() {
-    const layer = [...backdrops].find(([, colors]) => colors.size > 1)?.[0];
+    const fixed = [...backdrops].find(([, colors]) => colors.size > 1)?.[0];
+    const own = fixed ? null : [document.body, document.documentElement]
+      .find((el) => el && pageColors.has(el) && pageColors.get(el).size > 1);
+    const layer = fixed || own;
     backdrops = new Map();
+    pageColors = new Map();
     if (!layer) return;
     const vw = document.documentElement.clientWidth;
     const vh = window.innerHeight;
     const marked = Array.from(document.querySelectorAll(
-      '[data-bg], [data-bg-color], [data-background], [data-background-color]'
+      '[data-bg], [data-bg-color], [data-background], [data-background-color], [data-color]'
     )).filter((el) => {
       const r = el.getBoundingClientRect();
       return r.width > vw * 0.5 && r.height < pageHeight() * 0.8;
     });
-    const sections = marked.filter((el) => !marked.some((o) => o !== el && o.contains(el)));
+    let sections = marked.filter((el) => !marked.some((o) => o !== el && o.contains(el)));
+    if (!sections.length && own) sections = pageSections();
     if (!sections.length) return;
 
     // The color may fade over a script tween, so read it once it holds still.
@@ -269,8 +432,25 @@
     await sleep(150);
 
     const h = pageHeight();
-    const stops = bands.map((b, i) => `${b.color} ${b.top}px ${i + 1 < bands.length ? bands[i + 1].top : h}px`);
     unwrapped.push({ el: layer, style: layer.getAttribute('style') });
+    if (own) {
+      // Body's background is painted across the whole page from the top of
+      // html when html has none of its own, and from body's own box when it
+      // does.
+      const root = getComputedStyle(document.documentElement);
+      const spread = layer === document.body && root.backgroundImage === 'none' &&
+        /rgba\(.*,\s*0\)|transparent/.test(root.backgroundColor);
+      const origin = spread ? 0 : Math.round(layer.getBoundingClientRect().top + scroller.scrollTop);
+      const stops = bands.map((b, i) => `${b.color} ${Math.max(0, b.top - origin)}px ${(i + 1 < bands.length ? bands[i + 1].top : h) - origin}px`);
+      layer.style.setProperty('background-color', bands[bands.length - 1].color, 'important');
+      layer.style.setProperty('background-image', `linear-gradient(to bottom, ${stops.join(', ')})`, 'important');
+      layer.style.setProperty('background-size', `100% ${h - origin}px`, 'important');
+      layer.style.setProperty('background-repeat', 'no-repeat', 'important');
+      layer.style.setProperty('background-position', '0 0', 'important');
+      layer.style.setProperty('background-attachment', 'scroll', 'important');
+      return;
+    }
+    const stops = bands.map((b, i) => `${b.color} ${b.top}px ${i + 1 < bands.length ? bands[i + 1].top : h}px`);
     layer.style.setProperty('position', 'absolute', 'important');
     layer.style.setProperty('inset', '0 0 auto 0', 'important');
     layer.style.setProperty('height', `${h}px`, 'important');
@@ -336,19 +516,37 @@
 
   // Scroll through the whole page (top→bottom) once to trigger
   // IntersectionObserver reveals and lazy-loading before real capture.
+  //
+  // A page that recolours itself can take 100ms or more to react to a
+  // scroll (hitt.com does), longer than each stop lasts. The injected style
+  // gives every change a 1ms transition, so a change to the page's own
+  // background announces itself with a transitionend whenever it comes.
   async function preScroll() {
     const vh = window.innerHeight;
     const h = Math.min(pageHeight(), MAX_PAGE_HEIGHT);
+    const own = [document.documentElement, document.body].filter(Boolean);
+    own.forEach((el) => { if (!pageColors.has(el)) pageColors.set(el, new Set()); });
+    const recoloured = (e) => {
+      if (own.includes(e.target) && /background/.test(e.propertyName)) {
+        pageColors.get(e.target).add(getComputedStyle(e.target).backgroundColor);
+      }
+    };
+    document.addEventListener('transitionend', recoloured, true);
     for (let y = 0; y < h; y += vh) {
       scroller.scrollTo(0, y);
       await sleep(60);
       sampleScrollEffects();
     }
-    // one extra stop at the very bottom
+    // One extra stop at the very bottom, looked at twice: fades started by
+    // the last few stops are still running when the first look comes.
     scroller.scrollTo(0, h);
     await sleep(120);
+    sampleScrollEffects(true);
+    await sleep(300);
+    sampleScrollEffects(true);
     scroller.scrollTo(0, 0);
     await sleep(200);
+    document.removeEventListener('transitionend', recoloured, true);
   }
 
   // How tall an element looks on screen. Some sticky headers (the Field
@@ -556,9 +754,23 @@
   // through (a popup on a timer, a header that turns fixed on scroll).
   // Hidden with opacity as well as visibility: a child can override its
   // parent's `visibility: hidden` (Elementor buttons do), but not opacity.
+  //
+  // The worker can ask for the first tile again (to reshoot it next to the
+  // second when the two disagree), so at index 0 the header and the rest
+  // that only later tiles hide are shown again.
   function hideOverlays(index) {
     const vh = window.innerHeight;
-    const hide = (el) => {
+    if (index === 0) {
+      hiddenEls = hiddenEls.filter((h) => {
+        if (!h.later) return true;
+        if (h.prev) h.el.style.setProperty('visibility', h.prev);
+        else h.el.style.removeProperty('visibility');
+        if (h.prevOpacity) h.el.style.setProperty('opacity', h.prevOpacity);
+        else h.el.style.removeProperty('opacity');
+        return false;
+      });
+    }
+    const hide = (el, later) => {
       if (hiddenEls.some((h) => h.el === el)) return;
       const cs = getComputedStyle(el);
       if (cs.visibility === 'hidden' || cs.display === 'none') return;
@@ -568,15 +780,16 @@
       if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < vh) {
         covered.push({ top: Math.round(r.top), bottom: Math.round(r.bottom), left: Math.round(r.left), right: Math.round(r.right) });
       }
-      hiddenEls.push({ el, prev: el.style.visibility, prevOpacity: el.style.opacity });
+      hiddenEls.push({ el, later, prev: el.style.visibility, prevOpacity: el.style.opacity });
       el.style.setProperty('visibility', 'hidden', 'important');
       el.style.setProperty('opacity', '0', 'important');
     };
     sortOverlays(index === 0);
     for (const [el, role] of overlays) {
-      if (role === 'extra' || (index > 0 && role !== 'content')) hide(el);
+      if (role === 'extra') hide(el, false);
+      else if (index > 0 && role !== 'content') hide(el, true);
     }
-    if (index > 0) stickyHeaders.forEach(hide);
+    if (index > 0) stickyHeaders.forEach((el) => hide(el, true));
   }
 
   // Some sites (instant.ai) lock html and body to the window height and
@@ -769,8 +982,17 @@
       el.style.removeProperty('--cleanshot-tf');
     }
     pinned = [];
+    for (const { el } of held) {
+      el.removeAttribute('data-cleanshot-fade');
+      el.removeAttribute('data-cleanshot-probe');
+      el.style.removeProperty('--cleanshot-op');
+    }
+    held = [];
     scrollLinked = new Map();
+    topOffsets = new Map();
+    fades = new Map();
     backdrops = new Map();
+    pageColors = new Map();
     document.querySelectorAll('[data-cleanshot-parallax]').forEach((el) => el.removeAttribute('data-cleanshot-parallax'));
     document.querySelectorAll('[data-cleanshot-unpin]').forEach((el) => el.removeAttribute('data-cleanshot-unpin'));
     document.querySelectorAll('[data-cleanshot-spacer]').forEach((el) => {
@@ -799,9 +1021,11 @@
           await paintBackdrop();
           unpinScrollMagic();
           settleOverlays();
+          holdFades();
           placeRevealedBackdrop();
           findStickyHeaders(); // measured at scroll 0, after preScroll settles
           sortOverlays(true);
+          await settleAtTop();
           recordFirstScreen();
           holdScrollLinked();
           const rawH = pageHeight();
@@ -831,17 +1055,20 @@
           // time the tile is shot. The second pass catches anything slower.
           hideOverlays(msg.index);
           if (msg.index > 0) pinFirstScreen();
+          applyFades();
           await sleep(SETTLE_GRACE_MS);
           hideOverlays(msg.index);
           if (msg.index > 0) pinFirstScreen();
+          applyFades();
           await freezeVideos();
           await raf();
           await raf();
           // Report where we actually landed (bottom tile clamps short), how
           // far the page moved since the last tile, and how far it scrolls
-          // now, measured as late as possible before the shot.
-          const drift = measureDrift();
-          recordAnchors();
+          // now, measured as late as possible before the shot. A tile shot
+          // again out of turn leaves the anchors to the tile it was shot for.
+          const drift = msg.keepAnchors ? null : measureDrift();
+          if (!msg.keepAnchors) recordAnchors();
           const actualY = scroller.scrollTop || window.scrollY || 0;
           sendResponse({
             ok: true, actualY, drift, covered,

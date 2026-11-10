@@ -34,10 +34,16 @@ export const T = {
 // draws only the part of a tile below what an earlier tile already painted.
 export function tileRects(cap) {
   const scale = cap.canvas.width / (cap.prepare ? cap.prepare.pageWidth : cap.canvas.width / 2);
-  return cap.draws.map((d) => {
+  const out = [];
+  for (const d of cap.draws) {
     const k = d.dh / d.sh; // output px per source px
-    return { y: Math.round((d.dy - d.sy * k) / scale), h: Math.round((d.sy + d.sh) * k / scale), drawY: Math.round(d.dy / scale) };
-  });
+    const t = { y: Math.round((d.dy - d.sy * k) / scale), h: Math.round((d.sy + d.sh) * k / scale), drawY: Math.round(d.dy / scale) };
+    // A tile shot again (when two tiles disagreed) repaints rows already
+    // painted, and replaces the tile that painted them.
+    while (out.length && out[out.length - 1].drawY >= t.drawY) out.pop();
+    out.push(t);
+  }
+  return out;
 }
 
 // Rows where one tile's pixels start (every tile but the first): the row

@@ -10,7 +10,8 @@
 // generic detectors.
 
 import { seams, repeatedOverlays, boundaries } from './lib/detectors.mjs';
-import { flatShare, findStrip, seamRepeats, showsIn, result } from './lib/regions.mjs';
+import { flatShare, findStrip, seamRepeats, showsIn, inkLevel, result } from './lib/regions.mjs';
+import { cols } from './lib/image.mjs';
 
 // Floating extras (cookie banners, popups, promo and widget buttons) found on
 // the live page's first screen after the capture, and the site's fixed
@@ -39,6 +40,30 @@ function navKept({ img, shot, facts }) {
 }
 
 export const SITES = [
+  {
+    host: 'mattinglygc.com',
+    url: 'https://mattinglygc.com',
+    collect: () => {
+      const h = [...document.querySelectorAll('h1, h2')].find((e) => e.getBoundingClientRect().width > 0 && /building healthy/i.test(e.textContent));
+      if (!h) return { heading: null };
+      const r = h.getBoundingClientRect();
+      return { heading: { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) } };
+    },
+    checks: {
+      // The hero column fades out on scroll through a GSAP ScrollTrigger.
+      // Jumped to the end of that tween, the white headline vanished. Its
+      // box must hold white text: at least 3% of it near-white.
+      'hero-heading-visible'({ img, facts }) {
+        const h = facts.heading;
+        if (!h) return result(false, null, '"Building Healthy Relationships" heading not found on the page');
+        const [x0, x1] = cols(img, h.left, h.w);
+        let n = 0, white = 0;
+        for (let y = h.top; y < Math.min(img.H, h.top + h.h); y++) for (let x = x0; x < x1; x++) { n++; if (img.luma[y * img.W + x] > 240) white++; }
+        const share = n ? white / n : 0;
+        return result(share >= 0.03, +share.toFixed(3), `${(share * 100).toFixed(1)}% of the heading box near-white (fail under 3%)`, share >= 0.03 ? [] : [{ y0: h.top, y1: h.top + h.h, note: 'hero heading missing' }]);
+      }
+    }
+  },
   {
     host: 'newchristendompress.com',
     url: 'https://newchristendompress.com',
@@ -95,7 +120,18 @@ export const SITES = [
       for (let a = h; a && a !== document.body; a = a.parentElement) if (getComputedStyle(a).position === 'sticky') { block = a; break; }
       let sec = block.parentElement;
       while (sec && sec.parentElement && sec.getBoundingClientRect().height < innerHeight * 1.2) sec = sec.parentElement;
-      return { heading: R(block), section: sec ? R(sec) : null };
+      // The impact heading and figures, which the page fades by scroll
+      // position, and the tabs it turns on a timer, with their photo. The
+      // fades also slide them, so they're measured by layout, which leaves
+      // transforms out. The capture puts the sticky block back in flow as
+      // `relative`, where its sticky `top` shifts it down by that much.
+      const L = (el) => { let top = 0, left = 0; for (let a = el; a; a = a.offsetParent) { top += a.offsetTop; left += a.offsetLeft; } return { top, left, w: el.offsetWidth, h: el.offsetHeight }; };
+      const shift = block !== h ? parseFloat(getComputedStyle(block).top) || 0 : 0;
+      const hl = L(h);
+      const impact = [{ what: 'heading', ...hl, top: hl.top + shift }, ...[...document.querySelectorAll('.our-impact_card')].map((c, i) => ({ what: `figure ${i + 1}`, ...L(c) }))];
+      const tabs = [...document.querySelectorAll('.intended-audience_tab-menu_link .heading-style-h6')].map(R);
+      const photo = document.querySelector('.intended-audience_tab-img-wrapper');
+      return { heading: R(block), section: sec ? R(sec) : null, impact, tabs, photo: photo ? R(photo) : null };
     },
     checks: {
       // A sticky heading in a tall section lands in every tile it passes.
@@ -112,6 +148,36 @@ export const SITES = [
         const extra = found.flatMap((f) => f.matches.filter((y) => Math.abs(y - f.p.top) > 8).map((y) => ({ y0: y, y1: y + f.p.h, note: 'copy of the sticky heading block' })));
         const most = Math.max(...found.map((f) => f.matches.length));
         return result(extra.length === 0, most, `sticky heading block (${h.top}-${h.top + h.h}px) appears ${most}× in its section`, extra);
+      },
+      // Webflow fades the impact heading and figures by scroll position, so
+      // a tile caught one faded (the third figure, or the heading cut at a
+      // tile edge). At full strength each has marks darker than 110.
+      'impact-faded'({ img, facts }) {
+        const items = facts.impact || [];
+        if (items.length < 2) return result(false, null, 'impact heading and figures not found on the page');
+        const lv = items.map((it) => ({ it, ink: inkLevel(img, it) ?? 255 }));
+        const faded = lv.filter((l) => l.ink > 110);
+        return result(!faded.length, Math.max(...lv.map((l) => l.ink)), `darkest marks: ${lv.map((l) => `${l.it.what} ${l.ink}`).join(', ')} (fail above 110)`,
+          faded.map((l) => ({ y0: l.it.top, y1: l.it.top + l.it.h, note: `${l.it.what} faded` })));
+      },
+      // The audience tabs turn every 5s on a timer. A tile edge through the
+      // list, or a tab caught mid-turn, shows a heading half grey and half
+      // dark, or two tabs (or none) dark at once; a tile edge through the
+      // photo shows two photos. One tab heading must be dark, each heading
+      // one shade throughout, and no tile edge may break the photo.
+      'tab-state'({ img, tiles, facts }) {
+        const tabs = facts.tabs || [];
+        if (tabs.length < 2) return result(false, null, 'tab headings not found on the page');
+        const lv = tabs.map((t) => {
+          const k = Math.floor(t.h / 2);
+          return { t, all: inkLevel(img, t), a: inkLevel(img, { ...t, h: k }), b: inkLevel(img, { ...t, top: t.top + k, h: t.h - k }) };
+        });
+        const flags = lv.filter((l) => Math.abs(l.a - l.b) > 50).map((l) => ({ y0: l.t.top, y1: l.t.top + l.t.h, note: `tab heading ${l.a} above, ${l.b} below` }));
+        const dark = lv.filter((l) => l.all < 90).length;
+        if (dark !== 1) flags.push({ y0: tabs[0].top, y1: tabs[tabs.length - 1].top + tabs[tabs.length - 1].h, note: `${dark} tabs dark` });
+        const p = facts.photo;
+        if (p) flags.push(...seams(img, tiles, { region: { y0: p.top + 2, y1: p.top + p.h - 2, x: p.left, w: p.w }, minBlocks: 1 }).flags);
+        return result(!flags.length, flags.length, `tab headings (darkest marks, top/bottom half): ${lv.map((l) => `${l.a}/${l.b}`).join(', ')}; ${dark} dark; ${flags.length} problem(s)`, flags);
       }
     }
   },
@@ -307,6 +373,15 @@ export const SITES = [
       'page-moved-under-tiles'({ img, tiles, vh }) {
         const flags = seamRepeats(img, boundaries(tiles, img.H), { maxD: vh });
         return result(flags.length === 0, flags.length, `${flags.length} tile edge(s) with the rows above repeated below`, flags);
+      },
+      // The carousel should be stopped for the capture (its Swiper has no
+      // `.swiper` class, only an instance on the element). While it turns,
+      // the page height the extension reads at each tile changes.
+      'carousel-kept-rotating'({ cap }) {
+        const hs = (cap.tiles || []).map((t) => t.pageHeight).filter(Number.isFinite);
+        if (hs.length < 2) return result(false, null, 'no tile page heights recorded');
+        const range = Math.max(...hs) - Math.min(...hs);
+        return result(range <= 50, range, `page height varied by ${range}px over ${hs.length} tiles (fail above 50px)`);
       }
     }
   },
@@ -364,9 +439,48 @@ export const SITES = [
         // compared (the video shows a different frame in the screenshot).
         if (rows.length) nav = { top: 0, left: 0, w: innerWidth, h: Math.round(Math.max(...rows.map((r) => r.bottom))), light: true };
       }
-      return { extras, nav };
+      // The rows the page is built from: its background changes colour only
+      // where one row gives way to the next.
+      const rowEdges = [...document.querySelectorAll('[data-color]')]
+        .filter((el) => el.getBoundingClientRect().width >= innerWidth * 0.9)
+        .map((el) => R(el).top);
+      return { extras, nav, rowEdges };
     },
     checks: {
+      // The page recolours its own background (black or white) to match the
+      // row in view, so each tile came out in one colour all over and the
+      // change landed at a tile edge, through a heading. Read down the left
+      // margin, where only the page background shows: every change from
+      // black to white or back must fall on an edge between two rows.
+      'background-follows-section'({ img, facts }) {
+        const edges = facts.rowEdges || [];
+        if (!edges.length) return result(false, null, 'no colour-marked rows found');
+        const [x0, x1] = cols(img, 0, 12);
+        const shade = (y) => {
+          let lo = 255, hi = 0;
+          for (let x = x0; x < x1; x++) { const v = img.luma[y * img.W + x]; lo = Math.min(lo, v); hi = Math.max(hi, v); }
+          return hi - lo > 10 ? null : hi < 40 ? 'black' : lo > 215 ? 'white' : null;
+        };
+        // Runs of plain black or white margin at least 20 rows long.
+        const runs = [];
+        for (let y = 0; y < img.H; y++) {
+          const s = shade(y);
+          if (!s) continue;
+          const r = runs[runs.length - 1];
+          if (r && r.s === s && y - r.end <= 1) r.end = y;
+          else runs.push({ s, start: y, end: y });
+        }
+        const solid = runs.filter((r) => r.end - r.start >= 20);
+        const flags = [];
+        let changes = 0;
+        for (let k = 1; k < solid.length; k++) {
+          const a = solid[k - 1], b = solid[k];
+          if (a.s === b.s) continue;
+          changes++;
+          if (!edges.some((e) => e >= a.end - 4 && e <= b.start + 4)) flags.push({ y0: a.end, y1: b.start, note: `background turns ${b.s} between ${a.end} and ${b.start}px, not at a row edge` });
+        }
+        return result(!flags.length, flags.length, `${changes} background colour change(s), ${flags.length} away from a row edge`, flags);
+      },
       // A cookie banner across the bottom of the first screen and an
       // accessibility button beside it (earlier, the button repeated in
       // every tile).
@@ -392,6 +506,11 @@ export const KNOWN = {
   'marquee-blank': 'Infinite CSS review marquee raced and left a blank band',
   'page-moved-under-tiles': 'Page height changed between tiles: strip repeated at a tile edge',
   'sticky-feature-repeated': 'Tall sticky feature column repeated in the next tile',
+  'hero-heading-visible': 'Exit tween jumped to its end: hero heading faded out of the capture',
+  'impact-faded':'Scroll-linked fade caught part-way: a figure or heading faded or cut',
+  'tab-state': 'Timed tabs caught in two states across a tile edge',
+  'carousel-kept-rotating': 'Carousel kept rotating during the capture',
+  'background-follows-section': 'Page background recoloured by scroll, cut at a tile edge',
   'floating-extras-captured': 'Cookie banner, popup or floating button captured over the page',
   'fixed-nav-kept': 'Fixed site header hidden along with the floating extras'
 };
