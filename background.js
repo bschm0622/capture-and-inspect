@@ -448,12 +448,12 @@ async function stitchTiles(tab, info) {
         placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, match, retake: true });
         bmp.close();
         continue;
-      } else if (match.match !== 'mismatch') {
+      } else if (match.match !== 'mismatch' || res.drift != null) {
         // (After a mismatch the tile stays where position puts it: the
         // measured drift when the page gave one, which a mismatch doesn't
         // overrule, since it is usually something that changed between the
-        // two shots, like an image that finished loading; else the scroll
-        // position.)
+        // two shots, like an image that finished loading, and shooting the
+        // tile above again can settle it; else the scroll position.)
         agree = disagreement(grid, gw, seam, top, tileGrid, tileH, hidden);
       }
     }
