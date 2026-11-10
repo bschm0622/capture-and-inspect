@@ -70,6 +70,10 @@ async function checkSite(site) {
   fs.writeFileSync(path.join(outDir, `${file}.preview.jpg`), await preview(cap.png, 260));
   rec.png = `${file}.png`;
   rec.preview = `${file}.preview.jpg`;
+  if (cap.shot) {
+    fs.writeFileSync(path.join(outDir, `${file}.first-screen.jpg`), await preview(cap.shot, 1388));
+    rec.firstScreen = `${file}.first-screen.jpg`;
+  }
 
   const img = await loadCapture(cap.png, DPR);
   const tiles = tileRects(cap);
@@ -88,10 +92,11 @@ async function checkSite(site) {
 
   for (const [name, r] of Object.entries(runGeneric(img, cap))) rec.checks[name] = { kind: 'generic', ...r };
   const vh = cap.prepare ? cap.prepare.viewportHeight : VIEWPORT.height;
+  const shot = cap.shot ? await loadCapture(cap.shot, DPR) : null;
   for (const [name, fn] of Object.entries(site.checks || {})) {
     try {
       if (cap.siteFacts && cap.siteFacts.error) throw new Error(`collect failed: ${cap.siteFacts.error}`);
-      rec.checks[name] = { kind: 'site', ...fn({ img, cap, tiles, vh, facts: cap.siteFacts || {} }) };
+      rec.checks[name] = { kind: 'site', ...fn({ img, cap, tiles, vh, shot, facts: cap.siteFacts || {} }) };
     } catch (e) {
       rec.checks[name] = { kind: 'site', pass: false, value: null, detail: `check error: ${e.message}`, flags: [] };
     }

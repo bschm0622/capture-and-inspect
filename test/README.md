@@ -18,6 +18,7 @@ Options: `--headed` (show the browser), `--jobs N` (sites in parallel, default 1
 Each run writes `test/out/<timestamp>-<label>/` (git-ignored):
 
 - `<host>.png`: the full capture, exactly as the extension returned it
+- `<host>.first-screen.jpg`: the page's first screen as a visitor sees it, taken after the capture (cookie banners and popups included)
 - `report.html`: contact sheet with a preview per site (click it for the full PNG), every check's result, and red boxes on the preview at each flagged y-range
 - `results.json`: per site, every check's pass/fail, measured value, detail and flagged ranges, plus capture size, tile tops, tile count, duration and the page facts used. Also `tileLog` (for each shot: where it was asked to scroll, where it landed, the page height then and how far the page moved since the last shot) and, from the extension itself, `warnings` and `placements` (where each tile was put and how its overlap matched; `null` for commits from before the extension reported them)
 
@@ -33,6 +34,7 @@ The exit code is 1 if any check on any site fails or a site couldn't be captured
 - The capture is started by calling `self.__runCapture(tab)` in the service worker. The `result.html` tab it opens is closed, and the PNG comes from the returned data URL.
 - Tile positions are recorded from outside, with no change to the extension: the harness wraps `drawImage` on the worker's stitching canvas and `chrome.tabs.sendMessage`. That gives the exact y of every tile in the output, including the clamped last tile. Only the 9-argument form counts as a tile; the worker's other draws (its matching grids, the final crop) use shorter forms. Tiles overlap and each paints only the rows below what is already painted, so a tile has two positions: `y`/`h`, the whole screen it shot, and `drawY`, where its painted part starts. Seams are looked for at `drawY`; repeated overlays compare tiles by `y` but only over rows the later tile painted.
 - Page facts are read twice: before the capture (the real scrollable height, counting an inner scrolling container) and after it, when the extension has restored the page and lazy content has loaded (element positions for site checks).
+- After the capture the harness also screenshots the restored page's first screen (`shot`), so a check can ask whether something a visitor sees there, like a cookie banner or the site's header, made it into the capture.
 
 ## The generic detectors
 
@@ -56,7 +58,10 @@ Blind spots: a hole narrower than 90% of the width; rows painted with the wrong 
 
 ## Site checks
 
-`test/sites.mjs` has one entry per regression site and one check per known failure. A check gets `{ img, cap, tiles, vh, facts }`, where `facts` is what the site's `collect` function returned from the page after the capture. It returns `{ pass, value, detail, flags }`. Helpers: `flatShare`, `findStrip` and `seamRepeats` (rows just below a tile edge that repeat the rows just above it, which is what a tile placed too low leaves) in `test/lib/regions.mjs`; `seams`, `repeatedOverlays` and `blankBands` from the detectors accept a `region` to look inside one part of the page.
+`test/sites.mjs` has one entry per regression site and one check per known failure. A check gets `{ img, cap, tiles, vh, shot, facts }`, where `facts` is what the site's `collect` function returned from the page after the capture and `shot` is the first-screen screenshot, loaded like a capture. It returns `{ pass, value, detail, flags }`. Helpers: `flatShare`, `findStrip`, `seamRepeats` (rows just below a tile edge that repeat the rows just above it, which is what a tile placed too low leaves) and `showsIn` in `test/lib/regions.mjs`; `seams`, `repeatedOverlays` and `blankBands` from the detectors accept a `region` to look inside one part of the page.
+
+`showsIn(img, shot, rect)` compares an element's own marks (the pixels on the screenshot far from the element's most common colour: text, icons, edges) with the capture at the same place, and returns the share the capture reproduces, or null when there are too few to say. Whatever sits behind a hidden element doesn't count, so a hidden cookie banner scores near 0 and a captured one near 1. Two shared checks use it: `floating-extras-captured` (the extras listed in `facts.extras` must score under 0.6) and `fixed-nav-kept` (the header in `facts.nav` must score 0.6 or more, so hiding extras can't take the header with them). On the regression set a captured extra scores 0.87–1.0 and a hidden one 0–0.39. For a see-through header over a video (hitt.com), `light: true` compares only its near-white type.
+Blind spots: a see-through extra (a dimming scrim) has no marks of its own; the generic seam detector catches its edge at the first tile boundary instead. An element over a video or animation can score lower than it should, since the capture froze a different frame from the screenshot.
 
 ### Adding a site
 

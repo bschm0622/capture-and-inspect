@@ -10,7 +10,33 @@
 // generic detectors.
 
 import { seams, repeatedOverlays, boundaries } from './lib/detectors.mjs';
-import { flatShare, findStrip, seamRepeats, result } from './lib/regions.mjs';
+import { flatShare, findStrip, seamRepeats, showsIn, result } from './lib/regions.mjs';
+
+// Floating extras (cookie banners, popups, promo and widget buttons) found on
+// the live page's first screen after the capture, and the site's fixed
+// header. `facts.extras` / `facts.nav` hold their boxes; `shot` is that first
+// screen. An extra must not be in the capture; the header must.
+const SHOWN = 0.6; // share of an element's own marks the capture reproduces
+
+function extrasCaptured({ img, shot, facts }) {
+  const ex = facts.extras || [];
+  if (!ex.length) return result(false, null, 'no floating extra showing on the page to look for');
+  if (!shot) return result(false, null, 'no first-screen screenshot');
+  const seen = ex.map((e) => ({ e, s: showsIn(img, shot, e) })).filter((f) => f.s != null);
+  if (!seen.length) return result(false, null, `${ex.length} extra(s) found, none with enough marks to compare`);
+  const flags = seen.filter((f) => f.s >= SHOWN).map((f) => ({ y0: f.e.top, y1: f.e.top + f.e.h, note: `${f.e.what} in the capture (${Math.round(f.s * 100)}% of its marks)` }));
+  const most = Math.max(...seen.map((f) => f.s));
+  return result(flags.length === 0, +most.toFixed(2), seen.map((f) => `${f.e.what} ${Math.round(f.s * 100)}%`).join(', ') + ` of marks in the capture (fail at ${SHOWN * 100}%)`, flags);
+}
+
+function navKept({ img, shot, facts }) {
+  const n = facts.nav;
+  if (!n) return result(false, null, 'fixed header not found on the page');
+  if (!shot) return result(false, null, 'no first-screen screenshot');
+  const s = showsIn(img, shot, n, { light: !!n.light });
+  if (s == null) return result(false, null, 'header has too few marks to compare');
+  return result(s >= SHOWN, +s.toFixed(2), `${Math.round(s * 100)}% of the header's marks in the capture (fail under ${SHOWN * 100}%)`, s >= SHOWN ? [] : [{ y0: n.top, y1: n.top + n.h, note: 'header missing' }]);
+}
 
 export const SITES = [
   {
@@ -18,9 +44,15 @@ export const SITES = [
     url: 'https://newchristendompress.com',
     collect: () => {
       const R = (el) => { const r = el.getBoundingClientRect(); return { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; };
-      return { videos: [...document.querySelectorAll('video')].map(R).filter((r) => r.w >= 300 && r.h >= 200) };
+      const shown = (el) => { const r = el.getBoundingClientRect(), cs = getComputedStyle(el); return r.width > 0 && r.height > 0 && r.top < innerHeight && cs.visibility !== 'hidden' && +cs.opacity > 0; };
+      const extras = [...document.querySelectorAll('.popup-teaser, dialog[open], [aria-modal="true"]')].filter(shown).map((el) => ({ what: el.className ? `.${String(el.className).trim().split(/\s+/)[0]}` : el.tagName.toLowerCase(), ...R(el) }));
+      return { videos: [...document.querySelectorAll('video')].map(R).filter((r) => r.w >= 300 && r.h >= 200), extras };
     },
     checks: {
+      // The "Get 10% off" button and the newsletter popup floated over the
+      // hero (the popup's dimming also left a step at the first tile edge,
+      // which the generic seam detector catches).
+      'floating-extras-captured': extrasCaptured,
       // Video frames differ between tiles, leaving bands.
       'video-frame-bands'({ img, tiles, facts }) {
         if (!facts.videos || !facts.videos.length) return result(false, null, 'no video found on the page');
@@ -244,9 +276,12 @@ export const SITES = [
         }
         return b - t > 50 && rt - l > 100 ? { top: Math.round(t + scrollY), left: Math.round(l), w: Math.round(rt - l), h: Math.round(b - t) } : null;
       };
-      return { marquees: [...new Set(tracks.map((t) => t.parentElement))].map(visible).filter(Boolean) };
+      const consent = [...document.querySelectorAll('.tpr-consent')].filter((el) => el.getBoundingClientRect().height > 0).map((el) => ({ what: 'consent notice', ...R(el) }));
+      return { marquees: [...new Set(tracks.map((t) => t.parentElement))].map(visible).filter(Boolean), extras: consent };
     },
     checks: {
+      // The cookie notice sat over the hero in the first tile.
+      'floating-extras-captured': extrasCaptured,
       // Infinite CSS review marquee raced off screen, leaving a blank band.
       'marquee-blank'({ img, facts }) {
         const ms = facts.marquees || [];
@@ -282,9 +317,16 @@ export const SITES = [
       const R = (el) => { const r = el.getBoundingClientRect(); return { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; };
       // The feature block that sticks beside the scrolling column.
       const el = [...document.querySelectorAll('body *')].find((e) => getComputedStyle(e).position === 'sticky' && e.getBoundingClientRect().height > innerHeight * 0.6);
-      return el ? { block: R(el), section: R(el.parentElement) } : { block: null };
+      // The cookie box, and the big fixed WHITNEY logo that heads the page.
+      const extras = [...document.querySelectorAll('.cky-consent-container')].filter((e) => e.getBoundingClientRect().height > 0).map((e) => ({ what: 'cookie notice', ...R(e) }));
+      const logo = [...document.querySelectorAll('body *')].find((e) => getComputedStyle(e).position === 'fixed' && e.getBoundingClientRect().top < 150 && e.getBoundingClientRect().width > innerWidth * 0.5 && e.querySelector('svg, img'));
+      return { ...(el ? { block: R(el), section: R(el.parentElement) } : { block: null }), extras, nav: logo ? R(logo) : null };
     },
     checks: {
+      // The cookie notice sat over the hero.
+      'floating-extras-captured': extrasCaptured,
+      // Hiding the floating extras must not take the fixed logo with them.
+      'fixed-nav-kept': navKept,
       // A tall sticky column (the Lichtenstein feature) follows the reader
       // down, so it shows up again in the next tile.
       // Looked for with the repeated-overlay detector inside the block's
@@ -297,6 +339,40 @@ export const SITES = [
         const r = repeatedOverlays(img, tiles, { region: { y0: s.top, y1: s.top + s.h, x: s.left, w: s.w } });
         return result(r.pass, r.value, `${r.flags.length} strip(s) of the sticky column (${s.top}-${s.top + s.h}px) repeated at the tile step`, r.flags);
       }
+    }
+  },
+  {
+    host: 'www.hitt.com',
+    url: 'https://www.hitt.com',
+    collect: () => {
+      const R = (el) => { const r = el.getBoundingClientRect(); return { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; };
+      // The accessibility button lives in a shadow root.
+      const all = [];
+      const walk = (root) => root.querySelectorAll('*').forEach((el) => { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); });
+      walk(document.body);
+      const shown = (el) => { const r = el.getBoundingClientRect(), cs = getComputedStyle(el); return r.width > 0 && r.height > 0 && r.top < innerHeight && cs.visibility !== 'hidden' && +cs.opacity > 0; };
+      const extras = [
+        ...all.filter((el) => el.matches('.cky-consent-container') && shown(el)).map((el) => ({ what: 'cookie banner', ...R(el) })),
+        ...all.filter((el) => el.matches('.trigger-button') && shown(el)).map((el) => ({ what: 'accessibility button', ...R(el) }))
+      ];
+      // The fixed header is a 1px box its rows spill out of: measure them.
+      const header = document.querySelector('header[role="banner"]');
+      let nav = null;
+      if (header) {
+        const rows = [...header.querySelectorAll('*')].filter(shown).map((el) => el.getBoundingClientRect()).filter((r) => r.top >= 0 && r.bottom <= 150);
+        // It's see-through over the hero video, so only its white type is
+        // compared (the video shows a different frame in the screenshot).
+        if (rows.length) nav = { top: 0, left: 0, w: innerWidth, h: Math.round(Math.max(...rows.map((r) => r.bottom))), light: true };
+      }
+      return { extras, nav };
+    },
+    checks: {
+      // A cookie banner across the bottom of the first screen and an
+      // accessibility button beside it (earlier, the button repeated in
+      // every tile).
+      'floating-extras-captured': extrasCaptured,
+      // The fixed header must still head the capture.
+      'fixed-nav-kept': navKept
     }
   }
 ];
@@ -315,6 +391,8 @@ export const KNOWN = {
   'garden-gap-blank': 'Fixed garden photo behind a gap left a white band',
   'marquee-blank': 'Infinite CSS review marquee raced and left a blank band',
   'page-moved-under-tiles': 'Page height changed between tiles: strip repeated at a tile edge',
-  'sticky-feature-repeated': 'Tall sticky feature column repeated in the next tile'
+  'sticky-feature-repeated': 'Tall sticky feature column repeated in the next tile',
+  'floating-extras-captured': 'Cookie banner, popup or floating button captured over the page',
+  'fixed-nav-kept': 'Fixed site header hidden along with the floating extras'
 };
 

@@ -182,6 +182,9 @@ export async function captureSite(extDir, site, { headless = true, timeoutMs = 2
     // content below the fold has loaded during its pre-scroll, so element
     // positions here match the capture's layout better than the ones before.
     out.factsAfter = await page.evaluate(pageFacts).catch(() => null);
+    // The first screen as a visitor sees it now, floating extras and all,
+    // for checks that ask whether something on it reached the capture.
+    out.shot = await page.screenshot({ type: 'png' }).catch(() => null);
     if (site.collect) {
       out.siteFacts = await withTimeout(page.evaluate(site.collect), 30000, 'site facts').catch((e) => ({ error: String(e.message || e) }));
     }

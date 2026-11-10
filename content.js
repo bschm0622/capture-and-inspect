@@ -1,7 +1,9 @@
 // Injected on demand by background.js for each capture.
 // Handles all page-side work: freezing animations, pre-scrolling to trigger
 // lazy content, scrolling tile-by-tile, settling, and hiding fixed/sticky
-// overlays after the first tile. Communicates via chrome.runtime messages.
+// overlays: floating extras (cookie banners, popups, chat bubbles) in every
+// tile, the site's header after the first. Communicates via chrome.runtime
+// messages.
 
 (() => {
   // Guard against double-injection (executeScript may run more than once).
@@ -19,7 +21,7 @@
   let unwrapped = [];           // [{el, style}] for restore
   let hiddenEls = [];           // [{el, prev}] for restore
   let stickyHeaders = new Set(); // sticky elements that behave like a top nav
-  let fixedAtTop = new Set();    // elements already `fixed` at scroll 0
+  let overlays = new Map();      // fixed or sticky element -> 'nav' | 'backdrop' | 'extra' | 'content'
   let frozenVideos = new Map();  // video -> {time, wasPlaying}
   let firstScreen = new Map();   // element -> transform at scroll 0
   let pinned = [];               // elements held at their scroll-0 transform
@@ -375,33 +377,186 @@
   }
 
   // Every element on the page, including ones inside shadow roots, where
-  // chat widgets (LeadConnector, Intercom and the like) usually live.
+  // chat widgets (LeadConnector, Intercom and the like) usually live. Many
+  // widgets close their shadow root so page scripts can't reach in; an
+  // extension can still open it. Only HTML elements can host one, and the
+  // call throws on anything else (SVG).
+  const shadowOf = chrome.dom && chrome.dom.openOrClosedShadowRoot
+    ? (el) => {
+      if (!(el instanceof HTMLElement)) return null;
+      try { return chrome.dom.openOrClosedShadowRoot(el); } catch (_) { return el.shadowRoot; }
+    }
+    : (el) => el.shadowRoot;
+
   function allElements() {
     const out = [];
     const walk = (root) => root.querySelectorAll('*').forEach((el) => {
       out.push(el);
-      if (el.shadowRoot) walk(el.shadowRoot);
+      const shadow = shadowOf(el);
+      if (shadow) walk(shadow);
     });
     if (document.body) walk(document.body);
     return out;
   }
 
-  function findFixedAtTop() {
-    allElements().forEach((el) => {
-      if (getComputedStyle(el).position === 'fixed') fixedAtTop.add(el);
+  // Where a fixed element shows on screen. A wrapper with no size of its own
+  // (a zero-height header, a widget root whose bubble is positioned inside
+  // it) is measured by what it holds.
+  function screenBox(el) {
+    const r = el.getBoundingClientRect();
+    if (r.width >= 2 && r.height >= 2) return r;
+    let box = null;
+    const inner = el.querySelectorAll('*');
+    for (let i = 0; i < inner.length && i < 300; i++) {
+      const c = inner[i].getBoundingClientRect();
+      if (c.width < 2 || c.height < 2) continue;
+      box = box
+        ? { left: Math.min(box.left, c.left), top: Math.min(box.top, c.top), right: Math.max(box.right, c.right), bottom: Math.max(box.bottom, c.bottom) }
+        : { left: c.left, top: c.top, right: c.right, bottom: c.bottom };
+    }
+    return box && { ...box, width: box.right - box.left, height: box.bottom - box.top };
+  }
+
+  const DIALOG = 'dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"]';
+  const NAV = 'nav, header, [role="navigation"], [role="banner"]';
+
+  const shows = (el) => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && Number(cs.opacity) > 0;
+  };
+
+  // A full-screen layer that sits over the page rather than behind it: an
+  // open dialog, or a dimming scrim (a see-through colour with no picture in
+  // it). A page's own full-screen background or hero (a recoloured layer, a
+  // garden photo, a fixed video with a tint over it) holds a picture or is
+  // opaque, and isn't one.
+  function isScrimOrDialog(el) {
+    if (el.matches(DIALOG) || [...el.querySelectorAll(DIALOG)].some(shows)) return true;
+    if (el.querySelector('img, picture, video, canvas, iframe, svg image')) return false;
+    const vw = document.documentElement.clientWidth;
+    const vh = window.innerHeight;
+    const layers = [el, ...Array.from(el.children)].filter((c) => {
+      const r = c.getBoundingClientRect();
+      return r.width >= vw * 0.9 && r.height >= vh * 0.9;
+    });
+    // A gradient is still a scrim (New Christendom Press tints with one); a
+    // background picture isn't.
+    const seeThrough = (color) => {
+      const a = color.match(/rgba\([^)]*,\s*([\d.]+)\)/);
+      return !!a && Number(a[1]) > 0 && Number(a[1]) < 1;
+    };
+    return layers.some((c) => {
+      const cs = getComputedStyle(c);
+      if (/url\(/.test(cs.backgroundImage)) return false;
+      if (cs.backdropFilter && cs.backdropFilter !== 'none') return true;
+      const stops = cs.backgroundImage.match(/rgba?\([^)]*\)/g) || [];
+      return seeThrough(cs.backgroundColor) || (stops.length > 0 && stops.every(seeThrough));
     });
   }
 
-  // Hide overlays that would otherwise repeat in every tile: everything that
-  // was `fixed` at scroll 0 (nav bars, chat widgets, cookie banners), the
-  // sticky top-navs detected at scroll 0, and anything that only turned
-  // `fixed` once the page scrolled (theme "sticky on scroll" headers, floating
-  // call buttons). Runs before every tile after the first, because those late
-  // ones don't exist yet at the top. A late `fixed` element taller than most
-  // of the viewport is a pinned content section, so it stays visible.
+  // The one rule for things that stay put while the page scrolls, decided
+  // at scroll 0 and applied before every tile:
+  // - 'nav': the site's own header, kept in the first tile and hidden after
+  //   (it would repeat at every tile top otherwise). Anchored to the top of
+  //   the screen and either wide and not too tall, or holding the site's
+  //   navigation (a nav or header, several links, or a short logo or menu
+  //   button in the corner).
+  // - 'backdrop': part of the first screen's design that stays put while
+  //   the page scrolls over it: a full-screen background or hero layer, or
+  //   a big fixed panel low in the stacking order. Like the header, it
+  //   shows in the first tile only.
+  // - 'extra': everything else floats over the page and isn't part of it:
+  //   cookie banners and consent boxes, newsletter and promo popups and their
+  //   dimming, chat bubbles, accessibility widgets, call buttons, back-to-top
+  //   buttons. Anything that is a dialog counts here too, wherever it sits.
+  //   Hidden for the whole capture, the first tile included.
+  function overlayRole(el) {
+    const vw = document.documentElement.clientWidth;
+    const vh = window.innerHeight;
+    const r = screenBox(el);
+    if (el.matches(DIALOG)) return 'extra';
+    if (r.width >= vw * 0.9 && r.height >= vh * 0.9) return isScrimOrDialog(el) ? 'extra' : 'backdrop';
+    if (r.top <= 150) {
+      const h = Math.max(r.height, el.scrollHeight);
+      if (r.width >= vw * 0.5 && h < vh * 0.6) return 'nav';
+      if (el.matches(NAV) || el.querySelector(NAV) || el.querySelectorAll('a[href]').length >= 3) return 'nav';
+      if (h < 150 && el.querySelector('a[href], button, img, svg')) return 'nav';
+    }
+    // A big panel that isn't a dialog and sits low in the stacking order is
+    // first-screen content the page scrolls over (a fixed hero title or
+    // promo). Cookie boxes, chat windows and popups that big are stacked
+    // far above everything else.
+    if (r.width * r.height >= vw * vh * 0.2 && stackLevel(el) <= 10 && !isScrimOrDialog(el)) return 'backdrop';
+    return 'extra';
+  }
+
+  // The z-index an element is painted at: its own, or the nearest
+  // ancestor's that sets one.
+  function stackLevel(el) {
+    for (let a = el; a; a = a.parentElement) {
+      const z = getComputedStyle(a).zIndex;
+      if (z !== 'auto') return Number(z);
+    }
+    return 0;
+  }
+
+  // Something that turned `fixed` only after the page scrolled: a "sticky on
+  // scroll" header, a chat bubble that slid in, a popup on a timer, or a
+  // content section pinned while the rest scrolls past. Only the last is
+  // part of the page: tall, wide and not a dialog or a scrim.
+  function lateRole(el) {
+    const r = screenBox(el);
+    const tall = r.height >= window.innerHeight * 0.6 && r.width >= document.documentElement.clientWidth * 0.5;
+    return tall && !el.matches(DIALOG) && !isScrimOrDialog(el) ? 'content' : 'extra';
+  }
+
+  // Sort every fixed element on screen that hasn't been sorted yet. At scroll
+  // 0 that is the rule above; further down, only the late rule can apply.
+  // Elements with nothing to show yet (a closed drawer, a popup not opened)
+  // wait until they do.
+  function sortOverlays(atTop) {
+    allElements().forEach((el) => {
+      if (overlays.has(el) || getComputedStyle(el).position !== 'fixed') return;
+      const r = screenBox(el);
+      if (!r || r.width <= 0 || r.height <= 0) return;
+      overlays.set(el, atTop ? overlayRole(el) : lateRole(el));
+    });
+  }
+
+  // Popups usually lock the page while they're open: overflow hidden on html
+  // or body, or the body pinned in place with a negative top. Hiding the
+  // popup leaves the lock, so undo it for the capture; restore() puts it
+  // back. The overflow lock is only touched while a popup is up, since some
+  // pages lock the document for good and scroll an inner div instead.
+  function unlockScroll() {
+    const b = document.body;
+    const h = document.documentElement;
+    if (!b) return;
+    const bs = getComputedStyle(b);
+    if (bs.position === 'fixed' && (parseFloat(bs.top) < 0 || b.scrollHeight > window.innerHeight + 10)) {
+      unwrapped.push({ el: b, style: b.getAttribute('style') });
+      b.style.setProperty('position', 'static', 'important');
+      b.style.setProperty('top', 'auto', 'important');
+    }
+    const popupUp = [...overlays].some(([el, role]) => role === 'extra' && el.isConnected &&
+      getComputedStyle(el).display !== 'none' && (el.matches(DIALOG) || isScrimOrDialog(el)));
+    if (!popupUp) return;
+    for (const el of [h, b]) {
+      if (!/hidden|clip/.test(getComputedStyle(el).overflowY)) continue;
+      unwrapped.push({ el, style: el.getAttribute('style') });
+      el.style.setProperty('overflow-y', 'visible', 'important');
+    }
+  }
+
+  // Hide what shouldn't be in this tile: the floating extras always, and from
+  // the second tile on also the header and backdrop seen at scroll 0, the
+  // sticky top-navs, and late fixed elements other than pinned sections.
+  // Runs before every tile, because some of these only appear partway
+  // through (a popup on a timer, a header that turns fixed on scroll).
   // Hidden with opacity as well as visibility: a child can override its
   // parent's `visibility: hidden` (Elementor buttons do), but not opacity.
-  function hideStickies() {
+  function hideOverlays(index) {
     const vh = window.innerHeight;
     const hide = (el) => {
       if (hiddenEls.some((h) => h.el === el)) return;
@@ -417,12 +572,11 @@
       el.style.setProperty('visibility', 'hidden', 'important');
       el.style.setProperty('opacity', '0', 'important');
     };
-    fixedAtTop.forEach(hide);
-    stickyHeaders.forEach(hide);
-    allElements().forEach((el) => {
-      if (fixedAtTop.has(el) || getComputedStyle(el).position !== 'fixed') return;
-      if (el.getBoundingClientRect().height < vh * 0.6) hide(el);
-    });
+    sortOverlays(index === 0);
+    for (const [el, role] of overlays) {
+      if (role === 'extra' || (index > 0 && role !== 'content')) hide(el);
+    }
+    if (index > 0) stickyHeaders.forEach(hide);
   }
 
   // Some sites (instant.ai) lock html and body to the window height and
@@ -493,12 +647,25 @@
     return r.width < document.documentElement.clientWidth * 0.7 && !!box && box.height > h * 1.5;
   }
 
+  // A small sticky element told to stick in the lower half of the screen
+  // (Loops' "Book a demo" card, `top: calc(100vh - …)`) is a floating button
+  // that follows the reader, not a heading. Put back in flow it lands in
+  // the middle of the content, so it's hidden like the other extras.
+  function floatsLow(el, cs) {
+    const top = parseFloat(cs.top);
+    const r = screenBox(el);
+    return top >= window.innerHeight * 0.5 && !!r &&
+      r.height < window.innerHeight * 0.3 && r.width < document.documentElement.clientWidth * 0.5;
+  }
+
   function settleOverlays() {
     allElements().forEach((el) => {
       const cs = getComputedStyle(el);
       if (cs.position === 'sticky' && cs.bottom !== 'auto' && cs.top === 'auto') {
         unwrapped.push({ el, style: el.getAttribute('style') });
         el.style.setProperty('position', 'relative', 'important');
+      } else if (cs.position === 'sticky' && floatsLow(el, cs)) {
+        overlays.set(el, 'extra');
       } else if (cs.position === 'sticky' && isStickyColumn(el)) {
         unwrapped.push({ el, style: el.getAttribute('style') });
         el.style.setProperty('position', 'relative', 'important');
@@ -613,7 +780,7 @@
     firstScreen = new Map();
     anchors = [];
     stickyHeaders = new Set();
-    fixedAtTop = new Set();
+    overlays = new Map();
     if (styleEl && styleEl.parentNode) styleEl.parentNode.removeChild(styleEl);
     styleEl = null;
     scroller.scrollTo(0, originalScrollY);
@@ -624,6 +791,7 @@
       try {
         if (msg.cmd === 'prepare') {
           originalScrollY = scroller.scrollTop || window.scrollY || 0;
+          unlockScroll();
           pauseLoopingAnimations();
           injectStyle();
           unwrapInnerScroller();
@@ -633,7 +801,7 @@
           settleOverlays();
           placeRevealedBackdrop();
           findStickyHeaders(); // measured at scroll 0, after preScroll settles
-          findFixedAtTop();
+          sortOverlays(true);
           recordFirstScreen();
           holdScrollLinked();
           const rawH = pageHeight();
@@ -652,6 +820,7 @@
           });
         } else if (msg.cmd === 'tile') {
           covered = [];
+          unlockScroll();
           scroller.scrollTo(0, msg.y);
           await raf();
           await raf();
@@ -660,9 +829,11 @@
           // that turn fixed on scroll appear within a frame or two, and
           // hiding them only at the last moment isn't always painted by the
           // time the tile is shot. The second pass catches anything slower.
-          if (msg.index > 0) { hideStickies(); pinFirstScreen(); }
+          hideOverlays(msg.index);
+          if (msg.index > 0) pinFirstScreen();
           await sleep(SETTLE_GRACE_MS);
-          if (msg.index > 0) { hideStickies(); pinFirstScreen(); }
+          hideOverlays(msg.index);
+          if (msg.index > 0) pinFirstScreen();
           await freezeVideos();
           await raf();
           await raf();

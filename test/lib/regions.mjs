@@ -66,4 +66,39 @@ export function seamRepeats(img, boundaryRows, { maxD = 868, band = 160, minRows
   return flags;
 }
 
+// Whether something seen on the live page at scroll 0 made it into the
+// capture at the same place. `shot` is a screenshot of the page's first
+// screen taken after the capture (loaded like a capture), `rect` the
+// element's box on it. Compares only the element's own marks, the pixels
+// far from its most common colour (text, icons, edges), so whatever sits
+// behind a hidden element doesn't count. Returns the share of those pixels
+// the capture reproduces, or null when the element has too few to say.
+// With `light`, the marks are only the near-white pixels (light text on a
+// see-through header over a video, whose frame differs between the capture
+// and the screenshot), and the capture must be near-white there too.
+export function showsIn(img, shot, rect, { light = false } = {}) {
+  const [x0, x1] = cols(img, rect.left + 2, Math.max(1, rect.w - 4));
+  const y0 = Math.max(0, Math.round(rect.top) + 2), y1 = Math.min(shot.H, img.H, Math.round(rect.top + rect.h) - 2);
+  const hist = new Array(32).fill(0);
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) hist[shot.luma[y * shot.W + x] >> 3]++;
+  const bg = hist.indexOf(Math.max(...hist)) * 8 + 4;
+  let ink = 0, same = 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const v = shot.luma[y * shot.W + x];
+      if (light ? v < 215 : Math.abs(v - bg) < 48) continue;
+      ink++;
+      // A row either way: the capture's rows are sampled from a taller
+      // image, so a 1px text stroke can land one row off the screenshot's.
+      const near = (dy) => {
+        if (y + dy < 0 || y + dy >= img.H) return false;
+        const c = img.luma[(y + dy) * img.W + x];
+        return light ? c >= 200 : Math.abs(c - v) < 24;
+      };
+      if (near(0) || near(-1) || near(1)) same++;
+    }
+  }
+  return ink < 20 ? null : same / ink;
+}
+
 export const result =(pass, value, detail, flags = []) => ({ pass, value, detail, flags });
