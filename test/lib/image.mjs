@@ -22,6 +22,21 @@ export async function loadCapture(png, dpr = 2) {
     luma[i] = (data[j] * 77 + data[j + 1] * 150 + data[j + 2] * 29) >> 8;
   }
   const img = { W, H, rgb: data, luma, cssWidth: Math.round(meta.width / dpr), devWidth: meta.width, devHeight: meta.height };
+  // Rows no tile ever painted: the stitching canvas starts transparent and a
+  // browser screenshot never is, so a fully transparent row is a hole.
+  img.unpainted = new Uint8Array(H);
+  if (meta.hasAlpha) {
+    const alpha = await sharp(png, { limitInputPixels: false })
+      .extractChannel(3)
+      .resize({ width: COLS, height: H, kernel: 'nearest', fit: 'fill' })
+      .raw()
+      .toBuffer();
+    for (let y = 0; y < H; y++) {
+      let clear = 0;
+      for (let x = 0; x < W; x++) if (alpha[y * W + x] === 0) clear++;
+      if (clear >= W * 0.9) img.unpainted[y] = 1;
+    }
+  }
   img.rowStd = new Float32Array(H);
   img.rowMean = new Float32Array(H * 3);
   for (let y = 0; y < H; y++) {

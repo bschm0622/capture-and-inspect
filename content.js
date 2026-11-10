@@ -26,6 +26,8 @@
   let scrollLinked = new Map();  // element -> {ys, xs, tf} seen while pre-scrolling
   let backdrops = new Map();     // full-screen fixed layer -> colors seen while pre-scrolling
   let pausedAnimations = [];     // looping CSS animations held still during capture
+  let anchors = [];              // [{el, y}] page content seen in the last tile, and where it sat
+  let covered = [];              // screen rects of overlays hidden during this tile
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
@@ -405,6 +407,12 @@
       if (hiddenEls.some((h) => h.el === el)) return;
       const cs = getComputedStyle(el);
       if (cs.visibility === 'hidden' || cs.display === 'none') return;
+      // Where it sat on screen: the last tile showed it there, this one
+      // won't, so the worker leaves that area out when it lines them up.
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < vh) {
+        covered.push({ top: Math.round(r.top), bottom: Math.round(r.bottom), left: Math.round(r.left), right: Math.round(r.right) });
+      }
       hiddenEls.push({ el, prev: el.style.visibility, prevOpacity: el.style.opacity });
       el.style.setProperty('visibility', 'hidden', 'important');
       el.style.setProperty('opacity', '0', 'important');
@@ -472,11 +480,17 @@
   // supporting public leaders") follows the reader down, so it lands in
   // every tile it passes through. Measured at scroll 0: top navs sit in the
   // header zone and pinned storytelling sections fill most of the screen,
-  // and both are left alone.
+  // and both are left alone. A taller one that only fills part of the width
+  // inside a much taller container (Whitney's Lichtenstein feature beside
+  // the exhibitions list) is a column the rest of the section scrolls past,
+  // so it goes back in flow too.
   function isStickyColumn(el) {
     const r = el.getBoundingClientRect();
     const h = shownHeight(el);
-    return r.top + scroller.scrollTop > 150 && h > 0 && h < window.innerHeight * 0.6;
+    if (r.top + scroller.scrollTop <= 150 || h <= 0) return false;
+    if (h < window.innerHeight * 0.6) return true;
+    const box = el.parentElement && el.parentElement.getBoundingClientRect();
+    return r.width < document.documentElement.clientWidth * 0.7 && !!box && box.height > h * 1.5;
   }
 
   function settleOverlays() {
@@ -509,6 +523,58 @@
         }
       }
     });
+  }
+
+  // The page can move under the capture between two tiles: a carousel that
+  // resizes to each slide (Premier Roofing's testimonials swing by 300px), a
+  // header that shrinks once the page scrolls, an embed that loads late. To
+  // tell the worker where the next tile belongs, note a few pieces of
+  // ordinary page content in the lower part of each tile, where the next
+  // one overlaps it, and on the next tile measure how far they moved.
+  function pinnedToScreen(el) {
+    for (let a = el; a && a !== document.body; a = a.parentElement) {
+      if (/^(fixed|sticky)$/.test(getComputedStyle(a).position)) return true;
+    }
+    return false;
+  }
+
+  // Sampled from the bottom third of the screen, where the next tile picks
+  // up. Each piece must start close above the point it was found at, so a
+  // big section box whose top sits far away (above a carousel that resizes)
+  // doesn't stand in for the content at the seam.
+  function recordAnchors() {
+    const vw = document.documentElement.clientWidth;
+    const vh = window.innerHeight;
+    const y = scroller.scrollTop;
+    const seen = new Set();
+    anchors = [];
+    for (let row = 0; row < 6; row++) {
+      for (let col = 0; col < 7; col++) {
+        const py = vh * (0.7 + 0.05 * row);
+        const el = document.elementFromPoint(vw * (col + 0.5) / 7, py);
+        if (!el || seen.has(el) || el === document.body || el === document.documentElement) continue;
+        seen.add(el);
+        const r = el.getBoundingClientRect();
+        if (r.height === 0 || r.top < py - 300 || pinnedToScreen(el)) continue;
+        anchors.push({ el, y: r.top + y });
+      }
+    }
+  }
+
+  // How far the content noted on the last tile has moved since, in page px
+  // (positive: it moved down). Null when too few pieces agree to trust.
+  function measureDrift() {
+    const y = scroller.scrollTop;
+    const deltas = anchors
+      .filter((a) => a.el.isConnected)
+      .map((a) => ({ a, r: a.el.getBoundingClientRect() }))
+      .filter(({ r }) => r.height > 0)
+      .map(({ a, r }) => r.top + y - a.y)
+      .sort((p, q) => p - q);
+    if (deltas.length < 3) return null;
+    const mid = deltas[deltas.length >> 1];
+    const agree = deltas.filter((d) => Math.abs(d - mid) <= 2).length;
+    return agree >= Math.max(3, deltas.length / 2) ? mid : null;
   }
 
   function restore() {
@@ -545,6 +611,7 @@
       el.style.removeProperty('--cleanshot-pad');
     });
     firstScreen = new Map();
+    anchors = [];
     stickyHeaders = new Set();
     fixedAtTop = new Set();
     if (styleEl && styleEl.parentNode) styleEl.parentNode.removeChild(styleEl);
@@ -574,14 +641,17 @@
           if (rawH > MAX_PAGE_HEIGHT) {
             console.warn(`[CleanShot] page height ${rawH}px exceeds cap; capturing first ${MAX_PAGE_HEIGHT}px.`);
           }
+          anchors = [];
           sendResponse({
             ok: true,
             pageHeight: capped,
+            rawPageHeight: rawH,
             viewportHeight: window.innerHeight,
             pageWidth: document.documentElement.clientWidth,
             dpr: window.devicePixelRatio || 1
           });
         } else if (msg.cmd === 'tile') {
+          covered = [];
           scroller.scrollTo(0, msg.y);
           await raf();
           await raf();
@@ -596,9 +666,17 @@
           await freezeVideos();
           await raf();
           await raf();
-          // Report where we actually landed (bottom tile clamps short).
+          // Report where we actually landed (bottom tile clamps short), how
+          // far the page moved since the last tile, and how far it scrolls
+          // now, measured as late as possible before the shot.
+          const drift = measureDrift();
+          recordAnchors();
           const actualY = scroller.scrollTop || window.scrollY || 0;
-          sendResponse({ ok: true, actualY, pageHeight: pageHeight() });
+          sendResponse({
+            ok: true, actualY, drift, covered,
+            pageHeight: pageHeight(),
+            maxScroll: Math.max(0, scroller.scrollHeight - window.innerHeight)
+          });
         } else if (msg.cmd === 'finish') {
           restore();
           sendResponse({ ok: true });

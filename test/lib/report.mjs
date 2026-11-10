@@ -33,7 +33,12 @@ export function writeReport(dir, run) {
     const meta = s.error
       ? `<p class="err">FAILED: ${esc(s.error)}</p>`
       : `<p>${s.capture.devWidth}×${s.capture.devHeight}px, ${s.tileCount} tiles at ${esc(s.tileTops.join(', '))}; ${(s.durationMs / 1000).toFixed(0)}s</p>`;
-    return `<section><h2>${esc(s.host)} <small>${esc(s.url)}</small></h2><div class="row">${preview}<div class="res">${meta}<table>${table}</table></div></div></section>`;
+    // What the extension itself reported about the capture.
+    const warns = s.warnings == null ? ''
+      : s.warnings.length
+        ? `<p class="warn">Extension warnings:</p><ul class="warn">${s.warnings.map((w) => `<li><b>${esc(w.kind)}</b> y ${w.y0}–${w.y1}px: ${esc(w.note)}</li>`).join('')}</ul>`
+        : '<p>Extension warnings: none</p>';
+    return `<section><h2>${esc(s.host)} <small>${esc(s.url)}</small></h2><div class="row">${preview}<div class="res">${meta}${warns}<table>${table}</table></div></div></section>`;
   }).join('\n');
 
   const failed = run.sites.filter((s) => !s.pass).length;
@@ -50,7 +55,7 @@ h2{font-size:16px;margin:4px 0}h2 small{font-weight:normal;color:#666}
 .res{flex:1;min-width:0}
 table{border-collapse:collapse;width:100%}td{border-bottom:1px solid #eee;padding:4px 6px;vertical-align:top}
 tr.bad td:first-child{color:#b00;font-weight:bold;white-space:nowrap}tr.ok td:first-child{color:#070}
-ul{margin:2px 0 0 18px;padding:0;color:#444}.err{color:#b00;font-weight:bold}
+ul{margin:2px 0 0 18px;padding:0;color:#444}.err{color:#b00;font-weight:bold}.warn{color:#a60}p.warn{margin-bottom:0}
 </style>
 <h1>Capture regression run</h1>
 <p>Extension: ${esc(run.extension)} · ${esc(run.mode)} Chromium ${esc(run.browserVersion)} · viewport ${run.viewport.width}×${run.viewport.height} @${run.viewport.dpr}x · started ${esc(run.startedAt)} · ${(run.durationMs / 1000).toFixed(0)}s</p>

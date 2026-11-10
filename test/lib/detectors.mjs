@@ -29,16 +29,25 @@ export const T = {
 };
 
 // Tile rectangles in CSS px of the capture, from the recorded drawImage calls.
+// `y` and `h` are where the whole shot (one screen) sits in the capture;
+// `drawY` is where its painted part starts. They differ when the extension
+// draws only the part of a tile below what an earlier tile already painted.
 export function tileRects(cap) {
   const scale = cap.canvas.width / (cap.prepare ? cap.prepare.pageWidth : cap.canvas.width / 2);
-  return cap.draws.map((d) => ({ y: Math.round(d.dy / scale), h: Math.round(d.dh / scale) }));
+  return cap.draws.map((d) => {
+    const k = d.dh / d.sh; // output px per source px
+    return { y: Math.round((d.dy - d.sy * k) / scale), h: Math.round((d.sy + d.sh) * k / scale), drawY: Math.round(d.dy / scale) };
+  });
 }
 
-// Rows where one tile's pixels start (every tile but the first). Each tile
-// overwrites the one before, so the boundary is the later tile's top edge.
+// Rows where one tile's pixels start (every tile but the first): the row
+// where pixels from two different shots meet.
 export function boundaries(tiles, H) {
   const out = [];
-  for (let i = 1; i < tiles.length; i++) if (tiles[i].y > 0 && tiles[i].y < H) out.push(tiles[i].y);
+  for (let i = 1; i < tiles.length; i++) {
+    const y = tiles[i].drawY ?? tiles[i].y;
+    if (y > 0 && y < H) out.push(y);
+  }
   return out;
 }
 
@@ -98,6 +107,10 @@ export function repeatedOverlays(img, tiles, { zone = null, region = null, block
     if (d <= 0) continue;
     const h = Math.min(tiles[k].h, tiles[k + 1].h, img.H - b - 2);
     const oMax = zone ? Math.min(h, zone) : h;
+    // Only rows the later tile painted: where tiles overlap, the rows above
+    // its painted part came from the earlier tile, and comparing those
+    // would compare a tile with itself.
+    const oMin = tiles[k + 1].drawY != null ? Math.max(0, tiles[k + 1].drawY - b) : 0;
     for (let bi = 0; bi < blocks; bi++) {
       const x0 = rx0 + Math.floor((rx1 - rx0) * bi / blocks), x1 = rx0 + Math.floor((rx1 - rx0) * (bi + 1) / blocks);
       let run = null;
@@ -112,7 +125,7 @@ export function repeatedOverlays(img, tiles, { zone = null, region = null, block
         }
         run = null;
       };
-      for (let o = 0; o < oMax; o++) {
+      for (let o = oMin; o < oMax; o++) {
         const ya = a + o, yb = b + o;
         if (region && (yb < region.y0 || yb >= region.y1)) { close(); continue; }
         if (rowStdIn(img, yb, x0, x1) <= T.textured) { if (run && ++run.gap > 12) close(); continue; }
@@ -219,6 +232,21 @@ export function truncation(img, facts, { vh, ratio = T.truncRatio } = {}) {
   };
 }
 
+// (e) Unpainted rows: rows of the capture that are fully transparent, so no
+// tile was ever drawn there. A screenshot is always opaque, so any such row
+// is a hole, including a run at the very bottom.
+export function unpaintedRows(img) {
+  const flags = [];
+  let start = -1;
+  for (let y = 0; y <= img.H; y++) {
+    const hole = y < img.H && img.unpainted[y];
+    if (hole && start < 0) start = y;
+    if (!hole && start >= 0) { flags.push({ y0: start, y1: y, note: `${y - start}px never painted` }); start = -1; }
+  }
+  const total = flags.reduce((s, f) => s + (f.y1 - f.y0), 0);
+  return { pass: total === 0, value: total, detail: `${total} transparent row(s) in ${flags.length} run(s)`, flags };
+}
+
 export function runGeneric(img, cap) {
   const tiles = tileRects(cap);
   const vh = cap.prepare ? cap.prepare.viewportHeight : 868;
@@ -226,6 +254,7 @@ export function runGeneric(img, cap) {
     'blank-band': blankBands(img, { vh }),
     'repeated-overlay': repeatedOverlays(img, tiles),
     'seam': seams(img, tiles),
-    'truncation': truncation(img, cap.factsBefore, { vh })
+    'truncation': truncation(img, cap.factsBefore, { vh }),
+    'unpainted-rows': unpaintedRows(img)
   };
 }

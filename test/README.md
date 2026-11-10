@@ -1,6 +1,6 @@
 # Capture regression harness
 
-Drives the real extension in Chromium over a fixed set of live sites and checks each stitched capture for defects. Live pages change, so nothing is compared with a stored golden image. Instead, detectors look for the marks a broken capture leaves: blank bands, overlays repeated tile after tile, seams at tile boundaries, and a capture shorter than the page.
+Drives the real extension in Chromium over a fixed set of live sites and checks each stitched capture for defects. Live pages change, so nothing is compared with a stored golden image. Instead, detectors look for the marks a broken capture leaves: blank bands, overlays repeated tile after tile, seams at tile boundaries, a capture shorter than the page, and rows no tile ever painted.
 
 ## Running
 
@@ -19,7 +19,9 @@ Each run writes `test/out/<timestamp>-<label>/` (git-ignored):
 
 - `<host>.png`: the full capture, exactly as the extension returned it
 - `report.html`: contact sheet with a preview per site (click it for the full PNG), every check's result, and red boxes on the preview at each flagged y-range
-- `results.json`: per site, every check's pass/fail, measured value, detail and flagged ranges, plus capture size, tile tops, tile count, duration and the page facts used
+- `results.json`: per site, every check's pass/fail, measured value, detail and flagged ranges, plus capture size, tile tops, tile count, duration and the page facts used. Also `tileLog` (for each shot: where it was asked to scroll, where it landed, the page height then and how far the page moved since the last shot) and, from the extension itself, `warnings` and `placements` (where each tile was put and how its overlap matched; `null` for commits from before the extension reported them)
+
+The extension's own warnings (unpainted rows, an overlap that wouldn't match, page height changing by more than a screen, a truncated capture) are printed under each site's line and listed in the report. They don't fail a site; the checks do.
 
 The exit code is 1 if any check on any site fails or a site couldn't be captured.
 
@@ -29,7 +31,7 @@ The exit code is 1 if any check on any site fails or a site couldn't be captured
 - Chromium runs in new headless mode (`channel: 'chromium'`; the headless shell can't load extensions). The window is a real 1388×868 CSS px window at device scale 2, so captures are 2776 px wide. Playwright's viewport emulation is deliberately off: with emulated DPR the page reports 2x while `captureVisibleTab` returns 1x pixels, which stitches into gaps. The harness checks the inner size and DPR after load and fails the site if they're wrong.
 - Each site gets a fresh browser profile. A site that hangs or errors is reported as failed with the reason, and the run continues.
 - The capture is started by calling `self.__runCapture(tab)` in the service worker. The `result.html` tab it opens is closed, and the PNG comes from the returned data URL.
-- Tile positions are recorded from outside, with no change to the extension: the harness wraps `drawImage` on the worker's stitching canvas and `chrome.tabs.sendMessage`. That gives the exact y of every tile in the output, including the clamped last tile.
+- Tile positions are recorded from outside, with no change to the extension: the harness wraps `drawImage` on the worker's stitching canvas and `chrome.tabs.sendMessage`. That gives the exact y of every tile in the output, including the clamped last tile. Only the 9-argument form counts as a tile; the worker's other draws (its matching grids, the final crop) use shorter forms. Tiles overlap and each paints only the rows below what is already painted, so a tile has two positions: `y`/`h`, the whole screen it shot, and `drawY`, where its painted part starts. Seams are looked for at `drawY`; repeated overlays compare tiles by `y` but only over rows the later tile painted.
 - Page facts are read twice: before the capture (the real scrollable height, counting an inner scrolling container) and after it, when the extension has restored the page and lazy content has loaded (element positions for site checks).
 
 ## The generic detectors
@@ -49,9 +51,12 @@ Blind spots: a change that isn't a sharp break, such as a slow colour shift, a s
 **truncation**: the capture is under 70% of the page's real scrollable height, and more than one viewport short. The real height is the larger of the document's scroll height and any inner scrolling container's content height, measured before the capture.
 Blind spots: a page whose height legitimately shrinks during capture (the extension removes ScrollTrigger pin spacers) could be flagged; infinite-scroll pages are capped at 60000 px by the extension; content clipped inside a fixed-height inner region that isn't `overflow: auto/scroll` is invisible to the measurement.
 
+**unpainted-rows**: rows that are fully transparent (at least 90% of sampled columns with alpha 0), so no tile was drawn there. A browser screenshot is always opaque, so any such row is a hole, including a run at the very bottom of the capture.
+Blind spots: a hole narrower than 90% of the width; rows painted with the wrong content (that is what the other detectors and `seamRepeats` are for).
+
 ## Site checks
 
-`test/sites.mjs` has one entry per regression site and one check per known failure. A check gets `{ img, cap, tiles, vh, facts }`, where `facts` is what the site's `collect` function returned from the page after the capture. It returns `{ pass, value, detail, flags }`. Helpers: `flatShare` and `findStrip` in `test/lib/regions.mjs`; `seams`, `repeatedOverlays` and `blankBands` from the detectors accept a `region` to look inside one part of the page.
+`test/sites.mjs` has one entry per regression site and one check per known failure. A check gets `{ img, cap, tiles, vh, facts }`, where `facts` is what the site's `collect` function returned from the page after the capture. It returns `{ pass, value, detail, flags }`. Helpers: `flatShare`, `findStrip` and `seamRepeats` (rows just below a tile edge that repeat the rows just above it, which is what a tile placed too low leaves) in `test/lib/regions.mjs`; `seams`, `repeatedOverlays` and `blankBands` from the detectors accept a `region` to look inside one part of the page.
 
 ### Adding a site
 
@@ -69,7 +74,7 @@ Append to `SITES`:
 }
 ```
 
-`collect` is serialised into the page, so it must be an arrow function with no outside references. A site with no `checks` still gets the four generic detectors.
+`collect` is serialised into the page, so it must be an arrow function with no outside references. A site with no `checks` still gets the five generic detectors.
 
 ### Adding a check
 

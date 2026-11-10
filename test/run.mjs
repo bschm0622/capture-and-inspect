@@ -75,6 +75,14 @@ async function checkSite(site) {
   const tiles = tileRects(cap);
   rec.capture = { devWidth: img.devWidth, devHeight: img.devHeight, cssWidth: img.cssWidth, cssHeight: img.H };
   rec.tileTops = tiles.map((t) => t.y);
+  // What the content script reported for each tile: where it was asked to
+  // scroll, where it landed and how tall the page was at that moment.
+  rec.prepare = cap.prepare || null;
+  rec.tileLog = (cap.tiles || []).map(({ ok, ...t }) => t);
+  // The extension's own report on the capture (null before it had one), and
+  // where it placed each shot.
+  rec.warnings = cap.warnings ?? null;
+  rec.placements = cap.placements ?? null;
   rec.pageFacts = { before: cap.factsBefore, after: cap.factsAfter };
   rec.siteFacts = cap.siteFacts || null;
 
@@ -102,6 +110,7 @@ await Promise.all(Array.from({ length: Math.min(args.jobs, sites.length) }, asyn
     results[i] = rec;
     const failing = Object.entries(rec.checks).filter(([, c]) => !c.pass).map(([n]) => n);
     console.log(`${rec.pass ? 'PASS' : 'FAIL'} ${site.host.padEnd(30)} ${rec.error ? `error: ${rec.error}` : failing.length ? `failing: ${failing.join(', ')}` : ''} (${Math.round((rec.durationMs || 0) / 1000)}s)`);
+    for (const w of rec.warnings || []) console.log(`     warning ${w.kind} y ${w.y0}-${w.y1}: ${w.note}`);
   }
 }));
 

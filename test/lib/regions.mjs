@@ -39,4 +39,31 @@ export function findStrip(img, rect, s0, s1, tol = 3) {
   return { rows: rows.length, matches };
 }
 
-export const result = (pass, value, detail, flags = []) => ({ pass, value, detail, flags });
+// A tile placed too low (the page grew above it between shots) repeats the
+// rows just above its top edge just below it: rows B..B+L equal rows
+// B-d..B-d+L for some d. Looks at every boundary for a run of at least
+// `minRows` textured rows that matches that way, and drops a match that
+// holds nearly as well a few px off d (stripes, dot patterns, tiled
+// textures), like the repeated-overlay detector does.
+export function seamRepeats(img, boundaryRows, { maxD = 868, band = 160, minRows = 24 } = {}) {
+  const flags = [];
+  const diff = (B, d, rows) => rows.reduce((s, o) => s + rowDiff(img, B + o, B - d + o), 0) / rows.length;
+  for (const B of boundaryRows) {
+    const rows = [];
+    for (let o = 0; o < band && B + o < img.H; o++) if (img.rowStd[B + o] > T.textured) rows.push(o);
+    if (rows.length < minRows) continue;
+    for (let d = 8; d <= Math.min(maxD, B); d++) {
+      const own = rows.filter((o) => o < d);
+      if (own.length < minRows) continue;
+      // Cheap rejection on a few rows before the full comparison.
+      if (own.slice(0, 4).some((o) => rowDiff(img, B + o, B - d + o) >= T.matchDiff * 3)) continue;
+      const at0 = diff(B, d, own);
+      if (at0 >= T.matchDiff) continue;
+      const off = Math.min(...[-12, -6, 6, 12].filter((s) => d + s > 0 && d + s <= B).map((s) => diff(B, d + s, own)));
+      if (off > 1 + 2 * at0) { flags.push({ y0: B, y1: B + Math.min(d, band), note: `rows below the tile edge at ${B}px repeat the ${d}px above it` }); break; }
+    }
+  }
+  return flags;
+}
+
+export const result =(pass, value, detail, flags = []) => ({ pass, value, detail, flags });

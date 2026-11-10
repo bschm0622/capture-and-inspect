@@ -9,8 +9,8 @@
 // `waitUntil`, `collect` and `checks`. A site with no checks still gets the
 // generic detectors.
 
-import { seams, repeatedOverlays } from './lib/detectors.mjs';
-import { flatShare, findStrip, result } from './lib/regions.mjs';
+import { seams, repeatedOverlays, boundaries } from './lib/detectors.mjs';
+import { flatShare, findStrip, seamRepeats, result } from './lib/regions.mjs';
 
 export const SITES = [
   {
@@ -260,6 +260,44 @@ export const SITES = [
         return result(flags.length === 0, +Math.max(...shares).toFixed(2), `flat-row share per marquee strip: ${shares.map((f) => `${Math.round(f * 100)}%`).join(', ')} (fail above 50%)`, flags);
       }
     }
+  },
+  {
+    host: 'premier-roofing.com',
+    url: 'https://premier-roofing.com',
+    checks: {
+      // The testimonial carousel resizes to each slide as it rotates, so the
+      // page grows and shrinks by up to 300px between tiles. Tiles placed
+      // for the old layout repeat a strip across the tile edge (the footer
+      // twice) or leave rows never painted (the unpainted-rows detector).
+      'page-moved-under-tiles'({ img, tiles, vh }) {
+        const flags = seamRepeats(img, boundaries(tiles, img.H), { maxD: vh });
+        return result(flags.length === 0, flags.length, `${flags.length} tile edge(s) with the rows above repeated below`, flags);
+      }
+    }
+  },
+  {
+    host: 'whitney.org',
+    url: 'https://whitney.org',
+    collect: () => {
+      const R = (el) => { const r = el.getBoundingClientRect(); return { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; };
+      // The feature block that sticks beside the scrolling column.
+      const el = [...document.querySelectorAll('body *')].find((e) => getComputedStyle(e).position === 'sticky' && e.getBoundingClientRect().height > innerHeight * 0.6);
+      return el ? { block: R(el), section: R(el.parentElement) } : { block: null };
+    },
+    checks: {
+      // A tall sticky column (the Lichtenstein feature) follows the reader
+      // down, so it shows up again in the next tile.
+      // Looked for with the repeated-overlay detector inside the block's
+      // column: a template cut from the capture doesn't work here, since the
+      // cookie notice covers the first copy and a tile edge cuts it.
+      'sticky-feature-repeated'({ img, tiles, facts }) {
+        const b = facts.block;
+        if (!b) return result(false, null, 'no tall sticky block found on the page');
+        const s = facts.section;
+        const r = repeatedOverlays(img, tiles, { region: { y0: s.top, y1: s.top + s.h, x: s.left, w: s.w } });
+        return result(r.pass, r.value, `${r.flags.length} strip(s) of the sticky column (${s.top}-${s.top + s.h}px) repeated at the tile step`, r.flags);
+      }
+    }
   }
 ];
 
@@ -275,6 +313,8 @@ export const KNOWN = {
   'parallax-drift': 'TweenMax parallax drift',
   'pinned-slideshow': 'ScrollMagic-pinned slideshow repeated or vanished',
   'garden-gap-blank': 'Fixed garden photo behind a gap left a white band',
-  'marquee-blank': 'Infinite CSS review marquee raced and left a blank band'
+  'marquee-blank': 'Infinite CSS review marquee raced and left a blank band',
+  'page-moved-under-tiles': 'Page height changed between tiles: strip repeated at a tile edge',
+  'sticky-feature-repeated': 'Tall sticky feature column repeated in the next tile'
 };
 

@@ -59,9 +59,14 @@ function instrumentWorker() {
   const h = self.__harness = { draws: [], messages: [], canvas: null };
   const proto = OffscreenCanvasRenderingContext2D.prototype;
   const draw = proto.drawImage;
+  // Only the 9-argument form is a tile going onto the stitching canvas; the
+  // worker's other draws (its small matching grids, the final crop) use
+  // shorter forms.
   proto.drawImage = function (...a) {
-    if (a.length === 9) h.draws.push({ sy: a[2], sh: a[4], dx: a[5], dy: a[6], dw: a[7], dh: a[8] });
-    h.canvas = { width: this.canvas.width, height: this.canvas.height };
+    if (a.length === 9) {
+      h.draws.push({ sy: a[2], sh: a[4], dx: a[5], dy: a[6], dw: a[7], dh: a[8] });
+      h.canvas = { width: this.canvas.width, height: this.canvas.height };
+    }
     return draw.apply(this, a);
   };
   const send = chrome.tabs.sendMessage.bind(chrome.tabs);
@@ -146,6 +151,7 @@ export async function captureSite(extDir, site, { headless = true, timeoutMs = 2
       self.__harness.dataUrl = r.dataUrl || null;
       return {
         error: r.error, filename: r.filename, tileCount: r.tileCount,
+        warnings: r.warnings || null, placements: r.placements || null,
         size: r.dataUrl ? r.dataUrl.length : 0,
         draws: self.__harness.draws, messages: self.__harness.messages, canvas: self.__harness.canvas
       };
@@ -162,6 +168,10 @@ export async function captureSite(extDir, site, { headless = true, timeoutMs = 2
     const dataUrl = parts.join('');
     out.png = Buffer.from(dataUrl.slice(dataUrl.indexOf(',') + 1), 'base64');
     out.tileCount = res.tileCount;
+    // What the extension reported about its own capture (null on commits
+    // from before it did).
+    out.warnings = res.warnings;
+    out.placements = res.placements;
     out.canvas = res.canvas;
     out.draws = res.draws;
     const prep = res.messages.find((m) => m.cmd === 'prepare');
