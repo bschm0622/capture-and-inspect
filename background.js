@@ -7,6 +7,7 @@
 
 const CAPTURE_MIN_INTERVAL_MS = 600; // Chrome allows ~2 captureVisibleTab/sec
 const MAX_CANVAS_AREA = 268435456;   // Chrome canvas area cap (px^2)
+const MAX_PAGE_HEIGHT = 60000;       // CSS px, as in content.js: infinite-scroll safeguard
 
 let capturing = false;
 let lastCaptureTs = 0;
@@ -29,9 +30,14 @@ function sendToTab(tabId, msg) {
   });
 }
 
-async function throttledCapture(windowId) {
+// Wait until Chrome's quota allows the next shot.
+async function captureReady() {
   const wait = CAPTURE_MIN_INTERVAL_MS - (Date.now() - lastCaptureTs);
   if (wait > 0) await sleep(wait);
+}
+
+async function throttledCapture(windowId) {
+  await captureReady();
   const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
   lastCaptureTs = Date.now();
   return dataUrl;
@@ -69,6 +75,38 @@ const MATCH_ROWS = 80;   // canvas rows compared with each new tile
 const MATCH_OK = 6;      // mean |Δluma| under this counts as the same pixels
 const GRID_PX = 4;       // CSS px per column of the matching grid
 const GROWTH_TILES = 2;  // room for the page to grow during the capture, in screens
+
+// Two kinds of evidence say where a tile belongs: position (where the page
+// scrolled to, corrected by how far the content at the seam measurably
+// moved) and pixels (where the tile's overlap matches the canvas). Pixels
+// are trusted only when the rows matched are distinctive (textured, and
+// matching clearly better there than anywhere else in the tile) and the
+// match is within reach of where position says the tile is: on the
+// regression set the page moved a tile by at most 266px between two shots.
+// A match a whole screen away (Cooper Hewitt: a shot whose bottom rows
+// matched the first tile's own bottom rows, 772px up) isn't the page
+// moving, it's a shot gone wrong, and position wins.
+const MATCH_REACH = 0.5;  // of a screen
+// When the page itself says nothing moved (the content noted at the seam
+// is where it was, and the page is as tall as at the last shot), a match
+// may only fine-tune the placement. Pixels that match farther off are
+// something drawn at a new offset in each shot, not content that moved: on
+// milanodentalstudio.com a section's photo background matched 231px up and
+// the heading over it was painted over, and the capture came out 231px
+// short. The largest fine-tuning on the regression set is 5px.
+const FIRM_REACH = 8;     // CSS px
+// When the overlap doesn't match and the page can't say how far it moved,
+// the tile is shot again from half a screen higher, in case the content
+// moved up past the shot's top. On a page where that keeps finding nothing
+// (parallax images at a new offset in every shot, agcsf.com), it only
+// doubles the shots, so it stops after this many misses in a row.
+const MAX_LIFT_MISSES = 2;
+// Every extra shot (a retake, a lift, a reshoot) must leave enough of the
+// shot budget to reach the bottom of the page one plain tile at a time, so
+// running out of budget costs certainty at some seams, never content.
+const SHOTS_PER_TILE = 2;
+const SPARE_SHOTS = 10;
+const STALE_WAIT_MS = 250;  // before shooting again a frame that didn't change
 
 // Two tiles placed right show the same pixels where they overlap. Where they
 // don't, in part of the width, the page changed between the two shots: a tab
@@ -156,10 +194,13 @@ function overlapScores(sig, w, stripTop, K, blocks, edges, use, tile, tileH) {
 
 // Where the new tile belongs, given where the page says (predicted). Keeps
 // the prediction when the overlap confirms it or has too little texture to
-// say; moves the tile when the overlap clearly matches somewhere else.
+// say; moves the tile when the overlap clearly matches somewhere else
+// within `reach` CSS px of the prediction, and nowhere else in the tile
+// nearly as well. A clean match farther away is reported (`far`) but not
+// followed.
 // `hidden` lists canvas rects (CSS px) of overlays the last shot showed and
 // this one doesn't; they're left out of the comparison.
-function placeTile(sig, w, seam, predicted, tile, tileH, hidden) {
+function placeTile(sig, w, seam, predicted, tile, tileH, hidden, reach) {
   const s = Math.floor(seam);
   const K = Math.min(s, MATCH_ROWS, Math.max(MIN_OVERLAP, Math.round(seam - predicted)));
   if (K < MIN_OVERLAP) return { top: predicted, match: 'none' };
@@ -175,18 +216,40 @@ function placeTile(sig, w, seam, predicted, tile, tileH, hidden) {
   const blocks = texturedBlocks(sig, w, stripTop, K, edges, use);
   if (blocks.length < 2) return { top: predicted, match: 'flat' };
   const scores = overlapScores(sig, w, stripTop, K, blocks, edges, use, tile, tileH);
-  let best = 0;
-  for (let r = 1; r < scores.length; r++) if (scores[r] < scores[best]) best = r;
-  let second = Infinity;
-  for (let r = 0; r < scores.length; r++) if (Math.abs(r - best) > 4) second = Math.min(second, scores[r]);
   const r0 = Math.round(stripTop - predicted);
+  // Best match within reach of the prediction, and best anywhere.
+  let best = -1, any = 0;
+  for (let r = 0; r < scores.length; r++) {
+    if (scores[r] < scores[any]) any = r;
+    if (Math.abs(r - r0) <= reach && (best < 0 || scores[r] < scores[best])) best = r;
+  }
   const at0 = r0 >= 0 && r0 < scores.length ? scores[r0] : Infinity;
   const round = (v) => Math.round(v * 10) / 10;
+  const far = Math.abs(any - r0) > reach && scores[any] < MATCH_OK ? { far: stripTop - any, farScore: round(scores[any]) } : {};
+  if (best < 0) return { top: predicted, match: 'mismatch', score: round(at0), blocks: blocks.length, ...far };
+  // Distinctive: nothing more than 4 rows off, in reach or not, matches
+  // nearly as well.
+  let second = Infinity;
+  for (let r = 0; r < scores.length; r++) if (Math.abs(r - best) > 4) second = Math.min(second, scores[r]);
   if (at0 < MATCH_OK && at0 <= scores[best] + 1.5) return { top: predicted, match: 'ok', score: round(at0) };
   if (scores[best] < MATCH_OK && second > Math.max(2 * scores[best], scores[best] + 3)) {
-    return { top: stripTop - best, match: 'moved', score: round(scores[best]), predicted };
+    return { top: stripTop - best, match: 'moved', score: round(scores[best]), predicted, blocks: blocks.length };
   }
-  return { top: predicted, match: 'mismatch', score: round(at0), best: round(scores[best]) };
+  return { top: predicted, match: 'mismatch', score: round(at0), best: round(scores[best]), blocks: blocks.length, ...far };
+}
+
+// A shot that shows the same screen as the one before it, although the
+// page scrolled at least `MIN_OVERLAP` px in between, is a stale frame:
+// Chrome handed back what it had painted before the scroll. Needs texture
+// to say: two shots of a plain section look the same wherever they are.
+function sameFrame(a, b, w, h) {
+  let diff = 0, textured = 0;
+  for (let y = 0; y < h; y++) {
+    const o = y * w;
+    for (let x = o; x < o + w; x++) diff += Math.abs(a[x] - b[x]);
+    if (rowStd(a, w, y) > 12) textured++;
+  }
+  return textured >= h * 0.1 && diff / (w * h) < 1;
 }
 
 // How many column blocks of a tile placed at `top` differ from what the
@@ -231,38 +294,69 @@ async function stitchTiles(tab, info) {
   const warnings = [];
   const placements = [];
   if (info.rawPageHeight > pageHeight) {
-    warnings.push({ kind: 'truncated', y0: pageHeight, y1: info.rawPageHeight, note: `page is ${info.rawPageHeight}px tall; only the first ${pageHeight}px are captured` });
+    warnings.push({ kind: 'truncated', y0: pageHeight, y1: info.rawPageHeight, note: `page not fully captured: it is ${info.rawPageHeight}px tall; only the first ${pageHeight}px are captured` });
   }
 
   // Determine output scale, downshifting from dpr if the page is so tall it
   // would blow past the canvas area cap. The canvas leaves room for the page
   // to grow during the capture; rows it doesn't use are cut off at the end.
-  const room = pageHeight + GROWTH_TILES * vh;
+  let room = pageHeight + GROWTH_TILES * vh;
   let scale = dpr;
   while (scale > 1 && (pageWidth * scale) * (room * scale) > MAX_CANVAS_AREA) {
     scale -= 0.5;
   }
   if (scale < 1) scale = 1;
-  const canvas = new OffscreenCanvas(Math.round(pageWidth * scale), Math.round(room * scale));
-  const ctx = canvas.getContext('2d');
+  let canvas = new OffscreenCanvas(Math.round(pageWidth * scale), Math.round(room * scale));
+  let ctx = canvas.getContext('2d');
   // The same canvas as a luma grid, for matching each tile's overlap.
   const gw = Math.max(8, Math.round(pageWidth / GRID_PX));
-  const gh = Math.ceil(room);
-  const grid = new Uint8Array(gw * gh);
+  let gh = Math.ceil(room);
+  let grid = new Uint8Array(gw * gh);
+
+  // The page grew past the room left for it: make the canvas taller, as far
+  // as the canvas area cap and the page height cap allow. False when even
+  // `bottom` (CSS px) doesn't fit.
+  const grow = (bottom) => {
+    const limit = Math.min(Math.floor(MAX_CANVAS_AREA / canvas.width / scale), MAX_PAGE_HEIGHT + vh);
+    const want = Math.min(Math.ceil(bottom + GROWTH_TILES * vh), limit);
+    if (want < bottom || want <= room) return false;
+    const bigger = new OffscreenCanvas(canvas.width, Math.round(want * scale));
+    const bctx = bigger.getContext('2d');
+    bctx.drawImage(canvas, 0, 0);
+    const g = new Uint8Array(gw * Math.ceil(want));
+    g.set(grid);
+    canvas = bigger; ctx = bctx; grid = g; room = want; gh = Math.ceil(want);
+    return true;
+  };
 
   const step = vh - OVERLAP;
   let total = 1 + Math.ceil(Math.max(0, pageHeight - vh) / step);
-  const maxShots = total * 2 + 10;
+  // Grows with the page, which can only grow as far as the canvas can.
+  const shotBudget = () => total * SHOTS_PER_TILE + SPARE_SHOTS;
+  const reach = Math.round(vh * MATCH_REACH);
   let cursor = 0;  // canvas rows painted so far, top down (output px)
   let offset = 0;  // capture y minus page y of the content at the seam (CSS px)
   let minH = pageHeight, maxH = pageHeight;
   let shots = 0, retakes = 0;
   let lift = 0;    // extra CSS px to shoot higher on a retake after a failed match
+  let liftMisses = 0; // lifted shots in a row whose overlap matched nowhere either
   let prevTop = 0; // where the last tile drawn sits in the capture (CSS px)
   let hidden = []; // overlays it showed that the page has hidden since, in capture px
   const holes = [];
   let last = null; // the last tile drawn: where it was shot and which rows it painted
+  let prevShot = null; // the last frame shot in order: its luma grid and scroll position
   let reshoots = 0, seamReshoots = 0;
+  let skipped = 0; // extra shots the budget didn't allow
+
+  // Whether `n` more shots for this tile leave enough of the budget to
+  // reach the bottom of the page one plain tile at a time. Asked only when
+  // the shots are otherwise wanted, so a no counts as one skipped.
+  const affords = (n, res) => {
+    const below = res.actualY >= res.maxScroll - 1 ? 0 : Math.ceil((res.maxScroll - res.actualY) / step);
+    if (shots + n + below <= shotBudget()) return true;
+    skipped++;
+    return false;
+  };
 
   // Draw rows [from, to) of the canvas (output px) from a tile placed at
   // `top`, and copy them into the matching grid.
@@ -278,15 +372,22 @@ async function stitchTiles(tab, info) {
     }
   };
 
+  let lastRes = null;
   for (let i = 0; ;) {
-    if (shots++ >= maxShots) {
-      warnings.push({ kind: 'truncated', y0: Math.round(cursor / scale), y1: Math.round(cursor / scale), note: `stopped after ${maxShots} shots; the page kept moving` });
+    if (shots++ >= shotBudget()) {
+      const y = Math.round(cursor / scale);
+      const end = lastRes ? lastRes.pageHeight : pageHeight;
+      warnings.push({ kind: 'truncated', y0: y, y1: Math.max(y, end), note: `page not fully captured: stopped after ${shots - 1} shots with the page still moving; ${Math.max(0, end - y)}px below ${y}px missing` });
       break;
     }
     const seam = cursor / scale;
     const wantY = i === 0 ? 0 : Math.max(0, Math.round(seam - OVERLAP - offset - lift));
     const res = await sendToTab(tab.id, { cmd: 'tile', y: wantY, index: i, total });
     if (!res || !res.ok) throw new Error(res && res.error || 'tile failed');
+    // The page's own account of whether it moved since the last shot: the
+    // drift is measured from the anchors that shot noted.
+    const unmoved = res.drift != null && lastRes != null && Math.abs(res.pageHeight - lastRes.pageHeight) < 1;
+    lastRes = res;
     minH = Math.min(minH, res.pageHeight);
     maxH = Math.max(maxH, res.pageHeight);
     for (const c of res.covered || []) {
@@ -303,7 +404,7 @@ async function stitchTiles(tab, info) {
 
     // The content moved up past the seam since the last tile, so this shot
     // would leave a gap. Shoot again from higher up.
-    if (i > 0 && top > seam - MIN_OVERLAP && retakes < MAX_RETAKES) {
+    if (i > 0 && top > seam - MIN_OVERLAP && retakes < MAX_RETAKES && affords(1, res)) {
       retakes++;
       placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, retake: true });
       continue;
@@ -315,13 +416,31 @@ async function stitchTiles(tab, info) {
     const bmp = await dataUrlToBitmap(await throttledCapture(tab.windowId));
     const tileH = Math.round(bmp.height / dpr);
     const tileGrid = lumaGrid(bmp, gw, tileH);
+
+    // The page scrolled but the shot didn't change: shoot it again.
+    let stale = false;
+    if (prevShot && Math.abs(res.actualY - prevShot.actualY) >= MIN_OVERLAP && prevShot.h === tileH &&
+        sameFrame(tileGrid, prevShot.grid, gw, tileH)) {
+      if (retakes < MAX_RETAKES && affords(1, res)) {
+        retakes++;
+        placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, stale: true, retake: true });
+        bmp.close();
+        await sleep(STALE_WAIT_MS);
+        continue;
+      }
+      stale = true;
+    }
+    prevShot = { grid: tileGrid, actualY: res.actualY, h: tileH };
+
     let match = null, agree = null;
     if (i > 0) {
-      match = placeTile(grid, gw, seam, top, tileGrid, tileH, hidden);
+      match = placeTile(grid, gw, seam, top, tileGrid, tileH, hidden, unmoved ? FIRM_REACH : reach);
+      if (lift && match.match === 'mismatch') liftMisses++;
+      else if (!lift && match.match !== 'mismatch' && match.match !== 'flat' && match.match !== 'none') liftMisses = 0;
       if (match.match === 'moved') {
         top = match.top;
         offset = top - res.actualY;
-      } else if (match.match === 'mismatch' && res.drift == null && !lift) {
+      } else if (match.match === 'mismatch' && res.drift == null && !lift && liftMisses < MAX_LIFT_MISSES && affords(1, res)) {
         // Nothing to go on: the page couldn't say how far it moved and the
         // overlap isn't anywhere in this shot. If the content moved up past
         // the shot's top, a shot from half a screen higher still holds it.
@@ -329,13 +448,12 @@ async function stitchTiles(tab, info) {
         placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, match, retake: true });
         bmp.close();
         continue;
-      } else if (match.match === 'mismatch' && res.drift == null) {
-        // (With a measurement from the page, a mismatch is something that
-        // changed between the two shots, like an image that finished
-        // loading or an overlay hidden after the first tile, and the
-        // measurement stands.)
-        warnings.push({ kind: 'overlap-mismatch', y0: Math.round(top), y1: Math.round(seam), note: `tile ${i + 1} doesn't match the tile above where it overlaps it; placed by scroll position` });
-      } else {
+      } else if (match.match !== 'mismatch') {
+        // (After a mismatch the tile stays where position puts it: the
+        // measured drift when the page gave one, which a mismatch doesn't
+        // overrule, since it is usually something that changed between the
+        // two shots, like an image that finished loading; else the scroll
+        // position.)
         agree = disagreement(grid, gw, seam, top, tileGrid, tileH, hidden);
       }
     }
@@ -343,11 +461,16 @@ async function stitchTiles(tab, info) {
     // The page changed between this shot and the one above. Shoot that one
     // again, then this one, back to back. The repeat keeps the page's
     // anchors from this shot, so this one is still measured from here.
-    if (agree && agree.blocks > 0 && last && seamReshoots < RESHOOTS_PER_SEAM && reshoots < MAX_RESHOOTS) {
+    if (agree && agree.blocks > 0 && last && seamReshoots < RESHOOTS_PER_SEAM && reshoots < MAX_RESHOOTS && affords(2, res)) {
       seamReshoots++;
       reshoots++;
       placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, match, agree, retake: true });
       bmp.close();
+      // Wait out the capture quota first, so the shot follows right after
+      // the page has hidden its overlays and put its videos back on their
+      // frozen frame, with no time for the page to start them again.
+      await captureReady();
+      shots++;
       const again = await sendToTab(tab.id, { cmd: 'tile', y: last.actualY, index: last.index, total, keepAnchors: true });
       if (!again || !again.ok) throw new Error(again && again.error || 'tile failed');
       if (Math.abs(again.actualY - last.actualY) < 1) {
@@ -357,16 +480,24 @@ async function stitchTiles(tab, info) {
         b2.close();
         placements.push({ index: last.index, y: last.actualY, actualY: again.actualY, top: last.top, reshot: true });
       }
+      prevShot = null;
       continue;
     }
     if (agree && agree.blocks > 0) {
       warnings.push({ kind: 'tiles-disagree', y0: agree.y0, y1: agree.y1, note: `tile ${i + 1} differs from the tile above where they overlap (${agree.blocks} of ${AGREE_BLOCKS} column blocks): the page changed between the shots` });
+    }
+    if (stale || (match && match.match === 'mismatch')) {
+      const why = stale
+        ? 'the shot showed the same screen as the one before it'
+        : `its overlap doesn't match the tile above${match.far != null ? `, except ${Math.round(Math.abs(match.far - top))}px away, too far to believe` : ''}`;
+      warnings.push({ kind: 'position-only', y0: Math.round(top), y1: Math.round(seam), note: `placed by position only at y ${Math.round(top)}: tile ${i + 1} (${why}) is placed by ${res.drift != null ? 'how far the page content measurably moved' : 'scroll position'}` });
     }
 
     // captureVisibleTab returns device pixels (vh*dpr tall). Draw only the
     // rows below what is already painted, rescaled to our output scale.
     const topOut = Math.round(top * scale);
     const tileOut = Math.round(bmp.height * scale / dpr);
+    const outOfRoom = topOut + tileOut > canvas.height && !grow((topOut + tileOut) / scale);
     const from = Math.max(cursor, topOut, 0);
     const to = Math.min(topOut + tileOut, canvas.height);
     if (from > cursor) holes.push([cursor, from]);
@@ -375,7 +506,7 @@ async function stitchTiles(tab, info) {
       cursor = to;
     }
     bmp.close();
-    placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, match, agree });
+    placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, match, agree, ...(stale ? { stale } : {}) });
     last = { index: i, actualY: res.actualY, top, from: Math.min(from, cursor) };
 
     i++;
@@ -385,8 +516,8 @@ async function stitchTiles(tab, info) {
     prevTop = top;
     hidden = [];
     total = Math.max(total, i + (atBottom ? 0 : Math.ceil((res.maxScroll - res.actualY) / step)));
-    if (topOut + tileOut > canvas.height) {
-      warnings.push({ kind: 'truncated', y0: Math.round(cursor / scale), y1: Math.round((topOut + tileOut) / scale), note: `the page grew by more than ${GROWTH_TILES} screens while it was captured; the capture stops here` });
+    if (outOfRoom) {
+      warnings.push({ kind: 'truncated', y0: Math.round(cursor / scale), y1: Math.round((topOut + tileOut) / scale), note: `page not fully captured: the page grew past what one image can hold (${Math.round(room)}px); the capture stops here` });
       break;
     }
     if (atBottom) break;
@@ -395,6 +526,9 @@ async function stitchTiles(tab, info) {
   // Rows that no tile reached are reported, not hidden.
   for (const [a, b] of holes) {
     warnings.push({ kind: 'unpainted', y0: Math.round(a / scale), y1: Math.round(b / scale), note: `${Math.round((b - a) / scale)}px never painted: the page moved and the retakes didn't catch up` });
+  }
+  if (skipped) {
+    warnings.push({ kind: 'budget', y0: 0, y1: Math.round(cursor / scale), note: `shot budget ran low: ${skipped} retake(s) or reshoot(s) skipped so the capture could reach the bottom of the page` });
   }
   if (maxH - minH > vh) {
     warnings.push({ kind: 'page-height-changed', y0: minH, y1: maxH, note: `page height ranged from ${minH}px to ${maxH}px while it was captured` });

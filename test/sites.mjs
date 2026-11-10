@@ -488,8 +488,97 @@ export const SITES = [
       // The fixed header must still head the capture.
       'fixed-nav-kept': navKept
     }
+  },
+  {
+    host: 'www.cooperhewitt.org',
+    url: 'https://www.cooperhewitt.org',
+    collect: () => {
+      const f = [...document.querySelectorAll('footer')].filter((el) => el.getBoundingClientRect().height > 40).pop();
+      if (!f) return { footer: null };
+      const r = f.getBoundingClientRect();
+      // The colour behind the footer: its own, or the first ancestor's that
+      // isn't transparent.
+      let bg = null;
+      for (let el = f; el && !bg; el = el.parentElement) {
+        const m = getComputedStyle(el).backgroundColor.match(/[\d.]+/g);
+        if (m && (m.length < 4 || +m[3] > 0.5)) bg = m.slice(0, 3).map(Number);
+      }
+      bg = bg || [255, 255, 255];
+      return { footer: { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height), luma: Math.round((bg[0] * 77 + bg[1] * 150 + bg[2] * 29) / 256) } };
+    },
+    checks: {
+      // Tile 2's overlap matched the first tile's own bottom rows, 772px
+      // up from where the page had scrolled, and the stitcher believed it:
+      // the capture came out 1197px tall for a 1969px page, the lower
+      // sections gone. The capture must be as tall as the page.
+      'captures-full-height'({ img, cap }) {
+        const hs = [cap.factsBefore && cap.factsBefore.scrollable, cap.factsAfter && cap.factsAfter.scrollable].filter((v) => v > 0);
+        const off = Math.min(...hs.map((h) => Math.abs(img.H - h)));
+        return result(off <= 16, off, `capture ${img.H}px, page ${hs.join('/')}px (fail beyond 16px)`, off <= 16 ? [] : [{ y0: Math.max(0, img.H - 4), y1: img.H, note: 'capture height differs from the page' }]);
+      },
+      // ...and the footer must be in it, where the page has it: mostly the
+      // footer's own background colour, with its text on it.
+      'footer-present'({ img, facts }) {
+        const f = facts.footer;
+        if (!f) return result(false, null, 'footer not found on the page');
+        if (f.top + f.h > img.H + 2) return result(false, img.H - f.top - f.h, `footer ends at ${f.top + f.h}px, below the capture's end at ${img.H}px`, [{ y0: Math.min(f.top, img.H - 4), y1: img.H, note: 'footer missing' }]);
+        const [x0, x1] = cols(img, f.left, f.w);
+        let n = 0, bg = 0, marks = 0;
+        for (let y = f.top; y < Math.min(img.H, f.top + f.h); y++) {
+          for (let x = x0; x < x1; x++) {
+            const d = Math.abs(img.luma[y * img.W + x] - f.luma);
+            n++;
+            if (d < 24) bg++;
+            else if (d > 96) marks++;
+          }
+        }
+        const ok = n > 0 && bg / n >= 0.6 && marks / n >= 0.005;
+        return result(ok, +(bg / n).toFixed(2), `${Math.round(bg / n * 100)}% of the footer box in its background colour (fail under 60%), ${(marks / n * 100).toFixed(1)}% text marks (fail under 0.5%)`, ok ? [] : [{ y0: f.top, y1: f.top + f.h, note: 'footer not in the capture where the page has it' }]);
+      }
+    }
+  },
+  {
+    host: 'www.agcsf.com',
+    url: 'https://www.agcsf.com',
+    checks: {
+      // Parallax images sit at a new offset in every tile, so no overlap
+      // matched. Each tile was shot twice and a 50-shot cap stopped the
+      // capture 3,100px short of the bottom. It must reach the bottom...
+      'reaches-bottom'({ img, cap }) {
+        const hs = [cap.factsBefore && cap.factsBefore.scrollable, cap.factsAfter && cap.factsAfter.scrollable].filter((v) => v > 0);
+        const short = Math.min(...hs) - img.H;
+        return result(short <= 16, short, `capture ${img.H}px, page ${hs.join('/')}px (fail if more than 16px short)`, short <= 16 ? [] : [{ y0: Math.max(0, img.H - 4), y1: img.H, note: `capture ends ${short}px short of the page's bottom` }]);
+      },
+      // ...in bounded time: not many more shots than the page has screens
+      // (that part doesn't depend on how busy the machine is), and a
+      // ceiling on the capture itself, not counting loading the page.
+      'finishes-in-time'({ cap, vh }) {
+        const p = cap.phases || {};
+        if (p.captured == null || p.loaded == null) return result(false, null, 'no capture timing');
+        const s = Math.round((p.captured - p.loaded) / 1000);
+        const screens = 1 + Math.ceil(Math.max(0, cap.factsBefore.scrollable - vh) / (vh - 96));
+        const shots = (cap.tiles || []).length;
+        const ok = s <= AGCSF_SECONDS && shots <= screens * 1.5;
+        return result(ok, s, `capture took ${s}s (fail over ${AGCSF_SECONDS}s) and ${shots} shots for ${screens} screens (fail over ${screens * 1.5})`);
+      },
+      // ...and say which seams it couldn't confirm: every tile whose overlap
+      // didn't match carries a "placed by position only" warning.
+      'unmatched-seams-warned'({ cap }) {
+        if (!cap.placements || !cap.warnings) return result(false, null, 'extension reports no placements or warnings');
+        const unmatched = cap.placements.filter((p) => !p.retake && !p.reshot && p.match && p.match.match === 'mismatch');
+        // ('overlap-mismatch' is what commits up to c539d2d called it.)
+        const warned = new Set(cap.warnings.filter((w) => w.kind === 'position-only' || w.kind === 'overlap-mismatch').map((w) => w.y0));
+        const missing = unmatched.filter((p) => !warned.has(Math.round(p.top)));
+        return result(!missing.length, missing.length, `${unmatched.length} unmatched seam(s), ${missing.length} without a warning`, missing.map((p) => ({ y0: Math.round(p.top), y1: Math.round(p.top) + 96, note: 'unmatched seam not warned' })));
+      }
+    }
   }
 ];
+
+// Ceiling on agcsf.com's capture time, with room for a busy machine. On one
+// (another harness running alongside): c539d2d took 175s for 53 shots and
+// stopped 3,872px short; the fix took 82s for 27 shots and the whole page.
+const AGCSF_SECONDS = 150;
 
 // Which known failure each site-specific check stands for, for the report.
 export const KNOWN = {
@@ -512,6 +601,11 @@ export const KNOWN = {
   'carousel-kept-rotating': 'Carousel kept rotating during the capture',
   'background-follows-section': 'Page background recoloured by scroll, cut at a tile edge',
   'floating-extras-captured': 'Cookie banner, popup or floating button captured over the page',
-  'fixed-nav-kept': 'Fixed site header hidden along with the floating extras'
+  'fixed-nav-kept': 'Fixed site header hidden along with the floating extras',
+  'captures-full-height': 'Overlap matched a screen away from the scroll position: lower sections lost',
+  'footer-present': 'Overlap matched a screen away from the scroll position: lower sections lost',
+  'reaches-bottom': 'Overlaps never matched; shot cap stopped the capture short of the bottom',
+  'finishes-in-time': 'Overlaps never matched; every tile shot twice',
+  'unmatched-seams-warned': 'Seams placed by position only were not reported'
 };
 

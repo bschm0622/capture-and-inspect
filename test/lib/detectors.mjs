@@ -25,7 +25,7 @@ export const T = {
   seamCoverage: 0.15,  // ...in at least this share of the block's columns
   seamMinBlocks: 2,
   // truncation
-  truncRatio: 0.7
+  truncSlack: 16       // CSS px the capture may fall short of the page
 };
 
 // Tile rectangles in CSS px of the capture, from the recorded drawImage calls.
@@ -226,15 +226,20 @@ export function seams(img, tiles, { region = null, minBlocks = T.seamMinBlocks }
 // (d) Truncation: the capture is much shorter than the page's real
 // scrollable height (measured before the capture, including an inner
 // scrolling container when the document itself doesn't scroll).
-export function truncation(img, facts, { vh, ratio = T.truncRatio } = {}) {
-  const real = facts.scrollable;
-  const capped = Math.min(real, 60000);
-  const r = img.H / capped;
-  const pass = !(r < ratio && capped - img.H > vh);
+export function truncation(img, cap, { slack = T.truncSlack } = {}) {
+  // Every height the page had while it was captured: before, after, and at
+  // each tile. A page that shrank during the capture (pin spacers removed,
+  // a section collapsed) is held to its smallest height.
+  const hs = [cap.factsBefore && cap.factsBefore.scrollable, cap.factsAfter && cap.factsAfter.scrollable, ...(cap.tiles || []).map((t) => t.pageHeight)]
+    .filter((h) => h > 0);
+  const real = cap.factsBefore.scrollable;
+  const least = Math.min(60000, ...hs);
+  const short = least - img.H;
+  const pass = short <= slack;
   return {
-    pass, value: +r.toFixed(2),
-    detail: `capture ${img.H}px of ${real}px scrollable (${Math.round(r * 100)}%)`,
-    flags: pass ? [] : [{ y0: img.H - 4, y1: img.H, note: `capture ends at ${img.H}px; page scrolls to ${real}px` }]
+    pass, value: short,
+    detail: `capture ${img.H}px; page ${real}px scrollable, never under ${least}px during the capture (${short > 0 ? `${short}px short` : 'not short'}; fail beyond ${slack}px)`,
+    flags: pass ? [] : [{ y0: Math.max(0, img.H - 4), y1: img.H, note: `capture ends at ${img.H}px; page was never shorter than ${least}px` }]
   };
 }
 
@@ -260,7 +265,7 @@ export function runGeneric(img, cap) {
     'blank-band': blankBands(img, { vh }),
     'repeated-overlay': repeatedOverlays(img, tiles),
     'seam': seams(img, tiles),
-    'truncation': truncation(img, cap.factsBefore, { vh }),
+    'truncation': truncation(img, cap),
     'unpainted-rows': unpaintedRows(img)
   };
 }
