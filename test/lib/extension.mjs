@@ -17,7 +17,10 @@ const isExtensionFile = (f) =>
   /^icons\/[^/]+$/.test(f);
 
 // ref === null: the working tree as it is now (uncommitted edits included).
-export function buildExtension(ref) {
+// `overlay`: a folder whose extension files replace the copied ones, to try
+// a change to the extension (a patched background.js, say) without
+// touching the repo.
+export function buildExtension(ref, overlay = null) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'capture-ext-'));
   let files;
   if (ref) {
@@ -39,6 +42,12 @@ export function buildExtension(ref) {
       fs.copyFileSync(path.join(REPO, f), path.join(dir, f));
     }
   }
+  if (overlay) {
+    for (const f of fs.readdirSync(overlay).filter((f) => isExtensionFile(f) && fs.statSync(path.join(overlay, f)).isFile())) {
+      fs.copyFileSync(path.join(overlay, f), path.join(dir, f));
+      if (!files.includes(f)) files.push(f);
+    }
+  }
   const manifestPath = path.join(dir, 'manifest.json');
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   manifest.host_permissions = ['<all_urls>'];
@@ -46,7 +55,11 @@ export function buildExtension(ref) {
   return { dir, files };
 }
 
-export function describeRef(ref) {
+export function describeRef(ref, overlay = null) {
+  if (overlay) {
+    const files = fs.readdirSync(overlay).filter((f) => isExtensionFile(f));
+    return `${describeRef(ref)} with ${files.join(', ')} from ${overlay}`;
+  }
   if (!ref) {
     const head = execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: REPO }).toString().trim();
     const dirty = execFileSync('git', ['status', '--porcelain', '--', '*.js', '*.html', 'manifest.json', 'icons'], { cwd: REPO })

@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: stale frame after a scroll</title>
+<!-- Stands in for Chrome handing back the frame it painted before a scroll.
+     The page itself scrolls normally, but for 1.5s after a scroll of
+     exactly one tile step down onto a tile position (772px, a multiple of
+     it; the pre-scroll moves a whole screen, 868px, at a time) a
+     full-screen layer shows the screen as it was before that scroll: the
+     same pixels as the last shot. A shot taken in that time is stale. The
+     worker should notice (sameFrame), wait and shoot again, and the capture
+     come out right. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  #ghost{position:fixed;inset:0;overflow:hidden;z-index:5;display:none;background:#fff}
+</style>
+<script src="bands.js"></script>
+<main id="m"></main>
+<div id="ghost"></div>
+<script>
+  const m = document.getElementById('m');
+  const ghost = document.getElementById('ghost');
+  addBands(m, 0, 30);
+  const copy = m.cloneNode(true);
+  copy.removeAttribute('id');
+  ghost.appendChild(copy);
+  let lastY = 0, timer = null;
+  addEventListener('scroll', () => {
+    if (scrollY > 0 && scrollY % 772 === 0 && scrollY - lastY === 772) {
+      copy.style.transform = `translateY(${-lastY}px)`;
+      ghost.style.display = 'block';
+      clearTimeout(timer);
+      timer = setTimeout(() => { ghost.style.display = 'none'; }, 1500);
+    }
+    lastY = scrollY;
+  });
+</script>

@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: content jumps up on every scroll</title>
+<!-- On every scroll from the tiles (the pre-scroll's quick stops don't
+     count), the page's content moves up 150px (a negative top margin that
+     grows, 90 times at most), with scroll anchoring off. Every tile then
+     finds the content moved up past the seam and is shot again (retakes);
+     a tile that runs out of retakes leaves rows never painted, and the
+     retakes eat the shot budget. Nothing can be captured right here; the
+     capture must finish and say what went wrong (warnings 'unpainted',
+     'budget'). -->
+<style>html,body{margin:0;overflow-anchor:none}</style>
+<script src="bands.js"></script>
+<main id="m"></main>
+<script>
+  const m = document.getElementById('m');
+  addBands(m, 0, 120);
+  let shift = 0, n = 0, lastEvent = 0;
+  addEventListener('scroll', () => {
+    const now = performance.now();
+    const quick = now - lastEvent < 400;
+    lastEvent = now;
+    if (quick || n >= 90) return;
+    n++;
+    shift += 150;
+    m.style.marginTop = `${-shift}px`;
+  });
+</script>

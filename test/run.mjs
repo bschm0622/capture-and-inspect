@@ -8,6 +8,8 @@
 //   node test/run.mjs --ref b2d7f6e        # an older commit of the extension
 //   node test/run.mjs --url https://x.com  # any page, generic detectors only
 //   node test/run.mjs --urls list.txt      # one URL per line, generic only
+//   node test/run.mjs --fixtures           # the synthetic pages in test/fixtures
+//   --overlay dir                          # extension files from dir replace the copied ones
 //   --headed  --jobs 2  --label name  --timeout 240  --out dir  --keep-png all|failing|none
 //
 //   node test/run.mjs summary <run dir...>            # a sweep's summary
@@ -25,8 +27,10 @@ import { recordCapture, fileFor, verdictOf } from './lib/analyze.mjs';
 import { writeReport } from './lib/report.mjs';
 import { loadRuns, expandDirs, summarize, formatSummary, compare, formatCompare } from './lib/sweep.mjs';
 import { SITES } from './sites.mjs';
+import { FIXTURES, fixtureHost } from './fixtures/fixtures.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
+const FIXTURE_DIR = path.join(path.dirname(SELF), 'fixtures');
 
 // Children run in their own process groups (so a hung one can be killed
 // with its browser); if the run itself is stopped, take them down too.
@@ -57,10 +61,12 @@ if (sub === 'summary') {
 }
 
 function parseArgs(argv) {
-  const a = { sites: [], urls: [], ref: null, headed: false, jobs: 1, label: '', timeout: 240, out: null, keepPng: null, honest: true, captureBlocked: false, retryErrors: false };
+  const a = { sites: [], urls: [], ref: null, headed: false, jobs: 1, label: '', timeout: null, out: null, keepPng: null, honest: true, captureBlocked: false, retryErrors: false, fixtures: false, overlay: null };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i], v = () => argv[++i];
     if (k === '--site') a.sites.push(...v().split(','));
+    else if (k === '--fixtures') a.fixtures = true;
+    else if (k === '--overlay') a.overlay = v();
     else if (k === '--ref') a.ref = v();
     else if (k === '--url') a.urls.push(v());
     else if (k === '--urls') a.urls.push(...fs.readFileSync(v(), 'utf8').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#')));
@@ -80,9 +86,11 @@ function parseArgs(argv) {
 
 // One site in its own process: a page that hangs the browser or the
 // renderer can be killed with everything it started, and the run goes on.
-async function child({ site, extDir, outDir, timeout, headed, keepPng, honest, captureBlocked, regression }) {
-  const full = regression ? SITES.find((s) => s.host === site.host) : null;
-  const s = full || site;
+async function child({ site, extDir, outDir, timeout, headed, keepPng, honest, captureBlocked, regression, fixtures }) {
+  const full = fixtures ? FIXTURES.find((f) => fixtureHost(f.name) === site.host)
+    : regression ? SITES.find((s) => s.host === site.host) : null;
+  // (A fixture's URL is only known once its server is up.)
+  const s = full ? { ...full, host: site.host, url: site.url } : site;
   let cap = await captureSite(extDir, s, { headless: !headed, timeoutMs: timeout * 1000, honest, captureBlocked });
   // Turned away: try once with the other user agent. Some walls refuse
   // Chromium's "HeadlessChrome", others a Chrome user agent from a browser
@@ -116,11 +124,35 @@ function runChild(payload, hardMs) {
   });
 }
 
+// The fixture pages, served on 127.0.0.1 for as long as the run lasts.
+// Plain files only, from test/fixtures.
+async function serveFixtures() {
+  const http = await import('node:http');
+  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg' };
+  const server = http.createServer((req, res) => {
+    const name = path.basename(decodeURIComponent(new URL(req.url, 'http://x').pathname));
+    const file = path.join(FIXTURE_DIR, name);
+    if (!name || !fs.existsSync(file) || !types[path.extname(name)]) { res.writeHead(404); res.end('not found'); return; }
+    res.writeHead(200, { 'content-type': types[path.extname(name)], 'cache-control': 'no-store' });
+    fs.createReadStream(file).pipe(res);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return server;
+}
+
 async function main(argv) {
   const args = parseArgs(argv);
-  const regression = !args.urls.length;
-  let sites;
-  if (!regression) {
+  const regression = !args.urls.length && !args.fixtures;
+  // The tall fixtures take 50+ tiles; a live page rarely needs 4 minutes.
+  if (args.timeout == null) args.timeout = args.fixtures ? 600 : 240;
+  let sites, server = null;
+  if (args.fixtures) {
+    server = await serveFixtures();
+    const port = server.address().port;
+    sites = FIXTURES
+      .filter((f) => !args.sites.length || args.sites.some((q) => f.name.includes(q)))
+      .map((f) => ({ host: fixtureHost(f.name), url: `http://127.0.0.1:${port}/${f.file}` }));
+  } else if (args.urls.length) {
     sites = args.urls.map((u) => ({ host: new URL(u).host, url: u }));
   } else {
     sites = args.sites.length
@@ -128,22 +160,24 @@ async function main(argv) {
       : SITES;
   }
   if (!sites.length) { console.error('no matching sites'); process.exit(2); }
-  const keepPng = args.keepPng || (regression ? 'all' : 'failing');
+  const keepPng = args.keepPng || (regression || args.fixtures ? 'all' : 'failing');
 
   const startedAt = new Date();
   const stamp = startedAt.toISOString().replace(/[:]/g, '-').replace(/\..+/, '');
-  const tag = args.label || (args.ref ? args.ref.replace(/[^\w.-]/g, '_') : 'worktree');
+  const tag = args.label || [args.fixtures ? 'fixtures' : '', args.ref ? args.ref.replace(/[^\w.-]/g, '_') : 'worktree'].filter(Boolean).join('-');
   const outDir = args.out ? path.resolve(args.out) : path.join(REPO, 'test', 'out', `${stamp}-${tag}`);
   fs.mkdirSync(path.join(outDir, 'sites'), { recursive: true });
 
-  const extension = describeRef(args.ref);
+  const overlay = args.overlay ? path.resolve(args.overlay) : null;
+  const extension = describeRef(args.ref, overlay);
   // A folder that already has a run: resume it, with the same extension.
   const metaFile = path.join(outDir, 'run.json');
   if (fs.existsSync(metaFile)) {
     const prev = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
     if (prev.ref !== args.ref) { console.error(`${outDir} was run with --ref ${prev.ref}; resume it with the same ref`); process.exit(2); }
+    if ((prev.overlay || null) !== overlay) { console.error(`${outDir} was run with --overlay ${prev.overlay || '(none)'}; resume it with the same overlay`); process.exit(2); }
   } else {
-    fs.writeFileSync(metaFile, JSON.stringify({ startedAt: startedAt.toISOString(), extension, ref: args.ref, keepPng, honestUA: args.honest }, null, 2));
+    fs.writeFileSync(metaFile, JSON.stringify({ startedAt: startedAt.toISOString(), extension, ref: args.ref, overlay, keepPng, honestUA: args.honest }, null, 2));
   }
   const done = loadRuns([outDir]);
   const todo = sites.filter((s) => {
@@ -152,7 +186,7 @@ async function main(argv) {
     return r.verdict === 'error' && (args.retryErrors || !r.retried);
   });
 
-  const ext = buildExtension(args.ref);
+  const ext = buildExtension(args.ref, overlay);
   console.log(`extension: ${extension}\nloaded from ${ext.dir}\nout: ${outDir}`);
   if (todo.length < sites.length) console.log(`resuming: ${sites.length - todo.length} of ${sites.length} sites already done`);
   console.log('');
@@ -166,7 +200,7 @@ async function main(argv) {
       const prev = done.get(site.host);
       if (fs.existsSync(recFile)) fs.rmSync(recFile);
       const t0 = Date.now();
-      const r = await runChild({ site: { host: site.host, url: site.url }, extDir: ext.dir, outDir, timeout: args.timeout, headed: args.headed, keepPng, honest: args.honest, captureBlocked: args.captureBlocked, regression }, hardMs);
+      const r = await runChild({ site: { host: site.host, url: site.url }, extDir: ext.dir, outDir, timeout: args.timeout, headed: args.headed, keepPng, honest: args.honest, captureBlocked: args.captureBlocked, regression, fixtures: args.fixtures }, hardMs);
       let rec;
       if (fs.existsSync(recFile)) rec = JSON.parse(fs.readFileSync(recFile, 'utf8'));
       else {
@@ -182,6 +216,7 @@ async function main(argv) {
     }
   }));
   fs.rm(ext.dir, { recursive: true, force: true }, () => {});
+  if (server) server.close();
 
   // The whole run: every site asked for, in order, from the records on disk.
   const all = loadRuns([outDir]);
@@ -203,6 +238,6 @@ async function main(argv) {
   // Failures and errors fail the run. A blocked site fails it only in the
   // regression set, where it means a check could not run; in a sweep it is
   // listed and left out.
-  const bad = results.filter((r) => r.verdict === 'fail' || r.verdict === 'error' || (regression && r.verdict === 'blocked')).length;
+  const bad = results.filter((r) => r.verdict === 'fail' || r.verdict === 'error' || ((regression || args.fixtures) && r.verdict === 'blocked')).length;
   process.exitCode = bad || results.length < sites.length ? 1 : 0;
 }
