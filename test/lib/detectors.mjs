@@ -5,12 +5,14 @@
 // set's real captures; see test/README.md for what each one can't see.
 
 import { cols, rowDiff, rowStdIn, median } from './image.mjs';
+import { textSameColour, contentIn, usableDom } from './page-checks.mjs';
 
 export const T = {
   // blank band
   flatStd: 3,          // a row whose luma std is under this is "flat"
   flatDrift: 4,        // ...and stays within this of the run's colour
-  blankMinFrac: 0.45,  // band at least this × viewport height is flagged
+  blankMinFrac: 0.45,  // band at least this × viewport height is flagged (no page facts)
+  blankWithContent: 150, // CSS px: a flat run this tall over content the page has
   // repeated overlay
   textured: 12,        // row luma std above this counts as content
   matchDiff: 2,        // mean |Δluma| under this = rows are the same pixels
@@ -24,6 +26,10 @@ export const T = {
   seamSharp: 2,        // ...and this × the larger jump one row either side
   seamCoverage: 0.15,  // ...in at least this share of the block's columns
   seamMinBlocks: 2,
+  // seam, with the harness's own evidence from the two shots
+  ovDisagree: 6,       // mean |Δluma| between the shots over the 6 rows above the seam
+  ovStep: 8,           // the capture's jump exceeds the later shot's own by this
+  ovMinBlocks: 2,      // column blocks (~350 CSS px): one block alone was a live map tile twice in three
   // truncation
   truncSlack: 16       // CSS px the capture may fall short of the page
 };
@@ -38,6 +44,7 @@ export function tileRects(cap) {
   for (const d of cap.draws) {
     const k = d.dh / d.sh; // output px per source px
     const t = { y: Math.round((d.dy - d.sy * k) / scale), h: Math.round((d.sy + d.sh) * k / scale), drawY: Math.round(d.dy / scale) };
+    if (d.ov) t.ov = d.ov;
     // A tile shot again (when two tiles disagreed) repaints rows already
     // painted, and replaces the tile that painted them.
     while (out.length && out[out.length - 1].drawY >= t.drawY) out.pop();
@@ -58,11 +65,12 @@ export function boundaries(tiles, H) {
 }
 
 // (a) Blank band: a run of rows that are each one flat colour, the same
-// colour all the way down, taller than half a screen. A real design can
-// have that much empty space; a capture defect (a section whose image was
-// hidden, a marquee scrolled out of view) usually does. The very bottom of
-// the page is excluded: empty space below a footer is common and harmless.
-export function blankBands(img, { vh, region = null, minFrac = T.blankMinFrac } = {}) {
+// colour all the way down. Pixels alone can't tell deliberate space from a
+// section that didn't paint, so with the page's account of what is there
+// it is judged by that (below); without it, by height: taller than about
+// half a screen. The very bottom of the page is excluded: empty space below
+// a footer is common and harmless.
+export function blankBands(img, { vh, region = null, minFrac = T.blankMinFrac, dom = null } = {}) {
   const [y0, y1] = region ? [Math.max(0, region.y0), Math.min(img.H, region.y1)] : [0, img.H];
   const [x0, x1] = region && region.x != null ? cols(img, region.x, region.w) : [0, img.W];
   const minH = Math.round(vh * minFrac);
@@ -79,10 +87,25 @@ export function blankBands(img, { vh, region = null, minFrac = T.blankMinFrac } 
   }
   flush(y1);
   const longest = runs.reduce((m, r) => Math.max(m, r.y1 - r.y0), 0);
-  const flags = runs
-    .filter((r) => r.y1 - r.y0 >= minH && !(region == null && r.y1 >= img.H - 2))
-    .map((r) => ({ y0: r.y0, y1: r.y1, note: `flat rgb(${r.color.map(Math.round).join(',')}) ${r.y1 - r.y0}px` }));
-  return { pass: flags.length === 0, value: longest, detail: `longest flat run ${longest}px (limit ${minH}px)`, flags };
+  const notBottom = (r) => !(region == null && r.y1 >= img.H - 2);
+  // A run at least minH tall fails on height alone. With the page's account
+  // of what is there, a shorter one (down to T.blankWithContent) fails too
+  // when the page has text, images or embeds in it that didn't paint. The
+  // account never clears a tall run: content a script never put in the page
+  // (a reviews widget, a gallery) leaves the page empty there too, so it
+  // can't tell that from deliberate space.
+  const withDom = dom && !usableDom(img, dom);
+  const flags = [];
+  for (const r of runs) {
+    const h = r.y1 - r.y0;
+    if (!notBottom(r) || h < (withDom ? Math.min(T.blankWithContent, minH) : minH)) continue;
+    const col = `flat rgb(${r.color.map(Math.round).join(',')}) ${h}px`;
+    const c = withDom ? contentIn(dom, r.y0, r.y1) : null;
+    const has = c && (c.chars >= 10 || c.images || c.embeds);
+    if (has) flags.push({ y0: r.y0, y1: r.y1, note: `${col} where the page has ${[c.lines ? `${c.lines} text line(s)` : '', c.images ? `${c.images} image(s)` : '', c.embeds ? `${c.embeds} embed(s)` : ''].filter(Boolean).join(', ')}` });
+    else if (h >= minH) flags.push({ y0: r.y0, y1: r.y1, note: col });
+  }
+  return { pass: flags.length === 0, value: longest, detail: `longest flat run ${longest}px (limit ${minH}px${withDom ? `, ${T.blankWithContent}px over content the page has` : ''})`, flags };
 }
 
 // (b) Repeated overlay: the same textured strip at the same place in two
@@ -105,7 +128,7 @@ function runDiff(img, ya, yb, rows, shift, x0, x1) {
 // Matching is done per vertical block of the width, so an overlay that
 // covers only part of the screen (a popup card, a chat bubble, a sidebar)
 // is found even though the rest of its rows differ.
-export function repeatedOverlays(img, tiles, { zone = null, region = null, blocks = T.repeatBlocks } = {}) {
+export function repeatedOverlays(img, tiles, { zone = null, region = null, blocks = T.repeatBlocks, fixedBoxes = null } = {}) {
   const raw = [];
   const [rx0, rx1] = region && region.x != null ? cols(img, region.x, region.w) : [0, img.W];
   for (let k = 0; k + 1 < tiles.length; k++) {
@@ -150,11 +173,30 @@ export function repeatedOverlays(img, tiles, { zone = null, region = null, block
     if (f) { f.y0 = Math.min(f.y0, r.y0); f.y1 = Math.max(f.y1, r.y1); f.blocks.add(r.bi); f.n = Math.max(f.n, r.n); f.off = Math.min(f.off, r.off); }
     else flags.push({ k: r.k, d: r.d, y0: r.y0, y1: r.y1, blocks: new Set([r.bi]), n: r.n, off: r.off });
   }
-  const total = flags.reduce((s, f) => s + (f.y1 - f.y0), 0);
+  // With the page's account of what is fixed to the window (before and
+  // after the capture), a repeat only counts where something is: a fixed
+  // or sticky box covering the strip's place in the window. A repeat with
+  // nothing there is a background that repeats at the tile step (a
+  // window-fixed photo, a tiled texture) or a detail that recurs by chance.
+  let cleared = 0;
+  const kept = fixedBoxes == null ? flags : flags.filter((f) => {
+    const scale = img.cssWidth / img.W;
+    const bs = [...f.blocks];
+    const x0 = (rx0 + Math.floor((rx1 - rx0) * Math.min(...bs) / blocks)) * scale;
+    const x1 = (rx0 + Math.floor((rx1 - rx0) * (Math.max(...bs) + 1) / blocks)) * scale;
+    const o0 = f.y0 - tiles[f.k + 1].y, o1 = f.y1 - tiles[f.k + 1].y;
+    const hit = fixedBoxes.some(([bx, by, bw, bh]) => {
+      const iw = Math.min(x1, bx + bw) - Math.max(x0, bx), ih = Math.min(o1, by + bh) - Math.max(o0, by);
+      return iw > 0 && ih > 0 && iw * ih >= 0.25 * Math.min((x1 - x0) * (o1 - o0), bw * bh);
+    });
+    if (!hit) cleared++;
+    return hit;
+  });
+  const total = kept.reduce((s, f) => s + (f.y1 - f.y0), 0);
   return {
-    pass: flags.length === 0, value: total,
-    detail: `${flags.length} strip(s), ${total}px in all, repeated at the tile step`,
-    flags: flags.map((f) => ({ y0: f.y0, y1: f.y1, note: `${f.y1 - f.y0}px strip (${f.blocks.size}/${blocks} column blocks) identical to ${f.d}px above, tiles ${f.k + 1}/${f.k + 2}` }))
+    pass: kept.length === 0, value: total,
+    detail: `${kept.length} strip(s), ${total}px in all, repeated at the tile step${cleared ? `; ${cleared} more cleared: nothing fixed to the window there` : ''}`,
+    flags: kept.map((f) => ({ y0: f.y0, y1: f.y1, note: `${f.y1 - f.y0}px strip (${f.blocks.size}/${blocks} column blocks) identical to ${f.d}px above, tiles ${f.k + 1}/${f.k + 2}` }))
   };
 }
 
@@ -190,14 +232,78 @@ function coverage(img, B, x0, x1) {
   return n / (x1 - x0);
 }
 
-export function seams(img, tiles, { region = null, minBlocks = T.seamMinBlocks } = {}) {
+
+// The seam evidence the harness kept for a tile (capture.mjs): rows just
+// above where it starts painting, as already on the canvas (`prev`, the
+// tile above) and as this tile shot them (`own`, plus a few rows below).
+// Per column range: `dis`, how much the two shots of the same page rows
+// differ; `cap`, the jump the capture shows at the seam; `own`, the jump
+// this tile itself shows there. Null without evidence.
+const OV_COLS = 347;
+const decoded = new WeakMap();
+export function seamEvidence(tile, x0, x1, W) {
+  const ov = tile && tile.ov;
+  if (!ov) return null;
+  // Decoded once per tile, kept off the record (which is written as JSON).
+  let dec = decoded.get(ov);
+  if (!dec) decoded.set(ov, dec = { prev: Buffer.from(ov.prev, 'base64'), own: Buffer.from(ov.own, 'base64') });
+  const { n } = ov, { prev, own } = dec;
+  const c0 = Math.floor(x0 * OV_COLS / W), c1 = Math.max(c0 + 1, Math.floor(x1 * OV_COLS / W));
+  let dis = 0, cap = 0, mine = 0;
+  const rows = Math.min(6, n);
+  for (let r = n - rows; r < n; r++) for (let c = c0; c < c1; c++) dis += Math.abs(prev[r * OV_COLS + c] - own[r * OV_COLS + c]);
+  for (let c = c0; c < c1; c++) {
+    cap += Math.abs(prev[(n - 1) * OV_COLS + c] - own[n * OV_COLS + c]);
+    mine += Math.abs(own[(n - 1) * OV_COLS + c] - own[n * OV_COLS + c]);
+  }
+  const k = c1 - c0;
+  return { dis: dis / (k * rows), cap: cap / k, own: mine / k };
+}
+
+// Whether the extension itself found this tile's overlap matching the tile
+// above (placements, from 15e3544 on): its pixel match came out 'ok', or
+// (from c539d2d on) no column block disagreed. Null when it didn't say.
+function placementAgrees(p) {
+  if (!p) return null;
+  if (p.agree) return p.agree.blocks === 0;
+  if (p.match && p.match.match === 'ok') return true;
+  if (p.match && (p.match.match === 'mismatch' || p.match.match === 'moved')) return false;
+  return null;
+}
+
+export function seams(img, tiles, { region = null, minBlocks = T.seamMinBlocks, placements = null } = {}) {
   const flags = [];
-  let worst = 0;
+  let worst = 0, cleared = 0;
   const [rx0, rx1] = region && region.x != null ? cols(img, region.x, region.w) : [0, img.W];
   const nb = region && region.x != null ? Math.max(1, Math.round(T.seamBlocks * (rx1 - rx0) / img.W)) : T.seamBlocks;
-  for (const B of boundaries(tiles, img.H)) {
+  const placed = placements ? placements.filter((p) => !p.retake && !p.reshot) : null;
+  for (let ti = 1; ti < tiles.length; ti++) {
+    const B = tiles[ti].drawY ?? tiles[ti].y;
+    if (B <= 0 || B >= img.H) continue;
     if (B < 32 || B > img.H - 32) continue;
     if (region && (B < region.y0 || B >= region.y1)) continue;
+    // Best evidence: the two shots of the rows above the seam. A break the
+    // later shot shows itself, over rows both shots agree on, is an edge in
+    // the page (a section starting there), not a seam. A seam is a jump the
+    // capture shows and the later shot doesn't, where the shots disagree.
+    if (tiles[ti].ov) {
+      const hits = [];
+      for (let k = 0; k < nb; k++) {
+        const x0 = rx0 + Math.floor((rx1 - rx0) * k / nb), x1 = rx0 + Math.floor((rx1 - rx0) * (k + 1) / nb);
+        const e = seamEvidence(tiles[ti], x0, x1, img.W);
+        const step = e.cap - e.own;
+        if (e.cap >= T.seamJump) worst = Math.max(worst, step);
+        if (e.dis >= T.ovDisagree && e.cap >= T.seamJump && step >= T.ovStep) hits.push({ k, jump: Math.round(e.cap), own: Math.round(e.own), dis: Math.round(e.dis) });
+      }
+      if (hits.length >= T.ovMinBlocks) {
+        const h = hits.reduce((m, x) => (x.jump > m.jump ? x : m));
+        flags.push({ y0: B - 8, y1: B + 8, note: `break at ${B}px in ${hits.length}/${nb} column blocks where the two shots disagree (jump ${h.jump}; the later shot alone ${h.own}; shots differ by ${h.dis})` });
+      }
+      continue;
+    }
+    // Without it, the extension's own overlap match: a seam where it found
+    // the overlap matching is an edge in the page.
+    if (placed && placementAgrees(placed[ti]) === true) { cleared++; continue; }
     const hits = [];
     for (let k = 0; k < nb; k++) {
       const x0 = rx0 + Math.floor((rx1 - rx0) * k / nb), x1 = rx0 + Math.floor((rx1 - rx0) * (k + 1) / nb);
@@ -220,7 +326,7 @@ export function seams(img, tiles, { region = null, minBlocks = T.seamMinBlocks }
       flags.push({ y0: B - 8, y1: B + 8, note: `one-row break at ${B}px in ${hits.length}/${nb} column blocks (jump ${h.jump} vs ${h.base} typical, ${h.next} next row)` });
     }
   }
-  return { pass: flags.length === 0, value: +worst.toFixed(1), detail: `${flags.length} seam(s); strongest boundary score ${worst.toFixed(1)}`, flags };
+  return { pass: flags.length === 0, value: +worst.toFixed(1), detail: `${flags.length} seam(s); strongest boundary score ${worst.toFixed(1)}${cleared ? `; ${cleared} boundary break(s) cleared by the extension's overlap match` : ''}`, flags };
 }
 
 // (d) Truncation: the capture is much shorter than the page's real
@@ -258,14 +364,18 @@ export function unpaintedRows(img) {
   return { pass: total === 0, value: total, detail: `${total} transparent row(s) in ${flags.length} run(s)`, flags };
 }
 
-export function runGeneric(img, cap) {
+export async function runGeneric(img, cap) {
   const tiles = tileRects(cap);
   const vh = cap.prepare ? cap.prepare.viewportHeight : 868;
+  const dom = cap.dom && !cap.dom.error ? cap.dom : null;
+  // Everything the page had fixed to the window, before and after.
+  const fixedBoxes = dom ? [...(dom.fixed || []), ...((cap.gate && cap.gate.fixed) || [])].map((f) => f.box) : null;
   return {
-    'blank-band': blankBands(img, { vh }),
-    'repeated-overlay': repeatedOverlays(img, tiles),
-    'seam': seams(img, tiles),
+    'blank-band': blankBands(img, { vh, dom }),
+    'repeated-overlay': repeatedOverlays(img, tiles, { fixedBoxes }),
+    'seam': seams(img, tiles, { placements: cap.placements }),
     'truncation': truncation(img, cap),
-    'unpainted-rows': unpaintedRows(img)
+    'unpainted-rows': unpaintedRows(img),
+    'text-same-colour': await textSameColour(img, cap)
   };
 }
