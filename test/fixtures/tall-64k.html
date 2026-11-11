@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: 64000px page</title>
+<!-- Taller than the extension's 60000px cap: the capture should stop at
+     60000px and say so (warning 'truncated'). -->
+<style>html,body{margin:0}</style>
+<script src="bands.js"></script>
+<main id="m"></main>
+<script>addBands(document.getElementById('m'), 0, 320);</script>

@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: 40000px page</title>
+<!-- Taller than the stitching canvas can be at device scale 2: 65535 px is
+     Chrome's limit for one side of a canvas, so about 32700 CSS px. -->
+<style>html,body{margin:0}</style>
+<script src="bands.js"></script>
+<main id="m"></main>
+<script>addBands(document.getElementById('m'), 0, 200);</script>

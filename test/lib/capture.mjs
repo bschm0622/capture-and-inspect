@@ -118,10 +118,14 @@ function instrumentWorker([cssWidth, cols, above, below]) {
         const n = Math.min(above, Math.floor(a[2] / src), Math.floor(a[6] / out));
         if (n >= 4 && a[2] + below * src <= bmp.height) {
           const prev = this.getImageData(0, a[6] - n * out, this.canvas.width, n * out).data;
-          const tmp = new OffscreenCanvas(bmp.width, Math.round((n + below) * src));
-          draw.call(tmp.getContext('2d'), bmp, 0, a[2] - n * src, bmp.width, (n + below) * src, 0, 0, bmp.width, (n + below) * src);
+          // This tile's rows, resampled to the canvas's scale the way the
+          // stitcher draws them, so that when the extension scales a tall
+          // page down both sides of the comparison went through the same
+          // resampling.
+          const tmp = new OffscreenCanvas(this.canvas.width, Math.round((n + below) * out));
+          draw.call(tmp.getContext('2d'), bmp, 0, a[2] - n * src, bmp.width, (n + below) * src, 0, 0, tmp.width, tmp.height);
           const own = tmp.getContext('2d').getImageData(0, 0, tmp.width, tmp.height).data;
-          rec.ov = { n, below, prev: sample(prev, this.canvas.width, out, n), own: sample(own, bmp.width, src, n + below) };
+          rec.ov = { n, below, prev: sample(prev, this.canvas.width, out, n), own: sample(own, tmp.width, out, n + below) };
         }
       } catch (e) { rec.ovError = String(e.message || e); }
       h.draws.push(rec);
@@ -326,7 +330,43 @@ function domFacts([maxLines]) {
       if (r.width >= 100 && r.height >= 60) bgFixed.push({ box: box(r) });
     }
   }
-  return { width: W, height: (document.scrollingElement || document.documentElement).scrollHeight, scrollY: sy, lines, truncated, images, embeds, fixed: fixed.slice(0, 200), bgFixed: bgFixed.slice(0, 100) };
+  // Rows something on the page lays claim to, merged into [y0, y1) runs
+  // (page px): the box of every element in the flow that is a leaf of the
+  // layout (no child with a height of its own), and of every element a
+  // visitor can't see right now (transparent, hidden), which is content
+  // waiting to show. What no leaf claims is the space between and around
+  // boxes: padding and margins, there by design. A flat band in the capture
+  // over claimed rows is something that didn't paint (an empty widget box,
+  // an entrance never played); over unclaimed rows it is the page's own
+  // spacing.
+  const claims = [];
+  const flowing = (el) => {
+    for (let a = el; a && a !== document.body; a = a.parentElement) {
+      const p = getComputedStyle(a).position;
+      if (p === 'fixed' || p === 'sticky') return false;
+    }
+    return true;
+  };
+  for (const el of document.querySelectorAll('body *')) {
+    if (/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|BR|WBR|svg)$/i.test(el.tagName) || el.closest('svg')) continue;
+    const r = el.getBoundingClientRect();
+    if (r.height < 8 || r.width < 8 || r.bottom + sy <= 0 || r.right <= 0 || r.left >= W) continue;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none') continue;
+    const hiddenNow = cs.visibility === 'hidden' || +cs.opacity < 0.5;
+    const leaf = !Array.from(el.children).some((c) => c.getBoundingClientRect().height >= 2);
+    if (!hiddenNow && !leaf) continue;
+    if (!flowing(el)) continue;
+    claims.push([Math.max(0, Math.floor(r.top + sy)), Math.ceil(r.bottom + sy)]);
+  }
+  claims.sort((a, b) => a[0] - b[0]);
+  const claimed = [];
+  for (const c of claims) {
+    const last = claimed[claimed.length - 1];
+    if (last && c[0] <= last[1]) last[1] = Math.max(last[1], c[1]);
+    else claimed.push(c);
+  }
+  return { width: W, height: (document.scrollingElement || document.documentElement).scrollHeight, scrollY: sy, lines, truncated, images, embeds, fixed: fixed.slice(0, 200), bgFixed: bgFixed.slice(0, 100), claimed: claimed.slice(0, 5000) };
 }
 
 export async function captureSite(extDir, site, { headless = true, timeoutMs = 240000, honest = true, captureBlocked = false } = {}) {

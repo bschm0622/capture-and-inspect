@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: modal open, page locked by a fixed body</title>
+<!-- The common modal scroll lock: the page was scrolled to 400px, a popup
+     opened, and the body was pinned with position: fixed and top: -400px
+     (and html overflow hidden). The capture should hide the popup and its
+     scrim, undo the lock and capture the whole page from its top. -->
+<style>
+  html,body{margin:0}
+  html.locked{overflow:hidden}
+  body.locked{position:fixed;top:-400px;left:0;right:0}
+  #scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1000}
+  #modal{position:fixed;left:300px;right:8px;top:200px;height:420px;background:#e0f;z-index:1001;font:20px sans-serif;padding:24px;box-sizing:border-box}
+</style>
+<script src="bands.js"></script>
+<main id="m"></main>
+<div id="scrim"></div>
+<div id="modal" role="dialog" aria-modal="true"><h2>Sign up for our newsletter</h2><p>Get the latest offers straight to your inbox. <button>Close</button></p></div>
+<script>
+  addBands(document.getElementById('m'), 0, 25);
+  document.documentElement.classList.add('locked');
+  document.body.classList.add('locked');
+</script>

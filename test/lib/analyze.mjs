@@ -10,6 +10,13 @@ import { VIEWPORT, DPR } from './capture.mjs';
 
 export const fileFor = (host) => host.replace(/[^\w.-]/g, '_');
 
+// Output px per CSS px of the capture: the device scale, unless the
+// extension had to scale a page too tall for one image down.
+export function captureScale(cap) {
+  const w = cap.canvas && cap.canvas.width, css = cap.prepare && cap.prepare.pageWidth;
+  return w && css ? w / css : DPR;
+}
+
 // pass | fail | blocked | error
 export function verdictOf(rec) {
   if (rec.error) return 'error';
@@ -47,6 +54,12 @@ export async function runChecks(rec, img, cap, detectors, { site = null, shot = 
   const checks = {};
   // (async from the page checks on; plain object from older detectors)
   for (const [name, r] of Object.entries(await detectors.runGeneric(img, cap))) checks[name] = { kind: 'generic', ...r };
+  // A fixture built to break the capture on purpose expects some generic
+  // checks to fail; its own checks judge whether the extension said so.
+  for (const name of (site && site.expectGenericFail) || []) {
+    const c = checks[name];
+    if (c) checks[name] = { ...c, pass: true, expected: true, detail: `expected to fail on this page (${c.pass ? 'did not' : 'did'}): ${c.detail}` };
+  }
   if (site && site.checks) {
     const tiles = detectors.tileRects(cap);
     const vh = cap.prepare ? cap.prepare.viewportHeight : VIEWPORT.height;
@@ -87,7 +100,7 @@ export async function recordCapture(site, cap, outDir, detectors, { keepPng = 'a
 
   fs.writeFileSync(path.join(outDir, `${file}.preview.jpg`), await preview(cap.png, 260));
   rec.preview = `${file}.preview.jpg`;
-  const img = await loadCapture(cap.png, DPR);
+  const img = await loadCapture(cap.png, captureScale(cap));
   const tiles = detectors.tileRects(cap);
   rec.capture = { devWidth: img.devWidth, devHeight: img.devHeight, cssWidth: img.cssWidth, cssHeight: img.H };
   rec.tileTops = tiles.map((t) => t.y);
@@ -133,7 +146,7 @@ export async function recordCapture(site, cap, outDir, detectors, { keepPng = 'a
 // Returns null when there is no PNG to look at.
 export async function rescore(rec, dir, detectors) {
   if (!rec.png || !fs.existsSync(path.join(dir, rec.png))) return null;
-  const img = await loadCapture(fs.readFileSync(path.join(dir, rec.png)), DPR);
   const cap = capFromRecord(rec);
+  const img = await loadCapture(fs.readFileSync(path.join(dir, rec.png)), captureScale(cap));
   return runChecks(rec, img, cap, detectors);
 }

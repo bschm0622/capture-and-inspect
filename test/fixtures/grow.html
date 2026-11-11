@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: page that grows while captured</title>
+<!-- Starts 13 bands (2600px) tall. Each time the page is scrolled to within
+     1000px of its bottom, at least 400ms after the scroll before (so the
+     pre-scroll's quick stops don't count, the capture's tiles do), six more
+     bands (1200px) are added, five times. The page ends 8600px tall, far
+     past the room the stitching canvas leaves for growth (two screens), so
+     the canvas has to grow. -->
+<style>html,body{margin:0}</style>
+<script src="bands.js"></script>
+<main id="m"></main>
+<script>
+  const m = document.getElementById('m');
+  let n = 13, adds = 0, last = 0;
+  addBands(m, 0, n);
+  addEventListener('scroll', () => {
+    const now = performance.now();
+    const quick = now - last < 400;
+    last = now;
+    if (quick || adds >= 5) return;
+    if (scrollY + innerHeight > document.documentElement.scrollHeight - 1000) {
+      addBands(m, n, 6);
+      n += 6;
+      adds++;
+    }
+  });
+</script>

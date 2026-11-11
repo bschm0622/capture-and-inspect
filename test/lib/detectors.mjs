@@ -13,10 +13,12 @@ export const T = {
   flatDrift: 4,        // ...and stays within this of the run's colour
   blankMinFrac: 0.45,  // band at least this × viewport height is flagged (no page facts)
   blankWithContent: 150, // CSS px: a flat run this tall over content the page has
+  blankClaimedMax: 0.1,  // a tall run with no more than this share inside the page's boxes is spacing
   // repeated overlay
   textured: 12,        // row luma std above this counts as content
   matchDiff: 2,        // mean |Δluma| under this = rows are the same pixels
   repeatMin: 24,       // CSS px of matched content rows to flag
+  repeatOffRow: 12,    // ...of which at least this many unlike their commonest row
   repeatBlocks: 8,
   // seam
   seamBlocks: 8,
@@ -96,6 +98,7 @@ export function blankBands(img, { vh, region = null, minFrac = T.blankMinFrac, d
   // can't tell that from deliberate space.
   const withDom = dom && !usableDom(img, dom);
   const flags = [];
+  let spacing = 0;
   for (const r of runs) {
     const h = r.y1 - r.y0;
     if (!notBottom(r) || h < (withDom ? Math.min(T.blankWithContent, minH) : minH)) continue;
@@ -103,9 +106,28 @@ export function blankBands(img, { vh, region = null, minFrac = T.blankMinFrac, d
     const c = withDom ? contentIn(dom, r.y0, r.y1) : null;
     const has = c && (c.chars >= 10 || c.images || c.embeds);
     if (has) flags.push({ y0: r.y0, y1: r.y1, note: `${col} where the page has ${[c.lines ? `${c.lines} text line(s)` : '', c.images ? `${c.images} image(s)` : '', c.embeds ? `${c.embeds} embed(s)` : ''].filter(Boolean).join(', ')}` });
-    else if (h >= minH) flags.push({ y0: r.y0, y1: r.y1, note: col });
+    else if (h >= minH) {
+      // A tall run over rows no box on the page claims (the space between
+      // sections, their padding and margins) is the page's own spacing.
+      // Over a claimed box with nothing showing (a widget's empty frame,
+      // content still hidden for an entrance) it is something that didn't
+      // paint. Records from before the harness kept the claims can't tell.
+      const share = withDom && dom.claimed ? claimedShare(dom.claimed, r.y0, r.y1) : null;
+      if (share != null && share <= T.blankClaimedMax) spacing++;
+      else flags.push({ y0: r.y0, y1: r.y1, note: `${col}${share != null ? `; ${Math.round(share * 100)}% of it inside boxes the page has there` : ''}` });
+    }
   }
-  return { pass: flags.length === 0, value: longest, detail: `longest flat run ${longest}px (limit ${minH}px${withDom ? `, ${T.blankWithContent}px over content the page has` : ''})`, flags };
+  return { pass: flags.length === 0, value: longest, detail: `longest flat run ${longest}px (limit ${minH}px${withDom ? `, ${T.blankWithContent}px over content the page has` : ''})${spacing ? `; ${spacing} tall run(s) cleared: space between the page's boxes` : ''}`, flags };
+}
+
+// Share of rows [y0, y1) inside the page's claimed runs (capture.mjs).
+function claimedShare(claimed, y0, y1) {
+  let n = 0;
+  for (const [a, b] of claimed) {
+    if (a >= y1) break;
+    n += Math.max(0, Math.min(b, y1) - Math.max(a, y0));
+  }
+  return n / Math.max(1, y1 - y0);
 }
 
 // (b) Repeated overlay: the same textured strip at the same place in two
@@ -128,8 +150,36 @@ function runDiff(img, ya, yb, rows, shift, x0, x1) {
 // Matching is done per vertical block of the width, so an overlay that
 // covers only part of the screen (a popup card, a chat bubble, a sidebar)
 // is found even though the rest of its rows differ.
+//
+// A match only means something if the matched rows change down the strip.
+// Rows whose only texture is vertical edges (a card's side against a dark
+// gutter, a coloured bar beside a panel, a column of dots) are one row
+// profile repeated: they match every other row of the same column, so two
+// such stretches one tile step apart match without anything having
+// followed the scroll. Between the lines of a text block those rows come
+// in short runs, and the gaps in the text let them join into a strip long
+// enough to flag, while the shifted comparison below lands on text rows and
+// can't tell. The evidence a real overlay leaves is the opposite: its
+// varied rows (text, an outline, a picture) match too. So a run needs
+// T.repeatOffRow matched rows that differ from its commonest row (beyond
+// |Δluma| 2). Over every capture kept in test/out on 2026-11-11,
+// the false repeats had 2-6 such rows (a6c3f84 sweep: dark footer and card
+// grids, green service cards, coloured cards on a dotted ground; and two
+// card edges on older runs), every real one 14 or more (chat bubbles,
+// newsletter popup, sticky headings and nav, the Field Museum's header).
+function offRow(img, ys, x0, x1) {
+  let best = 0;
+  for (const r of ys) {
+    let n = 0;
+    for (const y of ys) if (rowDiff(img, r, y, x0, x1) <= T.matchDiff) n++;
+    if (n > best) best = n;
+  }
+  return ys.length - best;
+}
+
 export function repeatedOverlays(img, tiles, { zone = null, region = null, blocks = T.repeatBlocks, fixedBoxes = null } = {}) {
   const raw = [];
+  let uniform = 0;
   const [rx0, rx1] = region && region.x != null ? cols(img, region.x, region.w) : [0, img.W];
   for (let k = 0; k + 1 < tiles.length; k++) {
     const a = tiles[k].y, b = tiles[k + 1].y, d = b - a;
@@ -149,7 +199,9 @@ export function repeatedOverlays(img, tiles, { zone = null, region = null, block
           const at0 = Math.min(...JITTER.map((j) => runDiff(img, a, b, inner, j, x0, x1)));
           const off = Math.min(...SHIFTS.map((sh) => runDiff(img, a, b, inner, sh, x0, x1)));
           if (inner.length >= T.repeatMin && off > 1 + 2 * at0) {
-            raw.push({ k, d, bi, y0: b + run.o0, y1: b + run.o1, n: run.rows.length, at0, off });
+            const other = offRow(img, run.rows.map((o) => b + o), x0, x1);
+            if (other < T.repeatOffRow) uniform++;
+            else raw.push({ k, d, bi, y0: b + run.o0, y1: b + run.o1, n: run.rows.length, at0, off });
           }
         }
         run = null;
@@ -195,7 +247,7 @@ export function repeatedOverlays(img, tiles, { zone = null, region = null, block
   const total = kept.reduce((s, f) => s + (f.y1 - f.y0), 0);
   return {
     pass: kept.length === 0, value: total,
-    detail: `${kept.length} strip(s), ${total}px in all, repeated at the tile step${cleared ? `; ${cleared} more cleared: nothing fixed to the window there` : ''}`,
+    detail: `${kept.length} strip(s), ${total}px in all, repeated at the tile step${cleared ? `; ${cleared} more cleared: nothing fixed to the window there` : ''}${uniform ? `; ${uniform} block match(es) dropped: mostly one row repeated` : ''}`,
     flags: kept.map((f) => ({ y0: f.y0, y1: f.y1, note: `${f.y1 - f.y0}px strip (${f.blocks.size}/${blocks} column blocks) identical to ${f.d}px above, tiles ${f.k + 1}/${f.k + 2}` }))
   };
 }
