@@ -1,12 +1,14 @@
 // Synthetic local pages that drive paths of the stitcher no live site in the
-// regression set reaches: a page taller than a canvas can be, the page
-// height cap, a canvas that has to grow, a stale frame, a shot budget that
+// regression set reaches: pages taller than a canvas can be (painted into
+// several canvases, bands, and written by the extension's own PNG writer),
+// the page height cap, a canvas that has to grow, a stale frame, a shot budget that
 // runs low with rows left unpainted, and a modal's fixed-body scroll lock.
 // `node test/run.mjs --fixtures` serves this folder on 127.0.0.1 and
 // captures each page through the real extension; the generic detectors run
 // too. Each page is a stack of 200px bands of known colours (bands.js), so a
 // check can say exactly which content is out of place.
 
+import sharp from 'sharp';
 import { result } from '../lib/regions.mjs';
 import { cols } from '../lib/image.mjs';
 
@@ -50,26 +52,121 @@ function bandsInPlace(img, { first = 0, top = 0, until = img.H } = {}) {
     merged.map((m) => ({ y0: m.y0, y1: m.y1, note: m.n > 1 ? `${m.n} bands out of place from here: ${m.note}` : m.note })));
 }
 
+// Where the stitcher's canvases meet in the capture (device rows): each is
+// as tall as Chrome allows a canvas at this width (background.js bands).
+const bandEdges = (img) => {
+  const rows = Math.min(65535, Math.floor(268435456 / img.devWidth));
+  const out = [];
+  for (let y = rows; y < img.devHeight; y += rows) out.push(y);
+  return out;
+};
+
+// The extension's height cap for this width: MAX_PAGE_HEIGHT, or less when
+// the image would pass 2^31 bytes of RGBA (background.js).
+const heightCap = (img) => Math.min(100000, Math.floor((2 ** 31 - 1) / 4 / img.devWidth / img.dpr));
+
+// Every device row of the capture, at full resolution, shows its band's
+// colour in the plain strip at the right (within 3 levels). Catches a row
+// lost, doubled or shifted anywhere, a band edge included, to the pixel.
+async function rowsExact(img, until = img.devHeight) {
+  const left = Math.round(1260 * img.dpr), width = Math.round(120 * img.dpr);
+  const { data, info } = await sharp(img.png, { limitInputPixels: false })
+    .extract({ left, top: 0, width, height: until }).raw().toBuffer({ resolveWithObject: true });
+  const ch = info.channels;
+  const bad = [];
+  for (let y = 0; y < until; y++) {
+    const want = bandColour(Math.floor(y / img.dpr / BAND));
+    const s = [0, 0, 0];
+    for (let x = 0; x < width; x++) for (let k = 0; k < 3; k++) s[k] += data[(y * width + x) * ch + k];
+    if (Math.max(...s.map((v, k) => Math.abs(v / width - want[k]))) > 3) bad.push(y);
+  }
+  const flags = [];
+  for (const y of bad) {
+    const f = flags[flags.length - 1], c = Math.floor(y / img.dpr);
+    if (f && c <= f.y1) f.y1 = c + 1; else flags.push({ y0: c, y1: c + 1, note: 'rows show the wrong band colour' });
+  }
+  return result(bad.length === 0, bad.length, `${until - bad.length} of ${until} device rows show their band's colour`, flags.slice(0, 20));
+}
+
+// The capture around each place where two of the stitcher's canvases meet
+// equals the browser's own screenshot of the page there (taken after the
+// capture, page restored), row for row over the full width: text, edges and
+// all. Each band edge must fall inside a reference screenshot.
+async function edgesMatchPage(img, cap) {
+  const edges = bandEdges(img);
+  const shots = cap.refShots || [];
+  const covered = edges.filter((e) => shots.some((s) => e > s.scrollY * img.dpr + 8 && e < (s.scrollY + 868) * img.dpr - 8));
+  let worst = 0, badRows = 0, rows = 0;
+  const flags = [];
+  for (const s of shots) {
+    const ref = await sharp(s.png).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const top = Math.round(s.scrollY * img.dpr);
+    const h = Math.min(ref.info.height, img.devHeight - top);
+    if (h <= 0) continue;
+    const got = await sharp(img.png, { limitInputPixels: false }).extract({ left: 0, top, width: img.devWidth, height: h })
+      .removeAlpha().raw().toBuffer();
+    const W = img.devWidth;
+    for (let y = 0; y < h; y++) {
+      let d = 0;
+      for (let i = y * W * 3, e = i + W * 3; i < e; i++) d += Math.abs(got[i] - ref.data[i]);
+      d /= W * 3;
+      rows++;
+      worst = Math.max(worst, d);
+      if (d > 0.5) {
+        badRows++;
+        const c = Math.floor((top + y) / img.dpr), f = flags[flags.length - 1];
+        if (f && c <= f.y1) f.y1 = c + 1; else flags.push({ y0: c, y1: c + 1, note: 'differs from the browser\'s own screenshot of the page here' });
+      }
+    }
+  }
+  const ok = edges.length > 0 && covered.length === edges.length && badRows === 0;
+  return result(ok, badRows, `${edges.length} canvas edge(s) at device rows ${edges.join(', ') || 'none'}, ${covered.length} inside a reference shot; ${rows} rows compared, ${badRows} differ (worst mean |Δ| ${worst.toFixed(2)})`, flags.slice(0, 20));
+}
+
 const warned = (cap, kind) => (cap.warnings || []).filter((w) => w.kind === kind);
 
 export const FIXTURES = [
   {
-    name: 'tall-40k', file: 'tall-40k.html',
+    name: 'tall-40k', file: 'tall-40k.html', refShots: [32768],
     checks: {
       // 40000 CSS px at device scale 2 is 80000 px: past the 65535 px a
-      // canvas side may be. The capture must still come back, whole.
+      // canvas side may be, so two canvases and the extension's PNG writer.
+      // The capture must still come back, whole and full resolution.
       'bands-in-place': ({ img }) => bandsInPlace(img),
-      'full-height': ({ img }) => result(Math.abs(img.H - 40000) <= 2, img.H, `capture ${img.H}px for a 40000px page`)
+      'full-height': ({ img }) => result(Math.abs(img.H - 40000) <= 2 && img.devWidth === 2776, img.H, `capture ${img.devWidth}x${img.devHeight} for a 40000px page`),
+      'rows-exact': ({ img }) => rowsExact(img),
+      'edges-match-page': ({ img, cap }) => edgesMatchPage(img, cap)
     }
   },
   {
-    name: 'tall-64k', file: 'tall-64k.html',
+    name: 'tall-64k', file: 'tall-64k.html', refShots: [32768, 63500],
+    checks: {
+      // Past the old 60000 px cap, under the new one: captured whole.
+      'bands-in-place': ({ img }) => bandsInPlace(img),
+      'full-height': ({ img }) => result(Math.abs(img.H - 64000) <= 2 && img.devWidth === 2776, img.H, `capture ${img.devWidth}x${img.devHeight} for a 64000px page`),
+      'rows-exact': ({ img }) => rowsExact(img),
+      'edges-match-page': ({ img, cap }) => edgesMatchPage(img, cap),
+      // No warnings a whole, still page doesn't earn.
+      'no-false-warnings': ({ cap }) => {
+        const w = (cap.warnings || []).filter((x) => x.kind === 'truncated' || x.kind === 'page-height-changed');
+        return result(w.length === 0, w.length, w.length ? w.map((x) => x.note).join('; ') : 'no truncated or page-height-changed warning');
+      }
+    }
+  },
+  {
+    name: 'tall-100k', file: 'tall-100k.html', refShots: [32768, 65536],
     checks: {
       'bands-in-place': ({ img }) => bandsInPlace(img),
-      // The extension captures the first 60000px and says the rest is cut.
+      'rows-exact': ({ img }) => rowsExact(img),
+      'edges-match-page': ({ img, cap }) => edgesMatchPage(img, cap),
+      // Past the height cap: the extension captures up to it, says so once,
+      // and nothing else about the page's height.
       'capped-and-said': ({ img, cap }) => {
+        const c = heightCap(img);
         const w = warned(cap, 'truncated');
-        return result(Math.abs(img.H - 60000) <= 2 && w.length > 0, img.H, `capture ${img.H}px (cap 60000); ${w.length ? `warned: ${w[0].note}` : 'no truncated warning'}`);
+        const changed = warned(cap, 'page-height-changed');
+        const ok = Math.abs(img.H - c) <= 2 && w.length === 1 && w[0].reason === 'too-tall' && changed.length === 0;
+        return result(ok, img.H, `capture ${img.H}px (cap ${c}); ${w.length} truncated warning(s)${w.length ? `: ${w[0].note}` : ''}; ${changed.length} page-height-changed`);
       }
     }
   },

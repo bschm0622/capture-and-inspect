@@ -1,8 +1,9 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>Fixture: 64000px page</title>
-<!-- Taller than the extension's 60000px cap: the capture should stop at
-     60000px and say so (warning 'truncated'). -->
+<!-- Past the extension's old 60000px cap and under the new one (about
+     96,700 CSS px): captured whole, at full resolution, in two canvases
+     (65535 device rows each), with no warning. -->
 <style>html,body{margin:0}</style>
 <script src="bands.js"></script>
 <main id="m"></main>

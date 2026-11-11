@@ -391,7 +391,11 @@ export function truncation(img, cap, { slack = T.truncSlack } = {}) {
   const hs = [cap.factsBefore && cap.factsBefore.scrollable, cap.factsAfter && cap.factsAfter.scrollable, ...(cap.tiles || []).map((t) => t.pageHeight)]
     .filter((h) => h > 0);
   const real = cap.factsBefore.scrollable;
-  const least = Math.min(60000, ...hs);
+  // The extension's height cap (background.js): 100000 CSS px, or less where
+  // the image would pass 2^31 bytes of RGBA (about 96,700 px at 2776 px
+  // wide). Commits before the bands capped at 60000.
+  const capPx = Math.min(100000, Math.floor((2 ** 31 - 1) / 4 / img.devWidth / img.dpr));
+  const least = Math.min(capPx, ...hs);
   const short = least - img.H;
   const pass = short <= slack;
   return {

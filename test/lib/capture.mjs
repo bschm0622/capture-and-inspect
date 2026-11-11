@@ -101,12 +101,38 @@ function instrumentWorker([cssWidth, cols, above, below]) {
     for (let i = 0; i < out.length; i++) s += String.fromCharCode(out[i]);
     return btoa(s);
   };
+  // The stitcher paints into a stack of canvases (bands), each marked with
+  // `bandTop`, where it starts in the capture (output px); before bands, one
+  // canvas from 0. The bands seen so far, by their top, to read rows across
+  // a band edge.
+  const bands = new Map();
+  const readRows = (y, n, width) => {
+    const out = new Uint8ClampedArray(width * n * 4);
+    for (const [top, c] of bands) {
+      const a = Math.max(y, top), b = Math.min(y + n, top + c.height);
+      if (b <= a) continue;
+      out.set(c.getContext('2d').getImageData(0, a - top, width, b - a).data, (a - y) * width * 4);
+    }
+    return out;
+  };
   // Only the 9-argument form is a tile going onto the stitching canvas; the
   // worker's other draws (its small matching grids, the final crop) use
   // shorter forms.
   proto.drawImage = function (...a) {
     if (a.length === 9) {
-      const rec = { sy: a[2], sh: a[4], dx: a[5], dy: a[6], dw: a[7], dh: a[8] };
+      const bandTop = this.canvas.bandTop || 0;
+      bands.set(bandTop, this.canvas);
+      const rec = { sy: a[2], sh: a[4], dx: a[5], dy: a[6] + bandTop, dw: a[7], dh: a[8] };
+      // A tile that straddles two bands is drawn in two parts: the second
+      // continues the first, and is the same tile.
+      const prevRec = h.draws[h.draws.length - 1];
+      if (prevRec && h.lastSource === a[0] && Math.abs(prevRec.sy + prevRec.sh - rec.sy) < 1e-6 && prevRec.dy + prevRec.dh === rec.dy) {
+        prevRec.sh += rec.sh;
+        prevRec.dh += rec.dh;
+        h.canvas = { width: this.canvas.width, height: Math.max(h.canvas.height, bandTop + this.canvas.height) };
+        return draw.apply(this, a);
+      }
+      h.lastSource = a[0];
       // The seam evidence: just above where this tile starts painting, the
       // rows already on the canvas (the tile above's) and the same page
       // rows as this tile shot them, plus this tile's first rows below.
@@ -115,9 +141,9 @@ function instrumentWorker([cssWidth, cols, above, below]) {
         const bmp = a[0];
         const src = bmp.width / cssWidth;        // source px per CSS px
         const out = this.canvas.width / cssWidth; // canvas px per CSS px
-        const n = Math.min(above, Math.floor(a[2] / src), Math.floor(a[6] / out));
+        const n = Math.min(above, Math.floor(a[2] / src), Math.floor(rec.dy / out));
         if (n >= 4 && a[2] + below * src <= bmp.height) {
-          const prev = this.getImageData(0, a[6] - n * out, this.canvas.width, n * out).data;
+          const prev = readRows(rec.dy - n * out, n * out, this.canvas.width);
           // This tile's rows, resampled to the canvas's scale the way the
           // stitcher draws them, so that when the extension scales a tall
           // page down both sides of the comparison went through the same
@@ -129,7 +155,7 @@ function instrumentWorker([cssWidth, cols, above, below]) {
         }
       } catch (e) { rec.ovError = String(e.message || e); }
       h.draws.push(rec);
-      h.canvas = { width: this.canvas.width, height: this.canvas.height };
+      h.canvas = { width: this.canvas.width, height: Math.max(h.canvas ? h.canvas.height : 0, bandTop + this.canvas.height) };
     }
     return draw.apply(this, a);
   };
@@ -431,26 +457,46 @@ export async function captureSite(extDir, site, { headless = true, timeoutMs = 2
       const tab = tabs.find((t) => t.url === url) || tabs.find((t) => /^https?:/.test(t.url || ''));
       if (!tab) return { error: 'harness: tab not found' };
       const r = await self.__runCapture(tab);
+      // Commits before the PNG went to IndexedDB returned it as a data URL.
       self.__harness.dataUrl = r.dataUrl || null;
+      self.__harness.blob = !r.dataUrl && !r.error && self.CaptureStore ? await self.CaptureStore.get() : null;
       return {
         error: r.error, filename: r.filename, tileCount: r.tileCount,
         warnings: r.warnings || null, placements: r.placements || null,
-        size: r.dataUrl ? r.dataUrl.length : 0,
+        size: r.dataUrl ? r.dataUrl.length : self.__harness.blob ? self.__harness.blob.size : 0,
+        fromStore: !!self.__harness.blob, timings: r.timings || null,
         draws: self.__harness.draws, messages: self.__harness.messages, canvas: self.__harness.canvas
       };
     }, pageUrl), timeoutMs, 'capture');
     out.phases.captured = Date.now() - t0;
     if (res.error) throw new Error(`extension: ${res.error}`);
 
-    // Pull the data URL out in chunks; one 40 MB string over CDP is fragile.
+    // Pull the PNG out in chunks; one 40 MB string over CDP is fragile, and
+    // a tall capture's file is several hundred MB.
     const CHUNK = 8 << 20;
-    const parts = [];
-    for (let i = 0; i < res.size; i += CHUNK) {
-      parts.push(await sw.evaluate(([a, b]) => self.__harness.dataUrl.slice(a, b), [i, i + CHUNK]));
+    if (res.fromStore) {
+      const parts = [];
+      for (let i = 0; i < res.size; i += CHUNK) {
+        const b64 = await sw.evaluate(async ([a, b]) => {
+          const u = new Uint8Array(await self.__harness.blob.slice(a, b).arrayBuffer());
+          let s = '';
+          for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+          return btoa(s);
+        }, [i, i + CHUNK]);
+        parts.push(Buffer.from(b64, 'base64'));
+      }
+      out.png = Buffer.concat(parts);
+      await sw.evaluate(() => { self.__harness.blob = null; });
+    } else {
+      const parts = [];
+      for (let i = 0; i < res.size; i += CHUNK) {
+        parts.push(await sw.evaluate(([a, b]) => self.__harness.dataUrl.slice(a, b), [i, i + CHUNK]));
+      }
+      const dataUrl = parts.join('');
+      out.png = Buffer.from(dataUrl.slice(dataUrl.indexOf(',') + 1), 'base64');
     }
-    const dataUrl = parts.join('');
-    out.png = Buffer.from(dataUrl.slice(dataUrl.indexOf(',') + 1), 'base64');
     out.tileCount = res.tileCount;
+    out.timings = res.timings;
     // What the extension reported about its own capture (null on commits
     // from before it did).
     out.warnings = res.warnings;
@@ -477,6 +523,21 @@ export async function captureSite(extDir, site, { headless = true, timeoutMs = 2
     out.dom = await withTimeout(page.evaluate(domFacts, [6000]), 30000, 'dom facts').catch((e) => ({ error: String(e.message || e) }));
     if (site.collect) {
       out.siteFacts = await withTimeout(page.evaluate(site.collect), 30000, 'site facts').catch((e) => ({ error: String(e.message || e) }));
+    }
+    // Reference screenshots of a static page (a fixture), taken by the
+    // browser itself with the page scrolled so that each CSS y in
+    // `site.refShots` is mid-screen: what the capture must show there,
+    // pixel for pixel.
+    if (site.refShots) {
+      out.refShots = [];
+      for (const y of site.refShots) {
+        const scrollY = await page.evaluate((y) => {
+          scrollTo(0, Math.max(0, y - innerHeight / 2));
+          return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(() => r(scrollY), 100))));
+        }, y);
+        out.refShots.push({ y, scrollY, png: await page.screenshot({ type: 'png' }) });
+      }
+      await page.evaluate(() => scrollTo(0, 0));
     }
     out.ok = true;
   } catch (e) {
