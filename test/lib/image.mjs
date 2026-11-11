@@ -21,7 +21,9 @@ export async function loadCapture(png, dpr = 2) {
   for (let i = 0, j = 0; i < luma.length; i++, j += 3) {
     luma[i] = (data[j] * 77 + data[j + 1] * 150 + data[j + 2] * 29) >> 8;
   }
-  const img = { W, H, rgb: data, luma, cssWidth: Math.round(meta.width / dpr), devWidth: meta.width, devHeight: meta.height };
+  // `png` stays at hand for the few checks that need full resolution in a
+  // small box (whether a line of text painted any ink).
+  const img = { W, H, rgb: data, luma, cssWidth: Math.round(meta.width / dpr), devWidth: meta.width, devHeight: meta.height, png, dpr };
   // Rows no tile ever painted: the stitching canvas starts transparent and a
   // browser screenshot never is, so a fully transparent row is a hole.
   img.unpainted = new Uint8Array(H);
@@ -84,6 +86,33 @@ export function median(a) {
   if (!a.length) return 0;
   const s = [...a].sort((p, q) => p - q);
   return s[s.length >> 1];
+}
+
+// The capture at full resolution as greyscale, decoded once on first use
+// (one byte per device px).
+export async function fullGrey(img) {
+  if (!img.grey) {
+    img.grey = await sharp(img.png, { limitInputPixels: false }).removeAlpha().greyscale().raw().toBuffer();
+  }
+  return img.grey;
+}
+
+// Share of a CSS-px box's device pixels that stand apart from the box's most
+// common grey by more than `tol`: the ink of whatever is painted there.
+// Text that painted always leaves some; a box of one colour leaves none.
+export async function inkShare(img, { x, y, w, h }, tol = 32) {
+  const g = await fullGrey(img);
+  const W = img.devWidth;
+  const x0 = Math.max(0, Math.round(x * img.dpr)), y0 = Math.max(0, Math.round(y * img.dpr));
+  const x1 = Math.min(W, Math.round((x + w) * img.dpr)), y1 = Math.min(img.devHeight, Math.round((y + h) * img.dpr));
+  if (x1 <= x0 || y1 <= y0) return null;
+  const hist = new Uint32Array(256);
+  for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) hist[g[yy * W + xx]]++;
+  let mode = 0;
+  for (let v = 1; v < 256; v++) if (hist[v] > hist[mode]) mode = v;
+  let apart = 0;
+  for (let v = 0; v < 256; v++) if (Math.abs(v - mode) > tol) apart += hist[v];
+  return { share: apart / ((x1 - x0) * (y1 - y0)), mode };
 }
 
 // Downscaled JPEG preview for the report, plus a crop helper for debugging.

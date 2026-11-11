@@ -1,60 +1,120 @@
 # Capture regression harness
 
-Drives the real extension in Chromium over a fixed set of live sites and checks each stitched capture for defects. Live pages change, so nothing is compared with a stored golden image. Instead, detectors look for the marks a broken capture leaves: blank bands, overlays repeated tile after tile, seams at tile boundaries, a capture shorter than the page, and rows no tile ever painted.
+Drives the real extension in Chromium over a fixed set of live sites, or any list of URLs, and checks each stitched capture for defects. Live pages change, so nothing is compared with a stored golden image. Instead, detectors look for the marks a broken capture leaves: blank bands, overlays repeated tile after tile, seams at tile boundaries, a capture shorter than the page, rows no tile ever painted, and content the page has that the capture doesn't show.
 
 ## Running
 
 ```sh
 npm install                              # once: playwright-core 1.64.1 (Chromium 1248) and sharp
-node test/run.mjs                        # the working tree's extension, every site
+node test/run.mjs                        # the working tree's extension, every regression site
 node test/run.mjs --site noguchi         # one site (substring of the host; comma list or repeat)
 node test/run.mjs --ref b2d7f6e          # an older commit, same checks
 node test/run.mjs --url https://x.com    # any page, generic detectors only
-node test/run.mjs --urls list.txt        # one URL per line, generic detectors only
+node test/run.mjs --urls list.txt        # one URL per line, generic detectors only (a sweep)
 ```
 
-Options: `--headed` (show the browser), `--jobs N` (sites in parallel, default 1), `--timeout S` (per capture, default 240), `--label name` (suffix for the output folder).
+Options:
 
-Each run writes `test/out/<timestamp>-<label>/` (git-ignored):
+- `--jobs N`: sites in parallel (default 1; 3 is fine for a sweep)
+- `--timeout S`: per capture (default 240). A site's whole process is killed 240 s after that.
+- `--out dir`: the run folder. If it already holds a run, that run is resumed (see Sweeps).
+- `--keep-png all|failing|none`: which full PNGs to keep. Default `all` for the regression set, `failing` for a URL list (any site that didn't pass). Previews are always kept.
+- `--retry-errors`: on resume, capture again sites that errored twice already
+- `--label name`: suffix for the output folder name
+- `--headed`: show the browser
+- `--headless-ua`: send Chromium's own user agent ("HeadlessChrome") instead of a desktop Chrome one
+- `--capture-blocked`: capture a page judged blocked anyway (it is still reported as blocked)
 
-- `<host>.png`: the full capture, exactly as the extension returned it
-- `<host>.first-screen.jpg`: the page's first screen as a visitor sees it, taken after the capture (cookie banners and popups included)
+Each run writes `test/out/<timestamp>-<label>/` (or `--out`; `test/out` is not committed):
+
+- `sites/<host>.json`: one record per site, written the moment the site is done
+- `<host>.png`: the full capture, exactly as the extension returned it (subject to `--keep-png`)
+- `<host>.preview.jpg`: a 260 px wide preview
+- `<host>.first-screen.jpg`: the page's first screen as a visitor sees it, taken after the capture (cookie banners and popups included); for a blocked site, the challenge page
 - `report.html`: contact sheet with a preview per site (click it for the full PNG), every check's result, and red boxes on the preview at each flagged y-range
-- `results.json`: per site, every check's pass/fail, measured value, detail and flagged ranges, plus capture size, tile tops, tile count, duration (and `phases`: ms from the start to the page loaded and to the capture returned) and the page facts used. Also `tileLog` (for each shot: where it was asked to scroll, where it landed, the page height then and how far the page moved since the last shot) and, from the extension itself, `warnings` and `placements` (where each tile was put and how its overlap matched; `null` for commits from before the extension reported them)
+- `summary.txt`, `summary.json`: see Sweeps
+- `results.json`: every record in one file, in the order asked for
+- `run.json`: the extension ref and options, so a resumed run uses the same extension
 
-The extension's own warnings (unpainted rows, a tile placed by position only because its overlap wouldn't match, two tiles that still disagree where they overlap after the tile above was shot again, a shot budget that ran low, page height changing by more than a screen, a page not fully captured) are printed under each site's line and listed in the report. They don't fail a site; the checks do.
+A record holds the site's `verdict` (`pass`, `fail`, `blocked` or `error`), every check's pass/fail, measured value, detail and flagged ranges, capture size, tile tops and count, `durationMs` (and `phases`: ms from the start to the page loaded and to the capture returned; `captureMs`, the capture alone), and the page facts used. Also `tileLog` (for each shot: where it was asked to scroll, where it landed, the page height then and how far the page moved since the last shot) and, from the extension itself, `warnings` and `placements` (where each tile was put and how its overlap matched; `null` for commits from before the extension reported them). And what is needed to run the checks again later without capturing again: `draws` (each tile's draw onto the stitching canvas, with its seam evidence), `dom` (the page's own account of its text, images, embeds and fixed boxes), `gate` and `http` (what the page was).
 
-The exit code is 1 if any check on any site fails or a site couldn't be captured.
+The extension's own warnings (unpainted rows, a tile placed by position only because its overlap wouldn't match, two tiles that still disagree where they overlap after the tile above was shot again, a shot budget that ran low, page height changing by more than a screen, a page not fully captured) are printed under each site's line, listed in the report and counted in the summary. They don't fail a site; the checks do.
+
+The exit code is 1 if any site fails or errors, or, in the regression set only, is blocked (its checks couldn't run). In a URL-list sweep a blocked site is listed and doesn't fail the run.
 
 ### How it drives the extension
 
 - The extension is never loaded from the repo folder. Each run copies the extension files (manifest, root `.js`/`.html`, `icons/`) into a temp folder, from the working tree or, with `--ref`, from that commit via `git show`. Nothing is checked out. The copy's manifest gets `host_permissions: ["<all_urls>"]` so scripts can be injected without the toolbar click that grants `activeTab`. The shipped manifest is unchanged.
 - Chromium runs in new headless mode (`channel: 'chromium'`; the headless shell can't load extensions). The window is a real 1388×868 CSS px window at device scale 2, so captures are 2776 px wide. Playwright's viewport emulation is deliberately off: with emulated DPR the page reports 2x while `captureVisibleTab` returns 1x pixels, which stitches into gaps. The harness checks the inner size and DPR after load and fails the site if they're wrong.
-- Each site gets a fresh browser profile. A site that hangs or errors is reported as failed with the reason, and the run continues.
+- The browser sends the user agent a desktop Chrome of the same version sends (`Chrome/156.0.0.0`, without "Headless"). Nothing else about the browser is disguised, and no challenge is ever solved. See Blocked pages.
+- Each site runs in its own Node process with its own browser profile. A site that hangs or crashes the browser is killed with everything it started, recorded as an error with the reason, and the run continues.
 - The capture is started by calling `self.__runCapture(tab)` in the service worker. The `result.html` tab it opens is closed, and the PNG comes from the returned data URL.
 - Tile positions are recorded from outside, with no change to the extension: the harness wraps `drawImage` on the worker's stitching canvas and `chrome.tabs.sendMessage`. That gives the exact y of every tile in the output, including the clamped last tile. Only the 9-argument form counts as a tile; the worker's other draws (its matching grids, the final crop) use shorter forms. Tiles overlap and each paints only the rows below what is already painted, so a tile has two positions: `y`/`h`, the whole screen it shot, and `drawY`, where its painted part starts. Seams are looked for at `drawY`; repeated overlays compare tiles by `y` but only over rows the later tile painted. When two tiles disagree where they overlap, the worker shoots the tile above again and repaints its rows; that draw starts where the old one did and replaces it in the tile list.
-- Page facts are read twice: before the capture (the real scrollable height, counting an inner scrolling container) and after it, when the extension has restored the page and lazy content has loaded (element positions for site checks).
+- Seam evidence: at each tile draw, the wrapper also keeps the 12 rows just above `drawY` twice, as already on the canvas (painted by the tile above) and as this tile shot them, plus this tile's first 4 rows below, sampled to 347 columns. Both are sampled the same way inside the worker, so they compare exactly.
+- Page facts are read before the capture (the real scrollable height, counting an inner scrolling container; what is fixed to the window; whether the page is a challenge page) and after it, when the extension has restored the page and lazy content has loaded (element positions for site checks, and `dom`: every line of visible text with its colour, every image with its load state, every iframe, video, canvas and embed, every fixed or sticky box).
 - After the capture the harness also screenshots the restored page's first screen (`shot`), so a check can ask whether something a visitor sees there, like a cookie banner or the site's header, made it into the capture.
+
+## Blocked pages
+
+Before capturing, the harness looks at what loaded. A site is `blocked`, not passed or failed, when the page carries a known challenge or firewall mark (a "Just a moment…" / "Attention Required" / "Access denied" style title, Cloudflare's challenge form or error page, PerimeterX, DataDome, Incapsula, Sucuri or Akamai blocks), or answered with HTTP 400+ and has under 1000 characters of text, or has under 150 characters of text, no large image or video and is no taller than one screen. A challenge page gets 10 more seconds to pass on its own (nothing is clicked) and is looked at again. A blocked site isn't captured (unless `--capture-blocked`); its first screen is kept so a person can see what was served, and the summary lists it with the reason (`lib/gate.mjs`).
+
+Mitigations, tried on the five sites that served a Cloudflare challenge in the 2026-11 gallery sweep: a desktop user-agent string (no "Headless") let all five through; turning off the `AutomationControlled` blink feature (so `navigator.webdriver` is false) let none through. The harness uses the first and not the second. With `--headless-ua` all five are reported `blocked`.
 
 ## The generic detectors
 
-They run on every capture (`test/lib/detectors.mjs`). Each works on a grid with one row per CSS px and 347 columns, sampled nearest-neighbour so a tile boundary stays on exactly one row. Thresholds live in `T` at the top of the file.
+They run on every capture (`test/lib/detectors.mjs`, `test/lib/page-checks.mjs`). The pixel ones work on a grid with one row per CSS px and 347 columns, sampled nearest-neighbour so a tile boundary stays on exactly one row. Thresholds live in `T` and `P` at the top of the files.
 
-**blank-band**: a run of rows that are each one flat colour (luma std < 3), staying the same colour, at least 0.45 × viewport tall (391 px). Runs touching the bottom of the capture are ignored.
-Blind spots: a missing image over a gradient or patterned background (not flat); a blank band shorter than 391 px; faint content inside the band can split it into shorter runs. It can't tell a deliberate tall empty section from a missing one (the tallest legitimate flat run on the regression set is 349 px).
+Three kinds of evidence back them, strongest first. The two shots of the rows where tiles overlap (kept by the harness, above). The page's own account of what is on it (`dom`). The extension's placements (whether it found each overlap matching). Each detector says below what it does when the stronger evidence isn't there, which is the case for runs from before the harness kept it.
 
-**repeated-overlay**: the same textured strip at the same offset in two consecutive tiles, so exactly one tile step apart, with ±2 px slack for fractional scroll positions. Compared in 8 column blocks, so a popup card or chat bubble is found even when the rest of its rows differ. At least 24 matching content rows are needed. A match that holds almost as well 4–12 px off the step is dropped as a periodic pattern (dots, stripes, tiled textures).
-Blind spots: an element that follows the scroll but lands at a different offset in each tile (a sticky heading that sticks partway down a tile: see the 17A site check); a translucent overlay over changing content; flat overlays with no texture (a plain coloured bar); overlays repeating only in the clamped last tile, where the step is shorter (checked, but with less room).
+**seam**: a break at a tile boundary that comes from joining two different moments of the page. With the harness's seam evidence, in each of 8 column blocks: the capture jumps at least 12 (mean |Δluma|) from the row above the boundary to the row below it, that jump is at least 8 more than the later tile's own jump between the same two page rows, and the two shots of the 6 rows above the boundary differ by at least 6. Two such blocks are needed (about 350 CSS px): on the re-captured sweep, single-block flags were live map tiles that changed with no visible cut twice out of three. A break the later tile shows itself, over rows both shots agree on, is an edge in the page (a section or a full-screen hero ending exactly there), however sharp.
+Without the seam evidence, the earlier pixel rule (below) runs, and a boundary where the extension's placement says the overlap matched (`agree.blocks === 0`, or a match of `ok`) is cleared as a page edge.
+Pixel rule: a break exactly one row thick in at least 2 of 8 column blocks: jump ≥ 12, ≥ 4× the typical row-to-row jump within 30 rows, ≥ 2× the jump one row either side plus 4, and at least 15% of the block's columns breaking sharply with content (not the block's background colour) on both sides. That last rule exists because text across a boundary otherwise looks like a seam.
+Blind spots: a change between shots that leaves no jump at the boundary itself (a video whose frame changed in rows above it); a seam narrower than two column blocks (≈ 350 CSS px), or one whose jump is diluted below 12 across a block; a change between shots too subtle to see is still flagged (the shots really differ, but a person may see nothing); without the seam evidence, a section edge on a boundary where the extension's match came out `mismatch` for some other reason.
 
-**seam**: at each tile boundary, a break exactly one row thick in at least 2 of 8 column blocks. In a block, the jump between the boundary row and the row above must be ≥ 12 (mean |Δluma|), ≥ 4× the typical row-to-row jump within 30 rows, and ≥ 2× the jump one row either side plus 4. At least 15% of the block's columns must break sharply with content (not the block's background colour) on both sides. Blocks that are flat on either side are skipped.
-The coverage rule exists because text across a boundary otherwise looks like a seam: glyph tops and crossbars make one-row jumps, but every glyph edge has background on one side.
-Blind spots: a change that isn't a sharp break, such as a slow colour shift, a slight sub-pixel offset, or a text colour change across a heading (17A's "State or local government leader" at 1736 px, grey above and dark below, is missed); a seam in content narrower than about 2 blocks (≈ 350 CSS px); a real hard edge between two textured areas that falls exactly on a boundary (rare, but it would be flagged).
+**repeated-overlay**: the same textured strip at the same offset in two consecutive tiles, so exactly one tile step apart, with ±2 px slack for fractional scroll positions. Compared in 8 column blocks, so a popup card or chat bubble is found even when the rest of its rows differ. At least 24 matching content rows are needed. A match that holds almost as well 4–12 px off the step is dropped as a periodic pattern. With the page's account, a repeat counts only where the page had something fixed to the window (a fixed or sticky box, read before and after the capture) covering at least a quarter of the strip's place in the window. A repeat with nothing fixed there is a background that repeats at the tile step (a window-fixed photo, a tiled texture) or a detail that recurs by chance.
+Blind spots: an element that follows the scroll but lands at a different offset in each tile (a sticky heading that sticks partway down a tile: see the 17A site check); a translucent overlay over changing content; flat overlays with no texture; an overlay the page removed before the harness looked; a fixed full-window backdrop makes every repeat under it count.
 
-**truncation**: the capture is more than 16 px shorter than the smallest height the page had during the capture: its scrollable height before, its scrollable height after, and the height the extension reported at each tile. The real height is the larger of the document's scroll height and any inner scrolling container's content height. A shortfall of a few hundred px (a tile placed a section too high, overwriting what was below the seam) fails like a missing screen does.
-Blind spots: a page that grows and shrinks back during the capture is held to its smallest height, so content lost while it was taller goes unseen; infinite-scroll pages are capped at 60000 px by the extension; content clipped inside a fixed-height inner region that isn't `overflow: auto/scroll` is invisible to the measurement; a capture that is too tall (a tile placed too low) isn't this detector's job (see `seamRepeats`).
+**blank-band**: a run of rows that are each one flat colour (luma std < 3), staying the same colour, at least 0.45 × viewport (391 px) tall. With the page's account, a shorter run, down to 150 px, also fails when the page has text (10+ characters), images or embeds at least half inside it: they didn't paint. The page's account never clears a tall run: when a script never put a widget or gallery in the page, the page is empty there too and can't be told from deliberate space (on the 2026-11 sweep, the two real tall bands were of that kind, and the one false one was deliberate whitespace 409 px tall). Runs touching the bottom of the capture are ignored.
+Blind spots: a missing image over a gradient or patterned background (not flat); faint content inside the band can split it into shorter runs; deliberate empty space taller than 391 px is flagged.
 
-**unpainted-rows**: rows that are fully transparent (at least 90% of sampled columns with alpha 0), so no tile was drawn there. A browser screenshot is always opaque, so any such row is a hole, including a run at the very bottom of the capture.
-Blind spots: a hole narrower than 90% of the width; rows painted with the wrong content (that is what the other detectors and `seamRepeats` are for).
+**truncation**: the capture is more than 16 px shorter than the smallest height the page had during the capture: its scrollable height before, its scrollable height after, and the height the extension reported at each tile. The real height is the larger of the document's scroll height and any inner scrolling container's content height.
+Blind spots: a page that grows and shrinks back during the capture is held to its smallest height; infinite-scroll pages are capped at 60000 px by the extension; content clipped inside a fixed-height inner region that isn't `overflow: auto/scroll` is invisible to the measurement; a capture that is too tall isn't this detector's job (see `seamRepeats`).
+
+**unpainted-rows**: rows that are fully transparent (at least 90% of sampled columns with alpha 0), so no tile was drawn there.
+Blind spots: a hole narrower than 90% of the width; rows painted with the wrong content.
+
+The last one needs the page's account and passes with "no page facts" without it. The page is measured after the capture; if its height then differs from the capture's by more than 24 px, positions may not line up and they say so instead of judging.
+
+**text-same-colour**: lines of visible text (not hidden, under half opacity, transparent, clipped by an overflow box, inside a fixed or sticky box, or on a two-sided flip card) whose box in the capture is one flat colour, and that colour is the text's own (within 40 grey levels). That is light text whose background never loaded. Lines within 80 px are merged; a range is flagged at 40 characters. Each candidate is confirmed on the full-resolution PNG (under 0.2% of its pixels more than 32 grey levels from the box's most common grey).
+Why only the same colour: the page is read after the capture, and content that slid or faded in during it (entrance animations) sits a little way from where the capture painted it, so a box of dark text over plain background is usually the text 30–60 px off, not missing.
+Blind spots: text missing over a background of another colour (an entrance animation caught at its start); text inside images or canvases.
+
+Tried and dropped: images the page never loaded (failed, or still on a lazy-load placeholder) with an empty box in the capture, and iframes, videos and canvases whose box is empty. On the re-captured gallery sweep they flagged nothing: the content that never loaded there (reviews widgets, galleries, video embeds) was never added to the page at all, so there was no element to ask about.
+
+## Sweeps
+
+A sweep is `--urls` over a long list. It is safe to leave running: each site runs in its own process and is killed if it hangs (`--timeout` plus 240 s); each finished site is written to `sites/<host>.json` at once; running the same command again with the same `--out` skips sites already done (a site that errored is tried once more; `--retry-errors` tries again after that).
+
+```sh
+node test/run.mjs --urls gallery.txt --jobs 3 --out test/out/sweep-2026-11-11
+node test/run.mjs --urls gallery.txt --jobs 3 --out test/out/sweep-2026-11-11   # resumes
+node test/run.mjs summary test/out/sweep-2026-11-11
+node test/run.mjs compare test/out/sweep-old test/out/sweep-2026-11-11
+```
+
+`summary` (also written to `summary.txt` and `summary.json` at the end of every run) gives counts by verdict, failing checks with the number of sites and flagged ranges, extension warnings by kind with the sites that had them, total and median time per site and capture, the ten slowest sites, and the blocked, errored and failing sites with reasons. `compare A B` matches sites by host and lists new failures (with the checks that newly fail), fixed sites, sites still failing (with checks added and gone), newly blocked and unblocked sites, new and gone errors, and the change in median time. Each argument may be a comma-separated list of run folders, or a folder of run folders (a sweep run in batches); for a host in several, the later folder wins.
+
+## Scorecard
+
+```sh
+node test/run.mjs score --verdicts truth.tsv [--detectors stored|current|<git ref>] [--json out.json] <run dirs>
+```
+
+Measures each generic detector against a person's review of the same captures. The verdicts file is tab-separated with a header and columns `host`, `verdict` (`ok`, `minor`, `defect`, `blocked`, `environment`) and optionally `ranges`: where each known defect is, in CSS px, `;`-separated, as `y0-y1` or a single y (a seam, taken as ±40). Other columns are ignored.
+
+A flag on a site judged defect or minor is real when it overlaps one of the site's ranges (±60 px), or the site lists none. A flag on a site judged ok, or off every range, is false. Flags on blocked and environment pages are counted apart. Each range is one known defect, caught by a detector when one of its flags overlaps it. The table gives per detector: flags, real, false (on ok sites / off-range), precision, defects caught, recall, and how many ok sites it flagged; then defective sites caught, blocked pages agreed, every known defect no detector caught, and every false flag, so each can be opened and looked at.
+
+`--detectors stored` scores the checks as each run recorded them. `current` runs the working tree's detectors again on every site whose PNG was kept; a git ref runs that commit's `test/lib` (written to a temp folder). Sites without a PNG are left out of a rescore and counted, so to measure false alarms keep the PNGs of sites judged ok (`--keep-png all`) or capture a sample of them again at the same ref.
 
 ## Site checks
 
@@ -79,7 +139,7 @@ Append to `SITES`:
 }
 ```
 
-`collect` is serialised into the page, so it must be an arrow function with no outside references. A site with no `checks` still gets the five generic detectors.
+`collect` is serialised into the page, so it must be an arrow function with no outside references. A site with no `checks` still gets the generic detectors.
 
 ### Adding a check
 
@@ -87,4 +147,4 @@ Name it for the failure it catches, and keep it to that one failure: never asser
 
 ## Tuning notes
 
-Thresholds were set on captures of the regression set from both commits and checked on six sites that weren't used for tuning. Don't change a threshold to make a particular capture pass. If a detector flags something, open that y-range in the PNG first: a flag on the current extension can be a real defect.
+Don't change a threshold to make a particular capture pass, and never write a rule that names a site. If a detector flags something, open that y-range in the PNG first: a flag on the current extension can be a real defect. Judge a detector change with the scorecard on a reviewed sweep, old and new side by side, and look at every flag that moved.

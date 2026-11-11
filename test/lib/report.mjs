@@ -19,11 +19,11 @@ export function writeReport(dir, run) {
     }
     const scale = s.capture ? PREVIEW_W / s.capture.cssWidth : 0;
     const preview = s.preview
-      ? `<a href="${esc(s.png)}"><div class="pv" style="width:${PREVIEW_W}px;height:${Math.round(s.capture.cssHeight * scale)}px">
+      ? `<a href="${esc(s.png || s.preview)}"><div class="pv" style="width:${PREVIEW_W}px;height:${Math.round(s.capture.cssHeight * scale)}px">
           <img src="${esc(s.preview)}" width="${PREVIEW_W}">
           ${marks.map((m) => `<div class="mark" style="top:${Math.round(m.y0 * scale)}px;height:${Math.max(3, Math.round((m.y1 - m.y0) * scale))}px" title="${esc(`${m.name}: ${m.y0}-${m.y1}px ${m.note || ''}`)}"><span>${m.label}</span></div>`).join('')}
         </div></a>`
-      : '<div class="none">no capture</div>';
+      : s.firstScreen ? `<a href="${esc(s.firstScreen)}"><img src="${esc(s.firstScreen)}" width="${PREVIEW_W}"></a>` : '<div class="none">no capture</div>';
     let n = 0;
     const table = checks.map(([name, c]) => {
       const label = c.pass ? '' : ++n;
@@ -32,6 +32,7 @@ export function writeReport(dir, run) {
     }).join('');
     const meta = s.error
       ? `<p class="err">FAILED: ${esc(s.error)}</p>`
+      : s.blocked ? `<p class="warn"><b>BLOCKED</b>: ${esc(s.blocked)} (first screen shown; not captured)</p>`
       : `<p>${s.capture.devWidth}×${s.capture.devHeight}px, ${s.tileCount} tiles at ${esc(s.tileTops.join(', '))}; ${(s.durationMs / 1000).toFixed(0)}s</p>`;
     // What the extension itself reported about the capture.
     const warns = s.warnings == null ? ''
@@ -41,7 +42,8 @@ export function writeReport(dir, run) {
     return `<section><h2>${esc(s.host)} <small>${esc(s.url)}</small></h2><div class="row">${preview}<div class="res">${meta}${warns}<table>${table}</table></div></div></section>`;
   }).join('\n');
 
-  const failed = run.sites.filter((s) => !s.pass).length;
+  const failed = run.sites.filter((s) => !s.pass && !s.blocked).length;
+  const blocked = run.sites.filter((s) => s.blocked).length;
   const html = `<!doctype html><meta charset="utf-8"><title>Capture regression ${esc(run.startedAt)}</title>
 <style>
 body{font:14px/1.4 system-ui,sans-serif;margin:16px;color:#111;background:#fff}
@@ -59,7 +61,7 @@ ul{margin:2px 0 0 18px;padding:0;color:#444}.err{color:#b00;font-weight:bold}.wa
 </style>
 <h1>Capture regression run</h1>
 <p>Extension: ${esc(run.extension)} · ${esc(run.mode)} Chromium ${esc(run.browserVersion)} · viewport ${run.viewport.width}×${run.viewport.height} @${run.viewport.dpr}x · started ${esc(run.startedAt)} · ${(run.durationMs / 1000).toFixed(0)}s</p>
-<p><b>${failed ? `${failed} of ${run.sites.length} sites failed` : `all ${run.sites.length} sites passed`}</b>. Red boxes on a preview mark flagged y-ranges, numbered by failing check.</p>
+<p><b>${failed ? `${failed} of ${run.sites.length} sites failed` : `all ${run.sites.length - blocked} sites passed`}${blocked ? `, ${blocked} blocked` : ''}</b>. Red boxes on a preview mark flagged y-ranges, numbered by failing check.</p>
 ${rows}`;
   fs.writeFileSync(path.join(dir, 'report.html'), html);
 }
