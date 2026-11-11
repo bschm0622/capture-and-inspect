@@ -123,12 +123,10 @@ export const SITES = [
       // The impact heading and figures, which the page fades by scroll
       // position, and the tabs it turns on a timer, with their photo. The
       // fades also slide them, so they're measured by layout, which leaves
-      // transforms out. The capture puts the sticky block back in flow as
-      // `relative`, where its sticky `top` shifts it down by that much.
+      // transforms out. The capture puts the sticky block back where the
+      // layout has it, sticky offset cancelled.
       const L = (el) => { let top = 0, left = 0; for (let a = el; a; a = a.offsetParent) { top += a.offsetTop; left += a.offsetLeft; } return { top, left, w: el.offsetWidth, h: el.offsetHeight }; };
-      const shift = block !== h ? parseFloat(getComputedStyle(block).top) || 0 : 0;
-      const hl = L(h);
-      const impact = [{ what: 'heading', ...hl, top: hl.top + shift }, ...[...document.querySelectorAll('.our-impact_card')].map((c, i) => ({ what: `figure ${i + 1}`, ...L(c) }))];
+      const impact = [{ what: 'heading', ...L(h) }, ...[...document.querySelectorAll('.our-impact_card')].map((c, i) => ({ what: `figure ${i + 1}`, ...L(c) }))];
       const tabs = [...document.querySelectorAll('.intended-audience_tab-menu_link .heading-style-h6')].map(R);
       const photo = document.querySelector('.intended-audience_tab-img-wrapper');
       return { heading: R(block), section: sec ? R(sec) : null, impact, tabs, photo: photo ? R(photo) : null };
@@ -615,6 +613,66 @@ export const SITES = [
     }
   },
   {
+    host: 'www.clcroofing.com',
+    url: 'https://www.clcroofing.com',
+    collect: () => {
+      const R = (el) => { const r = el.getBoundingClientRect(); return { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; };
+      const h = [...document.querySelectorAll('h1, h2, h3')].find((e) => /Why Dallas Homeowners/i.test(e.textContent) && e.getBoundingClientRect().width > 0);
+      if (!h) return { heading: null };
+      let sec = h.parentElement;
+      while (sec && sec.parentElement && sec.getBoundingClientRect().width < innerWidth * 0.9) sec = sec.parentElement;
+      return { heading: R(h), section: sec ? R(sec) : null };
+    },
+    checks: {
+      // The left column holding "Why Dallas Homeowners & Businesses Choose
+      // CLC Roofing Inc." is sticky in a container only a little taller, so
+      // it showed twice, about 200px apart. It must show once, where the
+      // layout puts it.
+      'sticky-heading-twice'({ img, facts }) {
+        const h = facts.heading;
+        if (!h) return result(false, null, '"Why Dallas Homeowners…" heading not found on the page');
+        const s0 = facts.section ? facts.section.top : h.top - 1000, s1 = facts.section ? facts.section.top + facts.section.h : h.top + 1000;
+        // Each half on its own: a copy cut off by a tile edge still repeats
+        // one of them. The copy sat at a fractional offset (its sticky `top`
+        // is 199.6px), which redraws the text a little differently, so the
+        // match allows more difference than findStrip's default.
+        const half = Math.floor(h.h / 2);
+        const found = [{ ...h, h: half }, { ...h, top: h.top + half, h: h.h - half }].map((p) => ({ p, ...findStrip(img, p, s0, s1, 6) }));
+        if (found.every((f) => f.rows < 8)) return result(false, 0, `heading not visible at its place (${h.top}px)`, [{ y0: h.top, y1: h.top + h.h, note: 'expected heading here' }]);
+        const extra = found.flatMap((f) => f.matches.filter((y) => Math.abs(y - f.p.top) > 8).map((y) => ({ y0: y, y1: y + f.p.h, note: 'copy of the heading' })));
+        const most = Math.max(...found.map((f) => f.matches.length));
+        return result(extra.length === 0, most, `heading (${h.top}px) appears ${most}× in its section`, extra);
+      }
+    }
+  },
+  {
+    host: 'www.dentiq.dental',
+    url: 'https://www.dentiq.dental',
+    collect: () => {
+      // Sections whose background picture is painted against the window
+      // (`background-attachment: fixed`).
+      const out = [];
+      for (const el of document.querySelectorAll('body *')) {
+        const cs = getComputedStyle(el);
+        if (!cs.backgroundAttachment.includes('fixed') || !/url\(/.test(cs.backgroundImage)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 300 && r.height > 200) out.push({ top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) });
+      }
+      return { fixedBackgrounds: out };
+    },
+    checks: {
+      // The "Your confident smile is our guide" photo showed a different
+      // part of the picture in each tile, cut at the tile edge. No tile
+      // edge may break a fixed-background section.
+      'fixed-background-seam'({ img, tiles, facts }) {
+        const secs = facts.fixedBackgrounds || [];
+        if (!secs.length) return result(false, null, 'no section with a fixed background found on the page');
+        const flags = secs.flatMap((s) => seams(img, tiles, { region: { y0: s.top + 2, y1: s.top + s.h - 2, x: s.left, w: s.w }, minBlocks: 1 }).flags);
+        return result(flags.length === 0, flags.length, `${flags.length} tile boundary break(s) inside ${secs.length} fixed-background section(s)`, flags);
+      }
+    }
+  },
+  {
     host: 'www.agcsf.com',
     url: 'https://www.agcsf.com',
     checks: {
@@ -687,6 +745,8 @@ export const KNOWN = {
   'footer-present': 'Overlap matched a screen away from the scroll position: lower sections lost',
   'reaches-bottom': 'Overlaps never matched; shot cap stopped the capture short of the bottom',
   'finishes-in-time': 'Overlaps never matched; every tile shot twice',
-  'unmatched-seams-warned': 'Seams placed by position only were not reported'
+  'unmatched-seams-warned': 'Seams placed by position only were not reported',
+  'sticky-heading-twice': 'Sticky column in a slightly taller container shown twice',
+  'fixed-background-seam': 'Fixed-attachment background showed a different part of the picture in each tile'
 };
 

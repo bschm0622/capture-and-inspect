@@ -25,9 +25,14 @@
   let stickyHeaders = new Set(); // sticky elements that behave like a top nav
   let overlays = new Map();      // fixed or sticky element -> 'nav' | 'backdrop' | 'extra' | 'content'
   let frozenVideos = new Map();  // video -> {time, wasPlaying}
-  let firstScreen = new Map();   // element -> transform at scroll 0
-  let pinned = [];               // elements held at their scroll-0 transform
-  let scrollLinked = new Map();  // element -> {ys, xs, tf} seen while pre-scrolling
+  let firstScreen = new Map();   // element -> HOLD values at scroll 0
+  let pinned = new Set();        // elements with a HOLD property held through the stylesheet
+  let scrollLinked = new Map();  // element -> [[scrollTop, HOLD values]] seen while pre-scrolling
+  let stops = [];                // scroll positions the pre-scroll sampled placement at
+  let clones = [];               // elements of the copies of pinned sections, one copy per stage
+  let notes = [];                // what the capture couldn't show as it is, for the worker's warnings
+  let liveIds = new WeakMap();   // canvas -> id, so the worker can follow one across tiles
+  let liveCount = 0;
   let topOffsets = new Map();    // element on the first screen -> vertical offset before pre-scrolling
   let fades = new Map();         // element -> {min, max, last, near, linked} opacity seen while pre-scrolling
   let held = [];                 // [{el, max}] scroll-linked fades and the most visible opacity they reached
@@ -39,6 +44,29 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
+
+  // The properties a script (or a CSS scroll-driven animation) uses to place
+  // something by the scroll position: computed-style name, CSS name. Each
+  // can be held at one value through the stylesheet, where an !important
+  // rule beats both the script's inline writes and the animation.
+  const HOLD = [
+    ['transform', 'transform'],
+    ['translate', 'translate'],
+    ['clipPath', 'clip-path'],
+    ['backgroundPosition', 'background-position'],
+    ['objectPosition', 'object-position']
+  ];
+  const holdValues = (cs) => HOLD.map(([p]) => cs[p]);
+
+  function hold(el, k, value) {
+    const css = HOLD[k][1];
+    const tokens = new Set((el.getAttribute('data-cleanshot-hold') || '').split(' ').filter(Boolean));
+    tokens.add(css);
+    el.style.setProperty(`--cleanshot-${css}`, value);
+    el.setAttribute('data-cleanshot-hold', [...tokens].join(' '));
+    pinned.add(el);
+  }
+  const holds = (el, k) => (el.getAttribute('data-cleanshot-hold') || '').split(' ').includes(HOLD[k][1]);
 
   function pageHeight() {
     const b = document.body;
@@ -64,7 +92,9 @@
         transition-delay: 0ms !important;
         scroll-behavior: auto !important;
       }
-      [data-cleanshot-pin] { transform: var(--cleanshot-tf) !important; }
+      ${HOLD.map(([, css]) => `[data-cleanshot-hold~="${css}"] { ${css}: var(--cleanshot-${css}) !important; }`).join('\n      ')}
+      [data-cleanshot-unstick] { position: relative !important; inset: auto !important; }
+      [data-cleanshot-keep] { height: var(--cleanshot-height) !important; min-height: 0 !important; max-height: none !important; }
       [data-cleanshot-fade] { opacity: var(--cleanshot-op) !important; }
       [data-cleanshot-probe] { transition: none !important; }
       [data-cleanshot-parallax] { position: absolute !important; transform: none !important; }
@@ -283,13 +313,14 @@
   // JS parallax (UIkit, Rellax, hand-rolled scroll handlers) moves hero
   // images as the page scrolls, so a hero that spans two tiles shows up at
   // two offsets with a seam between. Remember how everything on the first
-  // screen is transformed at scroll 0, and hold it there for later tiles.
+  // screen is placed at scroll 0 (transform, clip, background and image
+  // position: see HOLD), and hold it there for later tiles.
   function recordFirstScreen() {
     const vh = window.innerHeight;
     allElements().forEach((el) => {
       const r = el.getBoundingClientRect();
       if (r.height > 0 && r.top < vh && r.bottom > 0) {
-        firstScreen.set(el, getComputedStyle(el).transform);
+        firstScreen.set(el, holdValues(getComputedStyle(el)));
       }
     });
   }
@@ -307,7 +338,9 @@
     };
     const moved = [...topOffsets].filter(([el]) => {
       const s = scrollLinked.get(el);
-      return el.isConnected && s && s.ys.size > 1 && s.xs.size <= 1;
+      if (!el.isConnected || !s) return false;
+      const m = s.map(([, v]) => matrixOf(v[0]));
+      return new Set(m.map((t) => Math.round(t.m42))).size > 1 && new Set(m.map((t) => Math.round(t.m41))).size <= 1;
     });
     topOffsets = new Map();
     if (!moved.length) return;
@@ -323,21 +356,22 @@
   }
 
   function pinFirstScreen() {
-    for (const [el, tf] of firstScreen) {
-      if (el.hasAttribute('data-cleanshot-pin')) continue;
-      if (getComputedStyle(el).transform === tf) continue;
-      el.style.setProperty('--cleanshot-tf', tf);
-      el.setAttribute('data-cleanshot-pin', '');
-      pinned.push(el);
+    for (const [el, values] of firstScreen) {
+      const now = holdValues(getComputedStyle(el));
+      values.forEach((v, k) => {
+        if (now[k] !== v && !holds(el, k)) hold(el, k, v);
+      });
     }
   }
 
   // JS parallax below the fold (Design Museum Danmark's TweenMax handler,
   // Rellax) slides images up and down as the page scrolls, so every tile
   // catches them at a different offset: cut off at the seams, or drifted
-  // away from their text. While pre-scrolling, note the elements whose
-  // vertical offset keeps changing with the scroll. Sideways movement is
-  // left out, since that's a carousel or marquee rather than parallax.
+  // away from their text. Scripts and CSS scroll-driven animations place
+  // things by the scroll in other ways too: a clip that opens, a background
+  // or image position that pans, a scale. While pre-scrolling, note at each
+  // stop how every element is placed (HOLD), so the ones that keep changing
+  // with the scroll can be held at one value later.
   //
   // Opacity is noted the same way. Webflow interactions and similar scripts
   // fade content by scroll position (17A's impact figures light up one by
@@ -384,34 +418,110 @@
       if (fadesOnly) return;
       const tf = cs.transform;
       if (atTop && r.height > 0 && r.top < vh && r.bottom > 0) {
-        topOffsets.set(el, tf === 'none' ? 0 : new DOMMatrix(tf).m42);
+        topOffsets.set(el, matrixOf(tf).m42);
       }
+      // Only elements placed by anything other than the defaults are worth
+      // following (a background position counts only with a picture).
+      const v = holdValues(cs);
       let seen = scrollLinked.get(el);
       if (!seen) {
-        if (tf === 'none') return;
-        seen = { ys: new Set(), xs: new Set(), tf };
+        const plain = v[0] === 'none' && v[1] === 'none' && v[2] === 'none' && v[4] === '50% 50%' &&
+          (cs.backgroundImage === 'none' || v[3] === '0% 0%');
+        if (plain) return;
+        // It was plain at the stops before this one.
+        seen = stops.map((y) => [y, ['none', 'none', 'none', '0% 0%', '50% 50%']]);
         scrollLinked.set(el, seen);
       }
-      const m = new DOMMatrix(tf === 'none' ? undefined : tf);
-      seen.ys.add(Math.round(m.m42));
-      seen.xs.add(Math.round(m.m41));
-      if (tf !== 'none') seen.tf = tf;
+      seen.push([scroller.scrollTop, v]);
     });
+    if (!fadesOnly) stops.push(scroller.scrollTop);
   }
 
-  // Hold each of those with its vertical offset removed, which is where the
-  // layout puts it and where parallax scripts rest it when it's centered on
-  // screen. Elements on the first screen are already held at scroll 0.
-  function holdScrollLinked() {
-    for (const [el, { ys, xs, tf }] of scrollLinked) {
-      if (ys.size < 3 || xs.size > 1 || firstScreen.has(el)) continue;
-      const m = new DOMMatrix(tf);
-      m.m42 = 0;
-      el.style.setProperty('--cleanshot-tf', m.toString());
-      el.setAttribute('data-cleanshot-pin', '');
-      pinned.push(el);
+  const matrixOf = (tf) => new DOMMatrix(!tf || tf === 'none' ? undefined : tf);
+
+  // The horizontal part of a `translate` value.
+  const translateX = (v) => (v === 'none' ? '0px' : v.split(' ')[0]);
+
+  // Two readings the same but for the last fraction of a pixel a smoothed
+  // scroll handler is still easing through.
+  const NUM = /-?\d*\.?\d+(?:e[-+]?\d+)?/gi;
+  function steady(a, b) {
+    if (a === b) return true;
+    if (a.replace(NUM, '#') !== b.replace(NUM, '#')) return false;
+    const na = a.match(NUM) || [], nb = b.match(NUM) || [];
+    return na.every((x, i) => Math.abs(Number(x) - Number(nb[i])) <= 0.5);
+  }
+
+  // Where the layout puts an element, leaving out transforms.
+  function layoutTop(el) {
+    if (!(el instanceof HTMLElement)) return el.getBoundingClientRect().top + scroller.scrollTop;
+    let top = 0;
+    for (let a = el; a; a = a.offsetParent) top += a.offsetTop;
+    return top;
+  }
+
+  // Hold each property that kept changing with the scroll (3 or more values
+  // over the stops) at the value it has where a visitor looks at it: with
+  // the element centred on screen, or, near the bottom of the page, as far
+  // as the page scrolls. The stops can't say what that is: Design Museum
+  // Danmark's parallax eases towards where the scroll puts it for a second
+  // or more, so each stop caught it on the way, and a reveal that plays
+  // once as it comes into view (Squarespace's clip on
+  // boulderlanddesign.com's service images) was caught part-way. So go
+  // there and read it once it holds still: an eased parallax has arrived, a
+  // reveal has finished. Elements whose resting places are close share a
+  // visit. Sideways movement is left to the page, since that's a carousel
+  // or marquee rather than parallax. Elements on the first screen are
+  // already held at scroll 0; the inside of an SVG (Lottie runs on a clock)
+  // and anything that floats over the page are left alone.
+  async function holdScrollLinked() {
+    const vh = window.innerHeight;
+    const maxScroll = Math.max(0, scroller.scrollHeight - vh);
+    const todo = [];
+    for (const [el, samples] of scrollLinked) {
+      if (firstScreen.has(el) || !el.isConnected || samples.length < 3) continue;
+      if (el.closest('svg') || pinnedToScreen(el) || el.closest('[data-cleanshot-filmed]')) continue;
+      const sideways = new Set(samples.map(([, v]) => Math.round(matrixOf(v[0]).m41))).size > 1;
+      const sidewaysT = new Set(samples.map(([, v]) => translateX(v[1]))).size > 1;
+      const props = HOLD.map((_, k) => k).filter((k) => new Set(samples.map(([, v]) => v[k])).size >= 3 &&
+        !(k === 0 && sideways) && !(k === 1 && sidewaysT));
+      if (!props.length) continue;
+      // (Its layout height too: its own transform can scale what's drawn.)
+      const h = el instanceof HTMLElement ? el.offsetHeight : el.getBoundingClientRect().height;
+      const rest = Math.min(maxScroll, Math.max(0, layoutTop(el) + h / 2 - vh / 2));
+      todo.push({ el, props, rest });
     }
     scrollLinked = new Map();
+    todo.sort((a, b) => a.rest - b.rest);
+    const NEAR = 60, VISITS = 40, WAIT_MS = 2500;
+    const t0 = performance.now();
+    for (let i = 0, visits = 0; i < todo.length && visits < VISITS && performance.now() - t0 < 15000; visits++) {
+      const group = [];
+      while (i < todo.length && todo[i].rest - todo[group.length ? i - group.length : i].rest <= NEAR) group.push(todo[i++]);
+      scroller.scrollTo(0, group[0].rest + (group[group.length - 1].rest - group[0].rest) / 2);
+      await raf();
+      await raf();
+      const read = () => group.map(({ el, props }) => {
+        const v = holdValues(getComputedStyle(el));
+        return props.map((k) => v[k]);
+      });
+      let last = read();
+      for (let t = 0; t < WAIT_MS; t += 100) {
+        await sleep(100);
+        const now = read();
+        const still = now.every((vals, g) => vals.every((v, j) => steady(v, last[g][j])));
+        last = now;
+        if (still && t >= 100) break;
+      }
+      group.forEach(({ el, props }, g) => props.forEach((k, j) => hold(el, k, last[g][j])));
+    }
+    if (!todo.length) return;
+    // Back at the top, the first screen's own eased parallax takes a moment
+    // to return to where it was recorded, which the first tile shows live.
+    scroller.scrollTo(0, 0);
+    const first = [...firstScreen].filter(([el]) => el.isConnected);
+    const off = () => first.filter(([el, v]) => holdValues(getComputedStyle(el)).some((x, k) => !steady(x, v[k]))).length;
+    for (let t = 0; t < 1500 && off(); t += 50) await sleep(50);
   }
 
   // Hold each scroll-linked fade at the most visible value it reached, which
@@ -978,21 +1088,189 @@
     return null;
   }
 
-  // A sticky heading or sidebar inside a tall section (17A's "A decade of
-  // supporting public leaders") follows the reader down, so it lands in
-  // every tile it passes through. Measured at scroll 0: top navs sit in the
-  // header zone and pinned storytelling sections fill most of the screen,
-  // and both are left alone. A taller one that only fills part of the width
-  // inside a much taller container (Whitney's Lichtenstein feature beside
-  // the exhibitions list) is a column the rest of the section scrolls past,
-  // so it goes back in flow too.
-  function isStickyColumn(el) {
+  // A sticky element follows the reader down through its container, so it
+  // lands in every tile it passes through, each time somewhere else: 17A's
+  // "A decade of supporting public leaders", Whitney's Lichtenstein feature
+  // beside the exhibitions list, CLC Roofing's left-column heading, folk's
+  // section eyebrows. Each goes back to where the layout puts it, with its
+  // sticky offset cancelled (left in place, `position: relative` would
+  // shift it down by its `top`, onto the heading below). Measured at scroll
+  // 0, two kinds stay as they are: the site's top nav, in the header zone
+  // (hidden after the first tile with the other headers), and a pinned
+  // section that fills the screen while the page scrolls a long way past it
+  // (see filmPinnedSections), which back in flow would leave the rest of its
+  // container blank.
+  function inHeaderZone(el) {
+    return el.getBoundingClientRect().top + scroller.scrollTop <= 150 || shownHeight(el) <= 0;
+  }
+
+  function isPinnedSection(el) {
     const r = el.getBoundingClientRect();
     const h = shownHeight(el);
-    if (r.top + scroller.scrollTop <= 150 || h <= 0) return false;
-    if (h < window.innerHeight * 0.6) return true;
     const box = el.parentElement && el.parentElement.getBoundingClientRect();
-    return r.width < document.documentElement.clientWidth * 0.7 && !!box && box.height > h * 1.5;
+    return r.width >= document.documentElement.clientWidth * 0.7 && h >= window.innerHeight * 0.6 &&
+      !!box && box.height >= h * 1.5;
+  }
+
+  // A pinned section that changes as the page scrolls past it (agcsf.com's
+  // project galleries: a full-screen frame stuck for four screens while a
+  // script slides a row of photos sideways through it) shows a different
+  // stage in every tile, cut at every seam. A visitor sees it as a run of
+  // stages, so that is how it's shown: visit each stage, one screen of
+  // scrolling apart, copy the section as it stands there, and stack the
+  // copies down the space the page reserves for it, which they fill. The
+  // section itself is hidden. One that looks the same at every stage is
+  // left as it is.
+  async function filmPinnedSections() {
+    const vh = window.innerHeight;
+    const frames = allElements().filter((el) => {
+      if (!(el instanceof HTMLElement) || getComputedStyle(el).position !== 'sticky') return false;
+      return !inHeaderZone(el) && isPinnedSection(el);
+    });
+    for (const frame of frames) {
+      if (frames.some((f) => f !== frame && f.contains(frame))) continue;
+      const parent = frame.parentElement;
+      const stick = parseFloat(getComputedStyle(frame).top) || 0;
+      const y = scroller.scrollTop;
+      const r = frame.getBoundingClientRect();
+      const pr = parent.getBoundingClientRect();
+      const off = r.top - pr.top;
+      const h = r.height;
+      const travel = pr.height - off - h;
+      const n = Math.round(travel / h) + 1;
+      if (n < 2) continue;
+      const pageTop = r.top + y;
+      const stages = [];
+      for (let k = 0; k < n; k++) {
+        scroller.scrollTo(0, Math.max(0, pageTop + travel * k / (n - 1) - stick));
+        await raf();
+        await raf();
+        await sleep(150);
+        await waitForVisibleImages(800);
+        stages.push({ at: off + travel * k / (n - 1), node: frame.cloneNode(true) });
+      }
+      if (stages.every((s) => s.node.outerHTML === stages[0].node.outerHTML)) continue;
+      // The page's script may size the container by how many frames it
+      // holds (agcsf.com's grew a screen per copy), so it keeps its height.
+      parent.style.setProperty('--cleanshot-height', `${pr.height}px`);
+      parent.setAttribute('data-cleanshot-keep', '');
+      const ps = getComputedStyle(parent);
+      if (ps.position === 'static') {
+        unwrapped.push({ el: parent, style: parent.getAttribute('style') });
+        parent.style.setProperty('position', 'relative', 'important');
+      }
+      unwrapped.push({ el: frame, style: frame.getAttribute('style') });
+      frame.style.setProperty('visibility', 'hidden', 'important');
+      frame.style.setProperty('opacity', '0', 'important');
+      frame.setAttribute('data-cleanshot-filmed', '');
+      const left = r.left - pr.left - parseFloat(ps.borderLeftWidth);
+      let after = frame;
+      for (const { at, node } of stages) {
+        node.setAttribute('data-cleanshot-clone', '');
+        node.setAttribute('aria-hidden', 'true');
+        for (const [p, v] of [['position', 'absolute'], ['top', `${at - parseFloat(ps.borderTopWidth)}px`], ['left', `${left}px`],
+          ['bottom', 'auto'], ['right', 'auto'], ['width', `${r.width}px`], ['height', `${h}px`], ['margin', '0']]) {
+          node.style.setProperty(p, v, 'important');
+        }
+        // The page's script finds the copies too and moves them on with the
+        // scroll (agcsf.com's slides every row of photos it can find, every
+        // frame), so each copy's styles as copied are held through the
+        // stylesheet, where the script's inline writes lose.
+        const rules = [node, ...node.querySelectorAll('[style]')].map((c) => {
+          const id = String(clones.length);
+          clones.push(c);
+          c.setAttribute('data-cleanshot-cid', id);
+          const decl = Array.from(c.style).map((p) => `${p}: ${c.style.getPropertyValue(p)} !important;`).join(' ');
+          return `[data-cleanshot-cid="${id}"] { ${decl} }`;
+        });
+        styleEl.textContent += `\n${rules.join('\n')}`;
+        parent.insertBefore(node, after.nextSibling);
+        after = node;
+      }
+      const top = Math.round(pr.top + y);
+      notes.push({ kind: 'pinned-stages', y0: top, y1: Math.round(top + pr.height), note: `a section that stays on screen while the page scrolls past it, changing as it goes (y ${top}-${Math.round(top + pr.height)}), is shown as ${n} screens, one for each stage` });
+    }
+    scroller.scrollTo(0, 0);
+    await sleep(150);
+  }
+
+  // A background with `background-attachment: fixed` is painted against the
+  // window, not its section, so every tile shows a different part of the
+  // picture through the section and it breaks at every seam (Cofa
+  // Dentistry's "A better dental experience", Dentiq's and Hendo Roofing's
+  // call-to-action photos). Paint it with the section instead, sized and
+  // placed as a visitor sees it with the section centred on screen (or at
+  // the top of the page for one on the first screen).
+  async function settleFixedBackgrounds() {
+    const vw = document.documentElement.clientWidth;
+    const vh = window.innerHeight;
+    const maxScroll = Math.max(0, scroller.scrollHeight - vh);
+    const y = scroller.scrollTop;
+    // Top-level commas only: gradients have commas of their own.
+    const layers = (s) => {
+      const out = [];
+      let depth = 0, cur = '';
+      for (const ch of s) {
+        if (ch === '(') depth++;
+        if (ch === ')') depth--;
+        if (ch === ',' && depth === 0) { out.push(cur.trim()); cur = ''; } else cur += ch;
+      }
+      out.push(cur.trim());
+      return out;
+    };
+    const natural = (img) => new Promise((resolve) => {
+      const m = img.match(/^url\(["']?(.*?)["']?\)$/);
+      if (!m) return resolve(null);
+      const probe = new Image();
+      const done = () => resolve(probe.naturalWidth ? [probe.naturalWidth, probe.naturalHeight] : null);
+      probe.onload = done;
+      probe.onerror = done;
+      setTimeout(done, 1500);
+      probe.src = m[1];
+      if (probe.complete) done();
+    });
+    const len = (t, ref) => (t === 'auto' || t == null ? null : t.endsWith('%') ? ref * parseFloat(t) / 100 : parseFloat(t));
+    for (const el of allElements()) {
+      const cs = getComputedStyle(el);
+      if (!cs.backgroundAttachment.includes('fixed') || cs.backgroundImage === 'none' || pinnedToScreen(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) continue;
+      const images = layers(cs.backgroundImage);
+      const at = (list, i) => list[i % list.length];
+      const att = layers(cs.backgroundAttachment), size = layers(cs.backgroundSize), pos = layers(cs.backgroundPosition);
+      const top = r.top + y + parseFloat(cs.borderTopWidth);
+      const left = r.left + parseFloat(cs.borderLeftWidth);
+      const rest = top < vh ? 0 : Math.min(maxScroll, Math.max(0, top + r.height / 2 - vh / 2));
+      const out = { att: [], size: [], pos: [] };
+      for (let i = 0; i < images.length; i++) {
+        if (at(att, i) !== 'fixed') {
+          out.att.push(at(att, i)); out.size.push(at(size, i)); out.pos.push(at(pos, i));
+          continue;
+        }
+        const nat = await natural(images[i]);
+        const st = at(size, i).split(/\s+/);
+        let w, h;
+        if (st[0] === 'cover' || st[0] === 'contain') {
+          const s = nat ? (st[0] === 'cover' ? Math.max(vw / nat[0], vh / nat[1]) : Math.min(vw / nat[0], vh / nat[1])) : 1;
+          [w, h] = nat ? [nat[0] * s, nat[1] * s] : [vw, vh];
+        } else {
+          w = len(st[0], vw); h = len(st[1], vh);
+          if (w == null && h == null) [w, h] = nat || [vw, vh];
+          else if (w == null) w = nat ? h * nat[0] / nat[1] : vw;
+          else if (h == null) h = nat ? w * nat[1] / nat[0] : vh;
+        }
+        const pt = /calc/.test(at(pos, i)) ? ['50%', '50%'] : at(pos, i).split(/\s+/);
+        const px = pt[0].endsWith('%') ? (vw - w) * parseFloat(pt[0]) / 100 : parseFloat(pt[0]) || 0;
+        const py = (pt[1] || '50%').endsWith('%') ? (vh - h) * parseFloat(pt[1] || '50') / 100 : parseFloat(pt[1]) || 0;
+        out.att.push('scroll');
+        out.size.push(`${w}px ${h}px`);
+        out.pos.push(`${px - left}px ${rest + py - top}px`);
+      }
+      unwrapped.push({ el, style: el.getAttribute('style') });
+      el.style.setProperty('background-attachment', out.att.join(', '), 'important');
+      el.style.setProperty('background-size', out.size.join(', '), 'important');
+      el.style.setProperty('background-position', out.pos.join(', '), 'important');
+    }
   }
 
   // A small sticky element told to stick in the lower half of the screen
@@ -1009,14 +1287,9 @@
   function settleOverlays() {
     allElements().forEach((el) => {
       const cs = getComputedStyle(el);
-      if (cs.position === 'sticky' && cs.bottom !== 'auto' && cs.top === 'auto') {
-        unwrapped.push({ el, style: el.getAttribute('style') });
-        el.style.setProperty('position', 'relative', 'important');
-      } else if (cs.position === 'sticky' && floatsLow(el, cs)) {
-        overlays.set(el, 'extra');
-      } else if (cs.position === 'sticky' && isStickyColumn(el)) {
-        unwrapped.push({ el, style: el.getAttribute('style') });
-        el.style.setProperty('position', 'relative', 'important');
+      if (cs.position === 'sticky') {
+        if (floatsLow(el, cs)) overlays.set(el, 'extra');
+        else if (!inHeaderZone(el) && !isPinnedSection(el)) el.setAttribute('data-cleanshot-unstick', '');
       } else if (cs.position === 'fixed' && el.classList.contains('Parallax-item')) {
         el.setAttribute('data-cleanshot-parallax', '');
       } else if (cs.position === 'fixed' && clippedByAncestor(el)) {
@@ -1092,6 +1365,24 @@
     return agree >= Math.max(3, deltas.length / 2) ? mid : null;
   }
 
+  // Canvases on screen: a WebGL image effect (Squarespace's section and
+  // image effects on boulderlanddesign.com) or an animation draws them
+  // itself, by the scroll or the clock, out of reach of the stylesheet, so
+  // they can't be held still. The worker takes each one that fits on a
+  // screen whole from one shot, and reports the ones it couldn't.
+  function liveRegions() {
+    const vh = window.innerHeight;
+    const out = [];
+    document.querySelectorAll('canvas').forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width < 100 || r.height < 60 || r.bottom <= 0 || r.top >= vh) return;
+      if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) || pinnedToScreen(el)) return;
+      if (!liveIds.has(el)) liveIds.set(el, ++liveCount);
+      out.push({ id: liveIds.get(el), top: Math.round(r.top), bottom: Math.round(r.bottom), left: Math.round(r.left), right: Math.round(r.right) });
+    });
+    return out;
+  }
+
   function restore() {
     // Newest first, so an element changed twice ends up with its original style.
     for (const { el, style } of unwrapped.reverse()) {
@@ -1113,10 +1404,20 @@
     pausedAnimations.forEach((anim) => anim.play());
     pausedAnimations = [];
     for (const el of pinned) {
-      el.removeAttribute('data-cleanshot-pin');
-      el.style.removeProperty('--cleanshot-tf');
+      el.removeAttribute('data-cleanshot-hold');
+      HOLD.forEach(([, css]) => el.style.removeProperty(`--cleanshot-${css}`));
     }
-    pinned = [];
+    pinned = new Set();
+    document.querySelectorAll('[data-cleanshot-clone]').forEach((el) => el.remove());
+    document.querySelectorAll('[data-cleanshot-filmed]').forEach((el) => el.removeAttribute('data-cleanshot-filmed'));
+    document.querySelectorAll('[data-cleanshot-unstick]').forEach((el) => el.removeAttribute('data-cleanshot-unstick'));
+    document.querySelectorAll('[data-cleanshot-keep]').forEach((el) => {
+      el.removeAttribute('data-cleanshot-keep');
+      el.style.removeProperty('--cleanshot-height');
+    });
+    clones = [];
+    notes = [];
+    stops = [];
     for (const { el } of held) {
       el.removeAttribute('data-cleanshot-fade');
       el.removeAttribute('data-cleanshot-probe');
@@ -1157,6 +1458,8 @@
           await preScroll();
           await paintBackdrop();
           unpinScrollMagic();
+          await filmPinnedSections();
+          await settleFixedBackgrounds();
           settleOverlays();
           holdFades();
           placeRevealedBackdrop();
@@ -1164,7 +1467,7 @@
           sortOverlays(true);
           await settleAtTop();
           recordFirstScreen();
-          holdScrollLinked();
+          await holdScrollLinked();
           const rawH = pageHeight();
           const capped = Math.min(rawH, MAX_PAGE_HEIGHT);
           if (rawH > MAX_PAGE_HEIGHT) {
@@ -1177,7 +1480,8 @@
             rawPageHeight: rawH,
             viewportHeight: window.innerHeight,
             pageWidth: document.documentElement.clientWidth,
-            dpr: window.devicePixelRatio || 1
+            dpr: window.devicePixelRatio || 1,
+            notes
           });
         } else if (msg.cmd === 'tile') {
           covered = [];
@@ -1211,7 +1515,7 @@
           if (!msg.keepAnchors) recordAnchors();
           const actualY = scroller.scrollTop || window.scrollY || 0;
           sendResponse({
-            ok: true, actualY, drift, covered,
+            ok: true, actualY, drift, covered, live: liveRegions(),
             pageHeight: pageHeight(),
             maxScroll: Math.max(0, scroller.scrollHeight - window.innerHeight)
           });

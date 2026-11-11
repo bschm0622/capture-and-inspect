@@ -296,6 +296,9 @@ async function stitchTiles(tab, info) {
   if (info.rawPageHeight > pageHeight) {
     warnings.push({ kind: 'truncated', y0: pageHeight, y1: info.rawPageHeight, note: `page not fully captured: it is ${info.rawPageHeight}px tall; only the first ${pageHeight}px are captured` });
   }
+  // What the page side changed so it could be shown at all (a pinned
+  // section laid out as its stages).
+  warnings.push(...(info.notes || []));
 
   // Determine output scale, downshifting from dpr if the page is so tall it
   // would blow past the canvas area cap. The canvas leaves room for the page
@@ -347,6 +350,14 @@ async function stitchTiles(tab, info) {
   let prevShot = null; // the last frame shot in order: its luma grid and scroll position
   let reshoots = 0, seamReshoots = 0;
   let skipped = 0; // extra shots the budget didn't allow
+  // Canvases the page draws itself (WebGL effects, animations) look
+  // different in every shot, so one cut by a seam shows two moments. The
+  // last tile drawn's canvases, in capture px: the next tile is shot from
+  // the top of one the seam would cut, if it fits on a screen, and draws it
+  // whole. They're left out of overlap matching, which they'd only confuse.
+  let live = [];
+  const liveSeen = new Map(); // canvas id -> where it sits in the capture
+  const paintStarts = [];     // capture px where each tile's painted rows start
 
   // Whether `n` more shots for this tile leave enough of the budget to
   // reach the bottom of the page one plain tile at a time. Asked only when
@@ -381,7 +392,14 @@ async function stitchTiles(tab, info) {
       break;
     }
     const seam = cursor / scale;
-    const wantY = i === 0 ? 0 : Math.max(0, Math.round(seam - OVERLAP - offset - lift));
+    let wantY = i === 0 ? 0 : Math.max(0, Math.round(seam - OVERLAP - offset - lift));
+    if (i > 0 && !lift && last) {
+      const cut = live.filter((r) => !(liveSeen.get(r.id) || {}).follows && r.top < seam - 4 && r.bottom > seam + 4 && r.bottom - r.top <= vh && r.top > prevTop);
+      if (cut.length) {
+        const from = Math.min(...cut.map((r) => r.top - Math.min(8, vh - (r.bottom - r.top))));
+        wantY = Math.max(last.actualY + 1, Math.min(wantY, Math.round(from - offset)));
+      }
+    }
     const res = await sendToTab(tab.id, { cmd: 'tile', y: wantY, index: i, total });
     if (!res || !res.ok) throw new Error(res && res.error || 'tile failed');
     // The page's own account of whether it moved since the last shot: the
@@ -407,6 +425,20 @@ async function stitchTiles(tab, info) {
     if (i > 0 && top > seam - MIN_OVERLAP && retakes < MAX_RETAKES && affords(1, res)) {
       retakes++;
       placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, retake: true });
+      continue;
+    }
+
+    // A canvas this shot would cut that the last one didn't show (the page
+    // switches its effect on once the section is in view): shoot again from
+    // its top, if it fits on a screen.
+    const appeared = i === 0 ? [] : (res.live || [])
+      .map((r) => ({ id: r.id, top: top + r.top, bottom: top + r.bottom, left: r.left, right: r.right }))
+      .filter((r) => r.top < top && r.top < seam - 4 && r.bottom > seam + 4 && r.bottom - r.top <= vh && r.top > prevTop &&
+        !live.some((l) => l.id === r.id) && !(liveSeen.get(r.id) || {}).follows);
+    if (appeared.length && !lift && retakes < MAX_RETAKES && affords(1, res)) {
+      retakes++;
+      live.push(...appeared);
+      placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, retake: true, canvas: true });
       continue;
     }
 
@@ -498,11 +530,29 @@ async function stitchTiles(tab, info) {
     const topOut = Math.round(top * scale);
     const tileOut = Math.round(bmp.height * scale / dpr);
     const outOfRoom = topOut + tileOut > canvas.height && !grow((topOut + tileOut) / scale);
-    const from = Math.max(cursor, topOut, 0);
+    // A canvas this shot holds whole that the seam would cut is drawn
+    // from this shot alone, from its top down.
+    const shown = (res.live || []).map((r) => ({ id: r.id, top: top + r.top, bottom: top + r.bottom, left: r.left, right: r.right, whole: r.top >= 0 && r.bottom <= tileH }));
+    // A canvas the page keeps moving along with the screen (Squarespace
+    // draws all of a page's image effects on one) isn't anywhere in
+    // particular, so it can't be taken whole; it's reported as such.
+    for (const r of shown) {
+      const s = liveSeen.get(r.id);
+      if (!s) liveSeen.set(r.id, { y0: r.top, y1: r.bottom, at: r.top, follows: false });
+      else {
+        s.follows = s.follows || Math.abs(r.top - s.at) > 8;
+        s.y0 = Math.min(s.y0, r.top);
+        s.y1 = Math.max(s.y1, r.bottom);
+      }
+    }
+    for (const r of shown) r.whole = r.whole && !liveSeen.get(r.id).follows;
+    const redraw = shown.filter((r) => r.whole && r.top < seam && r.bottom > seam).map((r) => Math.round(r.top * scale));
+    const from = Math.max(Math.min(cursor, ...redraw), topOut, 0);
     const to = Math.min(topOut + tileOut, canvas.height);
     if (from > cursor) holes.push([cursor, from]);
     if (to > from) {
       paint(bmp, tileGrid, tileH, top, from, to);
+      paintStarts.push(from / scale);
       cursor = to;
     }
     bmp.close();
@@ -514,13 +564,29 @@ async function stitchTiles(tab, info) {
     seamReshoots = 0;
     lift = 0;
     prevTop = top;
-    hidden = [];
+    live = shown;
+    hidden = shown.map(({ top: t, bottom, left, right }) => ({ top: t, bottom, left, right }));
     total = Math.max(total, i + (atBottom ? 0 : Math.ceil((res.maxScroll - res.actualY) / step)));
     if (outOfRoom) {
       warnings.push({ kind: 'truncated', y0: Math.round(cursor / scale), y1: Math.round((topOut + tileOut) / scale), note: `page not fully captured: the page grew past what one image can hold (${Math.round(room)}px); the capture stops here` });
       break;
     }
     if (atBottom) break;
+  }
+
+  // Canvases can't be held still, so say how each one is shown.
+  const said = new Set();
+  for (const { y0, y1, follows } of liveSeen.values()) {
+    const a = Math.round(y0), b = Math.round(y1);
+    if (said.has(`${a} ${b}`)) continue;
+    said.add(`${a} ${b}`);
+    const edges = paintStarts.filter((s) => s > y0 + 2 && s < y1 - 2).map(Math.round);
+    warnings.push({ kind: 'live-effect', y0: a, y1: b,
+      note: follows
+        ? `a canvas the page moves along with the screen draws over the page (y ${a}-${b}); it can't be held still, so what it shows in each tile is from a different moment${edges.length ? `, and tile edges at y ${edges.join(', ')} may show a step` : ''}`
+        : edges.length
+        ? `a canvas the page draws itself (y ${a}-${b}) can't be held still, and no one shot could hold it whole: tile edges at y ${edges.join(', ')} cut it, so its parts come from different moments`
+        : `a canvas the page draws itself (y ${a}-${b}) can't be held still; it is shown whole as one shot saw it` });
   }
 
   // Rows that no tile reached are reported, not hidden.
