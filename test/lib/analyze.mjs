@@ -66,7 +66,7 @@ export async function runChecks(rec, img, cap, detectors, { site = null, shot = 
     for (const [name, fn] of Object.entries(site.checks)) {
       try {
         if (cap.siteFacts && cap.siteFacts.error) throw new Error(`collect failed: ${cap.siteFacts.error}`);
-        checks[name] = { kind: 'site', ...fn({ img, cap, tiles, vh, shot, facts: cap.siteFacts || {} }) };
+        checks[name] = { kind: 'site', ...(await fn({ img, cap, tiles, vh, shot, facts: cap.siteFacts || {} })) };
       } catch (e) {
         checks[name] = { kind: 'site', pass: false, value: null, detail: `check error: ${e.message}`, flags: [] };
       }
@@ -112,6 +112,8 @@ export async function recordCapture(site, cap, outDir, detectors, { keepPng = 'a
   rec.wake = cap.wake ?? null;
   rec.pageTime = cap.pageTime ?? null;
   rec.captureMs = cap.phases.captured != null ? cap.phases.captured - cap.phases.loaded : null;
+  // The extension's own: tiles, PNG encoding and hand-off (null before it said).
+  rec.timings = cap.timings ?? null;
   rec.tileLog = (cap.tiles || []).map(({ ok, ...t }) => t);
   // The extension's own report on the capture (null before it had one), and
   // where it placed each shot.

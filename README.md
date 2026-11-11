@@ -106,5 +106,10 @@ declared color values, so photos and gradients-as-images won't muddy the result.
   container (rare for marketing pages) aren't handled in this version.
 - If a cookie banner covers the hero, dismiss it before capturing for the
   cleanest first screen (it's hidden automatically after the first tile).
-- Extremely tall pages are capped at 60,000 CSS px as an infinite-scroll
-  safeguard.
+- Captures are always at your display's full resolution, however tall. A page
+  longer than about 96,000 CSS px (at a 1388px-wide window on a 2x display;
+  less on a wider window) is captured to that point and the editor says so:
+  that is the largest image Chrome itself can open. Very tall captures take
+  longer to save (13 s for a 76,000px text page, up to about 50 s for one
+  full of photos) and can't be copied to the clipboard whole past 32,767 CSS px
+  (copy a selection, or download).

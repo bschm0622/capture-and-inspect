@@ -5,9 +5,21 @@
 // opens the editor tab with the result. Progress is streamed to the popup so
 // the indicator lives in browser chrome and never touches the page.
 
+importScripts('png.js', 'capture-store.js');
+
 const CAPTURE_MIN_INTERVAL_MS = 600; // Chrome allows ~2 captureVisibleTab/sec
 const MAX_CANVAS_AREA = 268435456;   // Chrome canvas area cap (px^2)
-const MAX_PAGE_HEIGHT = 60000;       // CSS px, as in content.js: infinite-scroll safeguard
+// Chrome's limit on either side of a canvas. Past it a canvas is created but
+// holds nothing ("The size of the OffscreenCanvas is zero"), so the capture
+// is painted into a stack of canvases (bands), each within both limits.
+const MAX_CANVAS_SIDE = 65535;
+const MAX_PAGE_HEIGHT = 100000;      // CSS px, as in content.js: infinite-scroll safeguard
+// The largest image Chrome will decode (2^31 bytes of RGBA): a capture past
+// it couldn't be shown on the result page or opened in a Chrome tab. At
+// 1388 CSS px wide and 2x that is about 96,700 CSS px of page. It also
+// bounds the stitcher's memory, which holds the raw pixels: 2.9 GB at the
+// worker's peak for 2776 x 200000 px, measured.
+const MAX_IMAGE_BYTES = 2 ** 31 - 1;
 
 let capturing = false;
 let lastCaptureTs = 0;
@@ -296,45 +308,72 @@ function disagreement(sig, w, seam, top, tile, tileH, hidden) {
 }
 
 async function stitchTiles(tab, info) {
-  const { pageHeight, viewportHeight: vh, pageWidth, dpr } = info;
+  const { viewportHeight: vh, pageWidth, dpr } = info;
   const warnings = [];
   const placements = [];
-  if (info.rawPageHeight > pageHeight) {
-    warnings.push({ kind: 'truncated', y0: pageHeight, y1: info.rawPageHeight, note: `page not fully captured: it is ${info.rawPageHeight}px tall; only the first ${pageHeight}px are captured` });
-  }
+  // Always full resolution: the device's own pixels, never scaled down.
+  const scale = dpr;
+  const width = Math.round(pageWidth * scale);
+  // How much of the page one image may hold (CSS px), and how far the tiles
+  // may scroll to fill it.
+  const cap = Math.min(MAX_PAGE_HEIGHT, Math.floor(MAX_IMAGE_BYTES / 4 / width / scale));
+  const capOut = Math.round(cap * scale);
+  const capScroll = Math.max(0, cap - vh);
+  const rawHeight = Math.max(info.rawPageHeight || 0, info.pageHeight);
+  const pageHeight = Math.min(rawHeight, cap);
+  let capWarned = false;
+  const warnCap = (y1) => {
+    if (capWarned) return;
+    capWarned = true;
+    warnings.push({ kind: 'truncated', reason: 'too-tall', y0: cap, y1: Math.max(cap, y1), note: `page not fully captured: it is ${y1}px tall; only the first ${cap}px are captured` });
+  };
+  if (rawHeight > cap) warnCap(rawHeight);
   // What the page side changed so it could be shown at all (a pinned
   // section laid out as its stages).
   warnings.push(...(info.notes || []));
 
-  // Determine output scale, downshifting from dpr if the page is so tall it
-  // would blow past the canvas area cap. The canvas leaves room for the page
-  // to grow during the capture; rows it doesn't use are cut off at the end.
-  let room = pageHeight + GROWTH_TILES * vh;
-  let scale = dpr;
-  while (scale > 1 && (pageWidth * scale) * (room * scale) > MAX_CANVAS_AREA) {
-    scale -= 0.5;
-  }
-  if (scale < 1) scale = 1;
-  let canvas = new OffscreenCanvas(Math.round(pageWidth * scale), Math.round(room * scale));
-  let ctx = canvas.getContext('2d');
-  // The same canvas as a luma grid, for matching each tile's overlap.
+  // The capture is painted into bands: canvases stacked top to bottom, each
+  // as tall as a canvas may be at this width (one band for any page up to
+  // about 32,700 CSS px at 2x). They leave room for the page to grow during
+  // the capture; rows it doesn't use are cut off at the end.
+  const bandRows = Math.max(1, Math.min(MAX_CANVAS_SIDE, Math.floor(MAX_CANVAS_AREA / width)));
+  const bands = []; // { canvas, ctx, top } (top in output px)
+  const allocated = () => (bands.length ? bands[bands.length - 1].top + bands[bands.length - 1].canvas.height : 0);
+  // Bands to cover output rows [0, rows). The last band, if short, is made
+  // taller first (only its own rows are copied), then new bands are added.
+  const allocate = (rows) => {
+    const last = bands[bands.length - 1];
+    if (last && last.canvas.height < bandRows && allocated() < rows) {
+      const c = new OffscreenCanvas(width, Math.min(bandRows, rows - last.top));
+      const x = c.getContext('2d');
+      x.drawImage(last.canvas, 0, 0);
+      last.canvas = c; last.ctx = x;
+      // (For the test harness: where this canvas sits in the capture.)
+      c.bandTop = last.top;
+    }
+    while (allocated() < rows) {
+      const top = allocated();
+      const c = new OffscreenCanvas(width, Math.min(bandRows, rows - top));
+      c.bandTop = top;
+      bands.push({ canvas: c, ctx: c.getContext('2d'), top });
+    }
+  };
+  let room = Math.min(pageHeight + GROWTH_TILES * vh, cap);
+  allocate(Math.round(room * scale));
+  // The same capture as a luma grid, for matching each tile's overlap.
   const gw = Math.max(8, Math.round(pageWidth / GRID_PX));
   let gh = Math.ceil(room);
   let grid = new Uint8Array(gw * gh);
 
-  // The page grew past the room left for it: make the canvas taller, as far
-  // as the canvas area cap and the page height cap allow. False when even
-  // `bottom` (CSS px) doesn't fit.
+  // The page grew past the room left for it: add room, as far as the cap
+  // allows. False when there is no more.
   const grow = (bottom) => {
-    const limit = Math.min(Math.floor(MAX_CANVAS_AREA / canvas.width / scale), MAX_PAGE_HEIGHT + vh);
-    const want = Math.min(Math.ceil(bottom + GROWTH_TILES * vh), limit);
-    if (want < bottom || want <= room) return false;
-    const bigger = new OffscreenCanvas(canvas.width, Math.round(want * scale));
-    const bctx = bigger.getContext('2d');
-    bctx.drawImage(canvas, 0, 0);
+    const want = Math.min(Math.ceil(bottom + GROWTH_TILES * vh), cap);
+    if (want <= room) return false;
+    allocate(Math.round(want * scale));
     const g = new Uint8Array(gw * Math.ceil(want));
     g.set(grid);
-    canvas = bigger; ctx = bctx; grid = g; room = want; gh = Math.ceil(want);
+    grid = g; room = want; gh = Math.ceil(want);
     return true;
   };
 
@@ -345,7 +384,9 @@ async function stitchTiles(tab, info) {
   const reach = Math.round(vh * MATCH_REACH);
   let cursor = 0;  // canvas rows painted so far, top down (output px)
   let offset = 0;  // capture y minus page y of the content at the seam (CSS px)
-  let minH = pageHeight, maxH = pageHeight;
+  // (From the page's real height: past the cap, `pageHeight` is the cap,
+  // and every tile's height would look like a change from it.)
+  let minH = rawHeight, maxH = rawHeight;
   // The offset was last set from the scroll position alone (the page
   // couldn't say how far its content moved): a guess, until a pixel match
   // confirms it. www.icaboston.org's header script scrolls the page 139px
@@ -386,13 +427,18 @@ async function stitchTiles(tab, info) {
     return false;
   };
 
-  // Draw rows [from, to) of the canvas (output px) from a tile placed at
-  // `top`, and copy them into the matching grid.
+  // Draw rows [from, to) of the capture (output px) from a tile placed at
+  // `top`, and copy them into the matching grid. A tile that straddles two
+  // bands is drawn in two parts, each band the rows it holds.
   const paint = (bmp, tileGrid, tileH, top, from, to) => {
     const topOut = Math.round(top * scale);
-    const sy = (from - topOut) * dpr / scale;
-    const sh = (to - from) * dpr / scale;
-    ctx.drawImage(bmp, 0, sy, bmp.width, sh, 0, from, Math.round(bmp.width * scale / dpr), to - from);
+    for (const b of bands) {
+      const a = Math.max(from, b.top), z = Math.min(to, b.top + b.canvas.height);
+      if (z <= a) continue;
+      const sy = (a - topOut) * dpr / scale;
+      const sh = (z - a) * dpr / scale;
+      b.ctx.drawImage(bmp, 0, sy, bmp.width, sh, 0, a - b.top, Math.round(bmp.width * scale / dpr), z - a);
+    }
     const t0 = Math.round(top);
     for (let c = Math.ceil(from / scale); c < Math.min(gh, Math.ceil(to / scale)); c++) {
       const t = c - t0;
@@ -417,8 +463,12 @@ async function stitchTiles(tab, info) {
         wantY = Math.max(last.actualY + 1, Math.min(wantY, Math.round(from - offset)));
       }
     }
-    const res = await sendToTab(tab.id, { cmd: 'tile', y: wantY, index: i, total });
+    const res = await sendToTab(tab.id, { cmd: 'tile', y: Math.min(wantY, capScroll), index: i, total });
     if (!res || !res.ok) throw new Error(res && res.error || 'tile failed');
+    // The height cap holds for the tiles too: past it the page counts as
+    // ended. (Without this the loop followed the page's real bottom past the
+    // cap until the canvas was full.)
+    if (res.maxScroll > capScroll) { warnCap(res.pageHeight); res.maxScroll = capScroll; }
     // The page's own account of whether it moved since the last shot: the
     // drift is measured from the anchors that shot noted.
     const unmoved = !guessed && res.drift != null && lastRes != null && Math.abs(res.pageHeight - lastRes.pageHeight) < 1;
@@ -557,7 +607,9 @@ async function stitchTiles(tab, info) {
     // rows below what is already painted, rescaled to our output scale.
     const topOut = Math.round(top * scale);
     const tileOut = Math.round(bmp.height * scale / dpr);
-    const outOfRoom = topOut + tileOut > canvas.height && !grow((topOut + tileOut) / scale);
+    if (topOut + tileOut > allocated()) grow(Math.min(topOut + tileOut, capOut) / scale);
+    // This tile reaches the cap: the capture stops with it.
+    const outOfRoom = topOut + tileOut > capOut;
     // A canvas this shot holds whole that the seam would cut is drawn
     // from this shot alone, from its top down.
     const shown = (res.live || []).map((r) => ({ id: r.id, kind: r.kind, top: top + r.top, bottom: top + r.bottom, left: r.left, right: r.right, whole: r.top >= 0 && r.bottom <= tileH }));
@@ -586,7 +638,7 @@ async function stitchTiles(tab, info) {
         if (r.whole && from > t && from < b && b <= cursor) { from = b; moved = true; }
       }
     }
-    const to = Math.min(topOut + tileOut, canvas.height);
+    const to = Math.min(topOut + tileOut, allocated());
     if (from > cursor) holes.push([cursor, from]);
     if (to > from) {
       paint(bmp, tileGrid, tileH, top, from, to);
@@ -606,7 +658,7 @@ async function stitchTiles(tab, info) {
     hidden = shown.map(({ top: t, bottom, left, right }) => ({ top: t, bottom, left, right }));
     total = Math.max(total, i + (atBottom ? 0 : Math.ceil((res.maxScroll - res.actualY) / step)));
     if (outOfRoom) {
-      warnings.push({ kind: 'truncated', y0: Math.round(cursor / scale), y1: Math.round((topOut + tileOut) / scale), note: `page not fully captured: the page grew past what one image can hold (${Math.round(room)}px); the capture stops here` });
+      if (res.pageHeight > cap) warnCap(res.pageHeight);
       break;
     }
     if (atBottom) break;
@@ -652,13 +704,57 @@ async function stitchTiles(tab, info) {
     warnings.push({ kind: 'page-height-changed', y0: minH, y1: maxH, note: `page height ranged from ${minH}px to ${maxH}px while it was captured` });
   }
 
-  // Cut off the rows below the last tile: room the page didn't grow into.
-  let out = canvas;
-  if (cursor < canvas.height) {
-    out = new OffscreenCanvas(canvas.width, Math.max(1, cursor));
-    out.getContext('2d').drawImage(canvas, 0, 0);
+  // Rows below the last tile (room the page didn't grow into) are left out
+  // of the image. Rows above it that no tile painted are transparent, and
+  // reported above as `unpainted`.
+  const image = { bands, width, height: Math.max(1, cursor), holes: holes.length > 0 };
+  return { image, tileCount: placements.filter((p) => !p.retake).length, warnings, placements };
+}
+
+// The stitched bands as one PNG Blob. A capture that fits one band is
+// encoded by the canvas, as before: Chrome's encoder is 3-4x faster than
+// the PNG writer (2.0 s against 7.6 s for 2776 x 39190 px), though its
+// files are 25-30% bigger. Taller captures go through the PNG writer, a
+// strip at a time. Either way the bands are released once encoded.
+async function encodeCapture(image) {
+  const { bands, width, height } = image;
+  try {
+    if (bands.length === 1 || height <= bands[0].canvas.height) {
+      // Cut off the rows below the last tile.
+      let out = bands[0].canvas;
+      if (height < out.height) {
+        out = new OffscreenCanvas(width, height);
+        out.getContext('2d').drawImage(bands[0].canvas, 0, 0);
+      }
+      return await out.convertToBlob({ type: 'image/png' });
+    }
+    const STRIP = 256;
+    async function* strips() {
+      for (const b of bands) {
+        const end = Math.min(b.canvas.height, height - b.top);
+        for (let y = 0; y < end; y += STRIP) {
+          const n = Math.min(STRIP, end - y);
+          yield { data: b.ctx.getImageData(0, y, width, n).data, rows: n };
+        }
+        // Done with this band: let its memory go before the next is read.
+        const last = b.top + end >= height;
+        b.canvas.width = b.canvas.height = 1;
+        if (last) break;
+      }
+    }
+    // RGB unless some rows were never painted: those stay transparent, as
+    // on a one-band capture, so they show as holes rather than black.
+    let shown = -1;
+    return await Png.encode({
+      width, height, alpha: image.holes, strips: strips(),
+      onProgress: (f) => {
+        const pct = Math.floor(f * 100);
+        if (pct !== shown) { shown = pct; notify({ phase: 'encode', fraction: f }); }
+      }
+    });
+  } finally {
+    for (const b of bands) b.canvas.width = b.canvas.height = 1;
   }
-  return { canvas: out, tileCount: placements.filter((p) => !p.retake).length, warnings, placements };
 }
 
 async function runCapture(tab) {
@@ -726,13 +822,16 @@ async function runCapture(tab) {
     await sendToTab(tab.id, { cmd: 'hold' }).catch(() => {});
     await sleep(HOLD_GRACE_MS);
 
-    const { canvas, tileCount, warnings, placements } = await stitchTiles(tab, info);
+    const t0 = Date.now();
+    const { image, tileCount, warnings, placements } = await stitchTiles(tab, info);
+    const t1 = Date.now();
 
     await sendToTab(tab.id, { cmd: 'finish' }).catch(() => {});
     await clock('release');
 
-    const outBlob = await canvas.convertToBlob({ type: 'image/png' });
-    const outUrl = await blobToDataUrl(outBlob);
+    const t2 = Date.now();
+    const outBlob = await encodeCapture(image);
+    const t3 = Date.now();
 
     let host = 'page';
     try { host = new URL(tab.url).hostname; } catch (_) {}
@@ -744,13 +843,18 @@ async function runCapture(tab) {
     const baseName = `${host}_${date}`;
 
     // Hand the stitched image to the editor tab, which handles crop, format
-    // choice, copy-to-clipboard, and download.
+    // choice, copy-to-clipboard, and download. The PNG goes into the
+    // extension's IndexedDB as a Blob (Chrome keeps it on disk; a data URL
+    // in storage would not survive a file of several hundred MB), and its
+    // description into storage.
+    await CaptureStore.put(outBlob);
+    const timings = { tilesMs: t1 - t0, encodeMs: t3 - t2, storeMs: Date.now() - t3, bands: image.bands.length };
     await chrome.storage.local.set({
       capture: {
-        image: outUrl,
         baseName,
-        width: canvas.width,
-        height: canvas.height,
+        width: image.width,
+        height: image.height,
+        size: outBlob.size,
         sourceUrl: tab.url,
         warnings
       }
@@ -760,7 +864,7 @@ async function runCapture(tab) {
     clearBadgeLater(2000);
     await chrome.tabs.create({ url: chrome.runtime.getURL('result.html') });
 
-    return { filename: `${baseName}.png`, dataUrl: outUrl, tileCount, warnings, placements };
+    return { filename: `${baseName}.png`, size: outBlob.size, width: image.width, height: image.height, timings, tileCount, warnings, placements };
   } catch (err) {
     console.error('[CleanShot]', err);
     // Best-effort page restore even on failure.
@@ -1063,13 +1167,4 @@ function pageClock(cmd, graceMs, afterMs) {
     delete window[KEY];
     return { timeouts: timeouts.length, frames: frames.length, skipped: S.skipped };
   }
-}
-
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
-  });
 }

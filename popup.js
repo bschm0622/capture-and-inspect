@@ -26,6 +26,10 @@ function render(msg) {
       $('sub').textContent = `Section ${msg.index + 1} of ${msg.total}`;
       setBar((msg.index + 1) / msg.total, false);
       break;
+    case 'encode':
+      $('sub').textContent = 'Saving the image…';
+      setBar(msg.fraction, false);
+      break;
     case 'done':
       $('ico').classList.add('done');
       $('title').textContent = 'Done';

@@ -10,7 +10,7 @@
   if (window.__cleanShotInjected) return;
   window.__cleanShotInjected = true;
 
-  const MAX_PAGE_HEIGHT = 60000; // CSS px — infinite-scroll safeguard
+  const MAX_PAGE_HEIGHT = 100000; // CSS px — infinite-scroll safeguard (background.js may cap lower)
   // JS-driven scroll animations (framer-motion springs, GSAP) aren't sped up
   // by the CSS duration clamp, so give each tile enough time to settle.
   const SETTLE_GRACE_MS = 550;
