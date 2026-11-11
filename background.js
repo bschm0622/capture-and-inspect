@@ -107,6 +107,12 @@ const MAX_LIFT_MISSES = 2;
 const SHOTS_PER_TILE = 2;
 const SPARE_SHOTS = 10;
 const STALE_WAIT_MS = 250;  // before shooting again a frame that didn't change
+// After the page's clock is held, work already under way (a slide moving,
+// a fade) gets this long to finish before it is held too (see pageClock).
+const HOLD_GRACE_MS = 800;
+// What the page starts after the hold, answering the capture's scrolling (a
+// reveal and its staggered delays), runs this long before it is held.
+const HOLD_AFTER_MS = 3000;
 
 // Two tiles placed right show the same pixels where they overlap. Where they
 // don't, in part of the width, the page changed between the two shots: a tab
@@ -351,13 +357,16 @@ async function stitchTiles(tab, info) {
   let reshoots = 0, seamReshoots = 0;
   let skipped = 0; // extra shots the budget didn't allow
   // Canvases the page draws itself (WebGL effects, animations) look
-  // different in every shot, so one cut by a seam shows two moments. The
-  // last tile drawn's canvases, in capture px: the next tile is shot from
+  // different in every shot, so one cut by a seam shows two moments; so do
+  // frames from other sites, videos that kept playing and whatever else the
+  // page changes on a clock that couldn't be held (content.js liveRegions).
+  // The last tile drawn's such regions, in capture px: the next tile is shot from
   // the top of one the seam would cut, if it fits on a screen, and draws it
   // whole. They're left out of overlap matching, which they'd only confuse.
   let live = [];
   const liveSeen = new Map(); // canvas id -> where it sits in the capture
   const paintStarts = [];     // capture px where each tile's painted rows start
+  const changedAt = [];       // seams (CSS px) where two tiles disagreed or didn't match: the page changed between them
 
   // Whether `n` more shots for this tile leave enough of the budget to
   // reach the bottom of the page one plain tile at a time. Asked only when
@@ -466,7 +475,12 @@ async function stitchTiles(tab, info) {
 
     let match = null, agree = null;
     if (i > 0) {
-      match = placeTile(grid, gw, seam, top, tileGrid, tileH, hidden, unmoved ? FIRM_REACH : reach);
+      // What this shot says can't be held still is left out as well as what
+      // the last one said: a slider first seen moving now differs from the
+      // tile above for that reason alone, and would make the overlap look
+      // like a mismatch (blossompdx.com's gallery, cut after retakes ran out).
+      const unheld = hidden.concat((res.live || []).map((r) => ({ top: top + r.top, bottom: top + r.bottom, left: r.left, right: r.right })));
+      match = placeTile(grid, gw, seam, top, tileGrid, tileH, unheld, unmoved ? FIRM_REACH : reach);
       if (lift && match.match === 'mismatch') liftMisses++;
       else if (!lift && match.match !== 'mismatch' && match.match !== 'flat' && match.match !== 'none') liftMisses = 0;
       if (match.match === 'moved') {
@@ -486,13 +500,18 @@ async function stitchTiles(tab, info) {
         // overrule, since it is usually something that changed between the
         // two shots, like an image that finished loading, and shooting the
         // tile above again can settle it; else the scroll position.)
-        agree = disagreement(grid, gw, seam, top, tileGrid, tileH, hidden);
+        agree = disagreement(grid, gw, seam, top, tileGrid, tileH, unheld);
+        // (And with them, only as evidence for the report below: did what
+        // couldn't be held change between the two shots?)
+        const all = disagreement(grid, gw, seam, top, tileGrid, tileH, hidden);
+        if (all && all.blocks > 0) changedAt.push(seam);
       }
     }
 
     // The page changed between this shot and the one above. Shoot that one
     // again, then this one, back to back. The repeat keeps the page's
     // anchors from this shot, so this one is still measured from here.
+    if ((agree && agree.blocks > 0) || (match && match.match === 'mismatch')) changedAt.push(seam);
     if (agree && agree.blocks > 0 && last && seamReshoots < RESHOOTS_PER_SEAM && reshoots < MAX_RESHOOTS && affords(2, res)) {
       seamReshoots++;
       reshoots++;
@@ -532,13 +551,13 @@ async function stitchTiles(tab, info) {
     const outOfRoom = topOut + tileOut > canvas.height && !grow((topOut + tileOut) / scale);
     // A canvas this shot holds whole that the seam would cut is drawn
     // from this shot alone, from its top down.
-    const shown = (res.live || []).map((r) => ({ id: r.id, top: top + r.top, bottom: top + r.bottom, left: r.left, right: r.right, whole: r.top >= 0 && r.bottom <= tileH }));
+    const shown = (res.live || []).map((r) => ({ id: r.id, kind: r.kind, top: top + r.top, bottom: top + r.bottom, left: r.left, right: r.right, whole: r.top >= 0 && r.bottom <= tileH }));
     // A canvas the page keeps moving along with the screen (Squarespace
     // draws all of a page's image effects on one) isn't anywhere in
     // particular, so it can't be taken whole; it's reported as such.
     for (const r of shown) {
       const s = liveSeen.get(r.id);
-      if (!s) liveSeen.set(r.id, { y0: r.top, y1: r.bottom, at: r.top, follows: false });
+      if (!s) liveSeen.set(r.id, { y0: r.top, y1: r.bottom, at: r.top, follows: false, kind: r.kind });
       else {
         s.follows = s.follows || Math.abs(r.top - s.at) > 8;
         s.y0 = Math.min(s.y0, r.top);
@@ -547,7 +566,17 @@ async function stitchTiles(tab, info) {
     }
     for (const r of shown) r.whole = r.whole && !liveSeen.get(r.id).follows;
     const redraw = shown.filter((r) => r.whole && r.top < seam && r.bottom > seam).map((r) => Math.round(r.top * scale));
-    const from = Math.max(Math.min(cursor, ...redraw), topOut, 0);
+    let from = Math.max(Math.min(cursor, ...redraw), topOut, 0);
+    // But not from inside one the tile above already held whole: two such
+    // boxes can overlap (saybriefly.com's stacked demo cards share 56px),
+    // and starting there would cut the upper one instead. Start below it.
+    for (let moved = true, k = 0; moved && k < 8; k++) {
+      moved = false;
+      for (const r of live) {
+        const t = Math.round(r.top * scale), b = Math.round(r.bottom * scale);
+        if (r.whole && from > t && from < b && b <= cursor) { from = b; moved = true; }
+      }
+    }
     const to = Math.min(topOut + tileOut, canvas.height);
     if (from > cursor) holes.push([cursor, from]);
     if (to > from) {
@@ -574,19 +603,33 @@ async function stitchTiles(tab, info) {
     if (atBottom) break;
   }
 
-  // Canvases can't be held still, so say how each one is shown.
+  // What couldn't be held still, so say how each one is shown. A canvas
+  // always gets a word. The rest (a frame from another site, a video, an
+  // element the page kept changing) only when a tile edge cut it and two
+  // tiles disagreed (or their overlap didn't match at all) at a seam inside
+  // it, which is the evidence it changed:
+  // a player that took the pause command, or a slider that stood still
+  // while it was shot, came out of one moment.
   const said = new Set();
-  for (const { y0, y1, follows } of liveSeen.values()) {
+  const NAMES = {
+    canvas: 'a canvas the page draws itself',
+    video: 'a video that kept playing',
+    frame: 'a frame from another site (a video player, a map)',
+    moving: 'something the page kept changing on its own (a slider on a timer, an animation)'
+  };
+  for (const { y0, y1, follows, kind } of liveSeen.values()) {
     const a = Math.round(y0), b = Math.round(y1);
     if (said.has(`${a} ${b}`)) continue;
-    said.add(`${a} ${b}`);
     const edges = paintStarts.filter((s) => s > y0 + 2 && s < y1 - 2).map(Math.round);
+    if (kind && kind !== 'canvas' && !(edges.length && changedAt.some((y) => y > y0 && y < y1))) continue;
+    said.add(`${a} ${b}`);
+    const what = NAMES[kind] || NAMES.canvas;
     warnings.push({ kind: 'live-effect', y0: a, y1: b,
       note: follows
-        ? `a canvas the page moves along with the screen draws over the page (y ${a}-${b}); it can't be held still, so what it shows in each tile is from a different moment${edges.length ? `, and tile edges at y ${edges.join(', ')} may show a step` : ''}`
+        ? `${what} moves along with the screen over the page (y ${a}-${b}); it can't be held still, so what it shows in each tile is from a different moment${edges.length ? `, and tile edges at y ${edges.join(', ')} may show a step` : ''}`
         : edges.length
-        ? `a canvas the page draws itself (y ${a}-${b}) can't be held still, and no one shot could hold it whole: tile edges at y ${edges.join(', ')} cut it, so its parts come from different moments`
-        : `a canvas the page draws itself (y ${a}-${b}) can't be held still; it is shown whole as one shot saw it` });
+        ? `${what} (y ${a}-${b}) can't be held still, and no one shot could hold it whole: tile edges at y ${edges.join(', ')} cut it, so its parts come from different moments`
+        : `${what} (y ${a}-${b}) can't be held still; it is shown whole as one shot saw it` });
   }
 
   // Rows that no tile reached are reported, not hidden.
@@ -622,7 +665,17 @@ async function runCapture(tab) {
   setBadge('…', '#555');
   notify({ phase: 'prepare' });
 
+  const clock = (cmd) => chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: 'MAIN',
+    func: pageClock,
+    args: [cmd, HOLD_GRACE_MS, HOLD_AFTER_MS]
+  }).then((r) => r && r[0] && r[0].result).catch(() => null);
+
   try {
+    // Follow the page's timers from before the wake-up, so the sliders the
+    // woken scripts start can be held once the page is prepared.
+    await clock('watch');
     // Inject the page-side worker (activeTab grant covers this tab) and let
     // it wake the page first: scripts held back until the first mouse move
     // start carousels and scroll animations the steps below must see.
@@ -654,9 +707,20 @@ async function runCapture(tab) {
     const info = await sendToTab(tab.id, { cmd: 'prepare' });
     if (!info || !info.ok) throw new Error(info && info.error || 'prepare failed');
 
+    // The page is prepared: stop its clock for the tiles. Carousels the
+    // pre-scroll brought to life (a slider set up when it scrolls into
+    // view) are stopped through their library as well, and the page side
+    // pauses what the browser animates. The grace lets a slide or fade
+    // already under way finish before the first shot.
+    await clock('hold');
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'MAIN', func: stopCarousels }).catch(() => {});
+    await sendToTab(tab.id, { cmd: 'hold' }).catch(() => {});
+    await sleep(HOLD_GRACE_MS);
+
     const { canvas, tileCount, warnings, placements } = await stitchTiles(tab, info);
 
     await sendToTab(tab.id, { cmd: 'finish' }).catch(() => {});
+    await clock('release');
 
     const outBlob = await canvas.convertToBlob({ type: 'image/png' });
     const outUrl = await blobToDataUrl(outBlob);
@@ -692,6 +756,7 @@ async function runCapture(tab) {
     console.error('[CleanShot]', err);
     // Best-effort page restore even on failure.
     try { await sendToTab(tab.id, { cmd: 'finish' }); } catch (_) {}
+    await clock('release');
     setBadge('!', '#c0392b');
     clearBadgeLater(3000);
     notify({ phase: 'error', error: String(err && err.message || err) });
@@ -866,6 +931,129 @@ function stopCarousels() {
   });
 
   return stopped;
+}
+
+// Injected into the page (MAIN world), so it must be self-contained. The
+// page's own clock: timers and animation frames that turn sliders, run
+// marquees, count numbers up and draw canvas animations. A seam between two
+// shots of one of those shows two different moments.
+//
+// 'watch' goes in before the page is woken, and only wraps the page's
+// setTimeout, setInterval and requestAnimationFrame so that every one
+// registered from then on (scripts the wake-up lets go of start their
+// sliders then) can be held later. It changes nothing yet.
+// 'hold' comes once the page is prepared (the pre-scroll, the lazy content
+// and the stage visits need the clock running) and stops time-driven work.
+// Of what was already going at the hold: a timer of a second or more (an
+// autoplay step, a popup on a timer) that comes due is kept back, an
+// interval of a second or more skips its ticks, and anything that keeps
+// itself going (a frame loop, a chain of timeouts, a fast interval) is kept
+// back once it has run HOLD_GRACE_MS past the hold, which lets a slide or
+// fade already under way finish. What starts after the hold is the page
+// answering the capture's own scrolling (a section revealed as it comes into
+// view, with its staggered delays; arcodb.com's FAQ never appeared when
+// those were held), so it runs for HOLD_AFTER_MS from its own start before
+// it is kept back too. A slider's next step is asked for from inside its
+// last one, so it belongs to the old chain and stays held.
+// 'release' puts the page's functions back and runs what was held, so the
+// page carries on as if it had only been paused.
+// What it can't reach: timers registered before 'watch' (at page load, by
+// the page itself), and loops that kept a reference to the browser's own
+// requestAnimationFrame; the page side shoots those whole where it can.
+function pageClock(cmd, graceMs, afterMs) {
+  const KEY = '__cleanShotClock';
+  const LONG_MS = 1000;
+  let S = window[KEY];
+  const now = () => performance.now();
+  if (cmd === 'watch') {
+    if (S) return 'watching';
+    S = { holding: false, holdAt: 0, grace: 1000, after: 3000, heldTimeouts: new Map(), heldFrames: new Map(), skipped: 0, ctx: null };
+    Object.defineProperty(window, KEY, { value: S, configurable: true, enumerable: false, writable: true });
+    const o = S.orig = {
+      setTimeout: window.setTimeout, setInterval: window.setInterval, clearTimeout: window.clearTimeout,
+      requestAnimationFrame: window.requestAnimationFrame, cancelAnimationFrame: window.cancelAnimationFrame
+    };
+    // Each callback carries the time its chain started: a timer or frame
+    // asked for from inside another one continues that one's chain.
+    const chain = () => (S.ctx ? S.ctx : { start: now() });
+    const run = (c, cb, self, args) => {
+      const prev = S.ctx;
+      S.ctx = c;
+      try { return cb.apply(self, args); } finally { S.ctx = prev; }
+    };
+    // Whether a callback of chain `c` (asked for `delay` ms ahead) is held now.
+    const held = (c, delay) => {
+      if (!S.holding) return false;
+      if (c.start < S.holdAt) return delay >= LONG_MS || now() - S.holdAt >= S.grace;
+      return now() - c.start >= S.after;
+    };
+    window.setTimeout = function (cb, ms, ...args) {
+      if (typeof cb !== 'function') return o.setTimeout.call(window, cb, ms, ...args);
+      const c = chain();
+      const delay = Number(ms) || 0;
+      let id;
+      const fire = function () {
+        if (held(c, delay)) {
+          S.heldTimeouts.set(id, () => run(c, cb, window, args));
+          return;
+        }
+        return run(c, cb, this, args);
+      };
+      id = o.setTimeout.call(window, fire, ms);
+      return id;
+    };
+    window.setInterval = function (cb, ms, ...args) {
+      if (typeof cb !== 'function') return o.setInterval.call(window, cb, ms, ...args);
+      const c = { start: now() };
+      const delay = Number(ms) || 0;
+      return o.setInterval.call(window, function () {
+        if (held(c, delay)) { S.skipped++; return; }
+        return run(c, cb, this, args);
+      }, ms);
+    };
+    window.clearTimeout = function (id) {
+      S.heldTimeouts.delete(id);
+      return o.clearTimeout.call(window, id);
+    };
+    window.requestAnimationFrame = function (cb) {
+      if (typeof cb !== 'function') return o.requestAnimationFrame.call(window, cb);
+      const c = chain();
+      let id;
+      id = o.requestAnimationFrame.call(window, function (t) {
+        if (held(c, 0)) {
+          S.heldFrames.set(id, (t2) => run(c, cb, window, [t2]));
+          return;
+        }
+        return run(c, cb, this, [t]);
+      });
+      return id;
+    };
+    window.cancelAnimationFrame = function (id) {
+      S.heldFrames.delete(id);
+      return o.cancelAnimationFrame.call(window, id);
+    };
+    return 'watching';
+  }
+  if (!S) return 'not watching';
+  if (cmd === 'hold') {
+    S.grace = graceMs || 1000;
+    S.after = afterMs || 3000;
+    S.holdAt = now();
+    S.holding = true;
+    return 'holding';
+  }
+  if (cmd === 'release') {
+    const o = S.orig;
+    S.holding = false;
+    for (const k of Object.keys(o)) window[k] = o[k];
+    const timeouts = [...S.heldTimeouts.values()], frames = [...S.heldFrames.values()];
+    S.heldTimeouts.clear();
+    S.heldFrames.clear();
+    timeouts.forEach((f) => o.setTimeout.call(window, f, 0));
+    frames.forEach((f) => o.requestAnimationFrame.call(window, f));
+    delete window[KEY];
+    return { timeouts: timeouts.length, frames: frames.length, skipped: S.skipped };
+  }
 }
 
 function blobToDataUrl(blob) {

@@ -41,6 +41,7 @@
   let pausedAnimations = [];     // looping CSS animations held still during capture
   let anchors = [];              // [{el, y}] page content seen in the last tile, and where it sat
   let covered = [];              // screen rects of overlays hidden during this tile
+  let clockHeld = false;         // the worker has stopped the page's clock (background.js pageClock)
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
@@ -126,6 +127,100 @@
       pausedAnimations.push(anim);
     });
   }
+
+  // Once the page's clock is held (after prepare, and again before each
+  // tile, for ones started since), pause everything the browser animates on
+  // its own clock: looping CSS animations started after the one above (a
+  // marquee set going when its section scrolled into view) and script
+  // animations (element.animate) that loop or have seconds left to run, like
+  // a slow zoom. Those started since the injected style squeezed every
+  // animation to 1ms would race through a loop each millisecond, so they're
+  // put at their start. Entrance animations with little left are left to
+  // finish.
+  function pauseClockAnimations() {
+    document.getAnimations().forEach((anim) => {
+      if (anim.playState !== 'running' || pausedAnimations.includes(anim) || anim instanceof CSSTransition) return;
+      const t = anim.effect && anim.effect.getComputedTiming();
+      if (!t) return;
+      const endless = t.iterations === Infinity;
+      if (anim instanceof CSSAnimation) {
+        if (!endless) return;
+        anim.pause();
+        if (t.duration <= 1) anim.currentTime = 0;
+      } else {
+        if (!endless && !(t.endTime - (t.localTime || 0) > 2000)) return;
+        anim.pause();
+      }
+      pausedAnimations.push(anim);
+    });
+  }
+
+  // A video player from another site can't be reached into, but the two
+  // that carry most background videos take commands from the page they're
+  // embedded in: Vimeo always, YouTube when embedded with its API on.
+  // Paused once the clock is held; at the end, the ones embedded to play
+  // on their own (autoplay, Vimeo's background mode) are started again. If
+  // a player ignores the command, its frame is still shot whole where it
+  // fits on a screen (liveRegions).
+  let players = [];
+  const PLAYERS = [
+    [/^https:\/\/player\.vimeo\.com\//, { method: 'pause' }, { method: 'play' }],
+    [/^https:\/\/www\.youtube(-nocookie)?\.com\/embed\//, JSON.stringify({ event: 'command', func: 'pauseVideo', args: [] }), JSON.stringify({ event: 'command', func: 'playVideo', args: [] })]
+  ];
+  function pausePlayers() {
+    document.querySelectorAll('iframe').forEach((f) => {
+      if (players.some((p) => p.f === f)) return;
+      const src = f.src || '';
+      const kind = PLAYERS.find(([re]) => re.test(src));
+      if (!kind) return;
+      try {
+        f.contentWindow.postMessage(kind[1], '*');
+        players.push({ f, play: kind[2], resume: /[?&](autoplay|background)=1/.test(src) });
+      } catch (_) {}
+    });
+  }
+
+  // Elements the page changes on its own clock: a slider whose timer was set
+  // when the page loaded, before the capture could reach it, or a loop the
+  // page drives with its own reference to the browser's frame timer. They
+  // can't be held, so the worker shoots each one that fits on a screen
+  // whole, like a canvas. Seen as changes to an element's class or inline
+  // style while the capture wasn't scrolling (what a scroll sets off, lazy
+  // loading and reveals, comes within a frame or two), and more than once,
+  // half a second or more apart: a clock comes back, a reveal finishing
+  // late doesn't (on clcroofing.com, counting single changes marked dozens
+  // of finished reveals as moving and reshaped the tiles for nothing). The
+  // capture's own style changes are told apart by what they write:
+  // `!important` declarations and --cleanshot variables.
+  let restless = new Set();
+  let changedOnce = new WeakMap(); // element -> when it first changed on its own
+  let lastScrollAt = 0;
+  let restlessWatch = null;
+  const QUIET_MS = 200;
+  const AGAIN_MS = 500;
+  const pageStyle = (s) => (s || '').split(';').map((d) => d.trim())
+    .filter((d) => d && !/!\s*important$/i.test(d) && !d.startsWith('--cleanshot')).join(';');
+  function watchRestless() {
+    if (restlessWatch) return;
+    if (!lastScrollAt) addEventListener('scroll', () => { lastScrollAt = performance.now(); }, { capture: true, passive: true });
+    lastScrollAt = performance.now();
+    restlessWatch = new MutationObserver((list) => {
+      if (performance.now() - lastScrollAt < QUIET_MS) return;
+      for (const m of list) {
+        const el = m.target;
+        if (el.nodeType !== 1 || el === document.body || el === document.documentElement || restless.has(el)) continue;
+        if (m.attributeName === 'style' && pageStyle(m.oldValue) === pageStyle(el.getAttribute('style'))) continue;
+        const first = changedOnce.get(el);
+        if (first == null) changedOnce.set(el, performance.now());
+        else if (performance.now() - first >= AGAIN_MS) restless.add(el);
+      }
+    });
+    restlessWatch.observe(document.documentElement, { subtree: true, attributes: true, attributeOldValue: true, attributeFilter: ['class', 'style', 'hidden'] });
+  }
+  const scrollPage = (y) => {
+    lastScrollAt = performance.now();
+    scroller.scrollTo(0, y);
+  };
 
   // Wait for images on screen to finish loading: <img> (whichever source a
   // <picture> or srcset picked) and CSS background images, which lazy
@@ -278,6 +373,15 @@
     const visible = allElements().filter((v) => v instanceof HTMLVideoElement).filter((v) => {
       const r = v.getBoundingClientRect();
       return r.bottom > 0 && r.top < vh && r.width > 0;
+    });
+    // And in frames from the same site, which the page side can reach.
+    document.querySelectorAll('iframe').forEach((f) => {
+      const r = f.getBoundingClientRect();
+      if (r.bottom <= 0 || r.top >= vh || r.width === 0) return;
+      try {
+        const d = f.contentDocument;
+        if (d) visible.push(...d.querySelectorAll('video'));
+      } catch (_) {}
     });
     const waits = [];
     for (const v of visible) {
@@ -1370,16 +1474,79 @@
   // itself, by the scroll or the clock, out of reach of the stylesheet, so
   // they can't be held still. The worker takes each one that fits on a
   // screen whole from one shot, and reports the ones it couldn't.
+  // The same goes for everything else whose content runs on a clock the
+  // capture can't stop: a frame from another site (a YouTube or Vimeo
+  // player, a Google map), which the extension can't reach into; a video
+  // that is still playing when the tile is shot (the page started it again,
+  // or it never had a frame to stop on); and elements the page keeps
+  // changing on its own (see watchRestless). A wrapper taller than two
+  // screens that the page restyles (a body class, a section marked as
+  // visited) says nothing about where the motion is, so it's left out.
   function liveRegions() {
     const vh = window.innerHeight;
+    const vw = document.documentElement.clientWidth;
     const out = [];
-    document.querySelectorAll('canvas').forEach((el) => {
-      const r = el.getBoundingClientRect();
-      if (r.width < 100 || r.height < 60 || r.bottom <= 0 || r.top >= vh) return;
+    // What shows of it: a background video frame is often made larger than
+    // its section (r-o.com's Vimeo hero runs 212px above and below) and cut
+    // to it by the section's overflow, so it's only as tall as the section.
+    // A slider's track, slid sideways by thousands of pixels, lies outside
+    // the window it is seen through; it shows as that window.
+    const shownRect = (el) => {
+      const b = el.getBoundingClientRect();
+      let top = b.top, bottom = b.bottom, left = b.left, right = b.right;
+      let win = null;
+      for (let a = el.parentElement, k = 0; a && a !== document.body && k < 30; a = a.parentElement, k++) {
+        const cs = getComputedStyle(a);
+        const clip = cs.clipPath !== 'none';
+        const cy = clip || cs.overflowY !== 'visible', cx = clip || cs.overflowX !== 'visible';
+        if (!cx && !cy) continue;
+        const p = a.getBoundingClientRect();
+        if (cy) { top = Math.max(top, p.top); bottom = Math.min(bottom, p.bottom); }
+        if (cx) {
+          if (!win) win = p;
+          left = Math.max(left, p.left); right = Math.min(right, p.right);
+        }
+      }
+      if (right - left < 1 && win && b.bottom > win.top && b.top < win.bottom) ({ left, right } = win);
+      return { top, bottom, left, right, width: right - left, height: bottom - top };
+    };
+    const add = (el, kind) => {
+      const r = shownRect(el);
+      if (r.width < 100 || r.height < 60 || r.bottom <= 0 || r.top >= vh || r.right <= 0 || r.left >= vw) return;
+      if (kind === 'moving' && r.height > 2 * vh) return;
       if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) || pinnedToScreen(el)) return;
       if (!liveIds.has(el)) liveIds.set(el, ++liveCount);
-      out.push({ id: liveIds.get(el), top: Math.round(r.top), bottom: Math.round(r.bottom), left: Math.round(r.left), right: Math.round(r.right) });
+      // (Outwards: a frame that starts half a pixel into a row paints part of
+      // that row, which must come from the same shot as the rest of it.)
+      out.push({ id: liveIds.get(el), kind, top: Math.floor(r.top), bottom: Math.ceil(r.bottom), left: Math.floor(Math.max(0, r.left)), right: Math.ceil(Math.min(vw, r.right)) });
+    };
+    document.querySelectorAll('canvas').forEach((el) => add(el, 'canvas'));
+    document.querySelectorAll('iframe, embed, object').forEach((el) => {
+      let reachable = false;
+      try { reachable = !!el.contentDocument; } catch (_) {}
+      if (!reachable) add(el, 'frame');
     });
+    for (const v of frozenVideos.keys()) if (v.isConnected && !v.paused) add(v, 'video');
+    // A small part that changes (a slider's dots, a line of text a demo
+    // types out, a counter) stands for the nearest box around it big enough
+    // to matter: the slider, the card.
+    // Slides that take turns (a crossfade gallery: each changes only as it
+    // comes in or goes out, and the hidden ones can't be seen) stand for
+    // what holds them once two of them have been seen changing.
+    const moving = new Set();
+    const siblings = new Map();
+    for (const el of restless) if (el.isConnected && el.parentElement) siblings.set(el.parentElement, (siblings.get(el.parentElement) || 0) + 1);
+    for (const el of restless) {
+      if (!el.isConnected) { restless.delete(el); continue; }
+      let box = siblings.get(el.parentElement) >= 2 ? el.parentElement : el;
+      for (let k = 0; box && box !== document.body && k < 8; k++, box = box.parentElement) {
+        const r = box.getBoundingClientRect();
+        if (r.width >= 100 && r.height >= 60) break;
+      }
+      if (!box || box === document.body || moving.has(box) || box.closest('[data-cleanshot-clone]')) continue;
+      moving.add(box);
+      add(box, 'moving');
+    }
     return out;
   }
 
@@ -1403,6 +1570,15 @@
     frozenVideos = new Map();
     pausedAnimations.forEach((anim) => anim.play());
     pausedAnimations = [];
+    clockHeld = false;
+    for (const { f, play, resume } of players) {
+      if (resume && f.isConnected) try { f.contentWindow.postMessage(play, '*'); } catch (_) {}
+    }
+    players = [];
+    if (restlessWatch) restlessWatch.disconnect();
+    restlessWatch = null;
+    restless = new Set();
+    changedOnce = new WeakMap();
     for (const el of pinned) {
       el.removeAttribute('data-cleanshot-hold');
       HOLD.forEach(([, css]) => el.style.removeProperty(`--cleanshot-${css}`));
@@ -1448,8 +1624,18 @@
     (async () => {
       try {
         if (msg.cmd === 'wake') {
-          sendResponse({ ok: true, ...await wakePage() });
+          // (Watched from once the page has settled after waking: what the
+          // woken scripts do as they start up is setting up, not a clock.)
+          const woke = await wakePage();
+          watchRestless();
+          sendResponse({ ok: true, ...woke });
+        } else if (msg.cmd === 'hold') {
+          clockHeld = true;
+          pauseClockAnimations();
+          pausePlayers();
+          sendResponse({ ok: true });
         } else if (msg.cmd === 'prepare') {
+          watchRestless();
           originalScrollY = scroller.scrollTop || window.scrollY || 0;
           unlockScroll();
           pauseLoopingAnimations();
@@ -1486,7 +1672,7 @@
         } else if (msg.cmd === 'tile') {
           covered = [];
           unlockScroll();
-          scroller.scrollTo(0, msg.y);
+          scrollPage(msg.y);
           await raf();
           await raf();
           await waitForVisibleImages();
@@ -1505,6 +1691,10 @@
           if (msg.index > 0) pinFirstScreen();
           applyFades();
           await freezeVideos();
+          if (clockHeld) {
+            pauseClockAnimations();
+            pausePlayers();
+          }
           await raf();
           await raf();
           // Report where we actually landed (bottom tile clamps short), how

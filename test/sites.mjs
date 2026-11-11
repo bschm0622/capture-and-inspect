@@ -707,6 +707,63 @@ export const SITES = [
         return result(!missing.length, missing.length, `${unmatched.length} unmatched seam(s), ${missing.length} without a warning`, missing.map((p) => ({ y0: Math.round(p.top), y1: Math.round(p.top) + 96, note: 'unmatched seam not warned' })));
       }
     }
+  },
+  {
+    // The reviews slider (a renamed slick) steps every second and restarts
+    // its own timer after each step. The capture holds the page's clock
+    // while it shoots (the generic seam check sees a slider caught in two
+    // positions) and must let it go afterwards: a page left frozen is a
+    // broken page for the visitor, and no pixel check can see that.
+    host: 'asebend.com',
+    url: 'https://asebend.com',
+    // (Sampled through 4s rather than compared once: it cycles through its
+    // positions in about 5s, so two looks 5s apart can match.)
+    collect: async () => {
+      const t = document.querySelector('.slickwprev-track');
+      if (!t) return { slider: null };
+      const seen = new Set();
+      for (let i = 0; i < 16; i++) {
+        seen.add(t.style.transform);
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      return { slider: { positions: [...seen] } };
+    },
+    checks: {
+      'clock-released'({ facts }) {
+        const s = facts.slider;
+        if (!s) return result(false, null, 'reviews slider not found on the page');
+        const n = s.positions.length;
+        return result(n > 1, n, n > 1
+          ? `the slider moved through ${n} positions in the 4s after the capture`
+          : `the slider stood still for 4s after the capture (${s.positions[0]})`);
+      }
+    }
+  },
+  {
+    // A testimonial slider on a timer the page set when it loaded, before
+    // the extension was there to hold it. It can't be stopped, so it must be
+    // shot whole, from one moment: no tile edge may cross it. Without that
+    // a seam through it passes or fails by luck, on whether the slide
+    // happened to change between the two shots.
+    host: 'taylorsway.com',
+    url: 'https://taylorsway.com',
+    collect: () => {
+      const v = document.querySelector('.tws-v');
+      if (!v) return { slider: null };
+      const r = v.getBoundingClientRect();
+      return { slider: { top: Math.round(r.top + scrollY), h: Math.round(r.height) } };
+    },
+    checks: {
+      'slider-in-one-shot'({ img, tiles, facts }) {
+        const s = facts.slider;
+        if (!s || s.h < 60) return result(false, null, 'testimonial slider not found on the page');
+        const cut = boundaries(tiles, img.H).filter((y) => y > s.top + 2 && y < s.top + s.h - 2);
+        return result(!cut.length, cut.length, cut.length
+          ? `tile edge(s) at y ${cut.join(', ')} cross the slider (y ${s.top}-${s.top + s.h})`
+          : `the slider (y ${s.top}-${s.top + s.h}) came from one shot`,
+        cut.map((y) => ({ y0: y - 8, y1: y + 8, note: 'tile edge through the timed slider' })));
+      }
+    }
   }
 ];
 
@@ -747,6 +804,8 @@ export const KNOWN = {
   'finishes-in-time': 'Overlaps never matched; every tile shot twice',
   'unmatched-seams-warned': 'Seams placed by position only were not reported',
   'sticky-heading-twice': 'Sticky column in a slightly taller container shown twice',
-  'fixed-background-seam': 'Fixed-attachment background showed a different part of the picture in each tile'
+  'fixed-background-seam': 'Fixed-attachment background showed a different part of the picture in each tile',
+  'clock-released': "Page left frozen after the capture: its slider didn't move again",
+  'slider-in-one-shot': 'Slider on a timer set at page load cut by a tile edge (two moments, or right only by luck)'
 };
 
