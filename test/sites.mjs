@@ -764,6 +764,54 @@ export const SITES = [
         cut.map((y) => ({ y0: y - 8, y1: y + 8, note: 'tile edge through the timed slider' })));
       }
     }
+  },
+  {
+    // The header sits in the page's flow at the top and a script makes its
+    // wrapper fixed once the page scrolls. Sorted then as a floating extra,
+    // it stayed hidden when the first tile was shot again, leaving the top
+    // 139px white. (The same script scrolls the page 139px past where it was
+    // asked; the generic seam and truncation checks catch what that did.)
+    host: 'www.icaboston.org',
+    url: 'https://www.icaboston.org',
+    collect: () => {
+      const h = [...document.querySelectorAll('header')].find((e) => { const r = e.getBoundingClientRect(); return r.height > 40 && r.top + scrollY < 60; });
+      if (!h) return { nav: null };
+      const r = h.getBoundingClientRect();
+      return { nav: { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) } };
+    },
+    checks: {
+      'fixed-nav-kept': navKept
+    }
+  },
+  {
+    // A column ("Our Symphony of Services") that an Elementor script turns
+    // `position: fixed` once the page scrolls to it, leaving a spacer in its
+    // place. It was hidden as a floating extra from that tile on, so its
+    // paragraph and button, below the tile edge, were never captured; the
+    // gap is too short for the blank-band check. Both must show ink.
+    host: 'terrenlandscapes.com',
+    url: 'https://terrenlandscapes.com',
+    collect: () => {
+      const R = (el) => { const r = el.getBoundingClientRect(); return { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; };
+      const head = [...document.querySelectorAll('h1, h2, h3, h4')].find((e) => /Symphony of Services/i.test(e.textContent));
+      const col = head && head.closest('section, .e-con');
+      if (!col) return { parts: null };
+      // (What follows the heading: dark text and a button's label.)
+      const below = head.getBoundingClientRect().bottom;
+      const parts = [...col.querySelectorAll('p, a')].filter((e) => e.getBoundingClientRect().top >= below && e.getBoundingClientRect().height > 10 && e.textContent.trim().length > 10)
+        .map((e) => ({ what: e.textContent.trim().slice(0, 30), ...R(e) }));
+      return { parts };
+    },
+    checks: {
+      'sticky-column-whole'({ img, facts }) {
+        const parts = facts.parts;
+        if (!parts || !parts.length) return result(false, null, 'the "Our Symphony of Services" column was not found on the page');
+        const levels = parts.map((p) => ({ p, ink: inkLevel(img, p) }));
+        const missing = levels.filter((l) => l.ink == null || l.ink > 160);
+        return result(!missing.length, missing.length, levels.map((l) => `"${l.p.what}" darkest marks ${l.ink}`).join('; ') + ' (missing over 160)',
+          missing.map((l) => ({ y0: l.p.top, y1: l.p.top + l.p.h, note: `"${l.p.what}" not in the capture` })));
+      }
+    }
   }
 ];
 
@@ -806,6 +854,7 @@ export const KNOWN = {
   'sticky-heading-twice': 'Sticky column in a slightly taller container shown twice',
   'fixed-background-seam': 'Fixed-attachment background showed a different part of the picture in each tile',
   'clock-released': "Page left frozen after the capture: its slider didn't move again",
-  'slider-in-one-shot': 'Slider on a timer set at page load cut by a tile edge (two moments, or right only by luck)'
+  'slider-in-one-shot': 'Slider on a timer set at page load cut by a tile edge (two moments, or right only by luck)',
+  'sticky-column-whole': 'Column a script makes sticky hidden as a floating extra: its text lost below a tile edge'
 };
 

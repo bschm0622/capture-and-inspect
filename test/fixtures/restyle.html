@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: a chat bubble that rewrites its own style</title>
+<!-- A floating chat bubble, fixed at the bottom right, that writes its whole
+     style attribute again every 150ms (some chat widgets set
+     `style="bottom:0px;position:fixed;…"` again whenever they reposition).
+     That wipes an inline hide. The timer is set at page load, before the
+     capture can hold the page's clock, so it keeps running through the
+     tiles. The bubble must not be in the capture. -->
+<style>html,body{margin:0}</style>
+<script src="bands.js"></script>
+<main id="m"></main>
+<div id="bubble"><b>Chat with us!</b><br>We reply fast</div>
+<script>
+  addBands(document.getElementById('m'), 0, 25);
+  const bubble = document.getElementById('bubble');
+  const STYLE = 'position:fixed;right:24px;bottom:24px;width:150px;height:150px;border-radius:75px;background:rgb(255,0,255);color:#fff;font:16px/22px sans-serif;text-align:center;padding-top:48px;box-sizing:border-box;z-index:99999';
+  bubble.setAttribute('style', STYLE);
+  setInterval(() => bubble.setAttribute('style', STYLE), 150);
+</script>

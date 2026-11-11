@@ -52,6 +52,24 @@ function bandsInPlace(img, { first = 0, top = 0, until = img.H } = {}) {
 
 const warned = (cap, kind) => (cap.warnings || []).filter((w) => w.kind === kind);
 
+// Rows of the capture where at least `min` grid columns show `rgb` (within
+// 24 levels a channel), merged into runs. The fixtures paint their floating
+// parts in colours no band ever has (bands keep each channel within 30-229).
+function rowsWith(img, rgb, { min = 6, y0 = 0, y1 = img.H } = {}) {
+  const runs = [];
+  for (let y = y0; y < Math.min(y1, img.H); y++) {
+    let n = 0;
+    for (let x = 0; x < img.W; x++) {
+      const j = (y * img.W + x) * 3;
+      if (Math.abs(img.rgb[j] - rgb[0]) <= 24 && Math.abs(img.rgb[j + 1] - rgb[1]) <= 24 && Math.abs(img.rgb[j + 2] - rgb[2]) <= 24) n++;
+    }
+    if (n < min) continue;
+    const r = runs[runs.length - 1];
+    if (r && y <= r.y1 + 1) r.y1 = y + 1; else runs.push({ y0: y, y1: y + 1 });
+  }
+  return runs;
+}
+
 export const FIXTURES = [
   {
     name: 'tall-40k', file: 'tall-40k.html',
@@ -131,6 +149,37 @@ export const FIXTURES = [
       // from its top: band 0 at y 0.
       'bands-in-place': ({ img }) => bandsInPlace(img),
       'full-height': ({ img }) => result(Math.abs(img.H - 5000) <= 2, img.H, `capture ${img.H}px for a 5000px page`)
+    }
+  },
+  {
+    name: 'restyle', file: 'restyle.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img),
+      // The chat bubble (magenta) rewrites its whole style attribute every
+      // 150ms; it must be hidden in every tile all the same.
+      'bubble-hidden': ({ img }) => {
+        const runs = rowsWith(img, [255, 0, 255]);
+        return result(runs.length === 0, runs.length, `${runs.length} place(s) in the capture show the chat bubble`,
+          runs.map((r) => ({ ...r, note: 'chat bubble in the capture' })));
+      }
+    }
+  },
+  {
+    name: 'late-header', file: 'late-header.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { top: 120 }),
+      // The header (dark blue) turns fixed once the page scrolls; it must be
+      // at the top of the capture, even when the first tile is shot again
+      // after it turned fixed, and nowhere else.
+      'header-once-at-top': ({ img, cap }) => {
+        const runs = rowsWith(img, [20, 40, 160], { min: 60 });
+        const top = runs.find((r) => r.y0 <= 2 && r.y1 >= 110);
+        const elsewhere = runs.filter((r) => r !== top);
+        const reshot = (cap.placements || []).some((p) => p.reshot && p.index === 0);
+        return result(!!top && !elsewhere.length && reshot, runs.length,
+          `${top ? 'header at the top' : 'no header at the top'}; ${elsewhere.length} other place(s) show it; first tile ${reshot ? 'shot again' : 'not shot again (the path this fixture is for did not run)'}`,
+          [...(top ? [] : [{ y0: 0, y1: 120, note: 'header missing from the top' }]), ...elsewhere.map((r) => ({ ...r, note: 'header repeated' }))]);
+      }
     }
   }
 ];

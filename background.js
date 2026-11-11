@@ -346,6 +346,14 @@ async function stitchTiles(tab, info) {
   let cursor = 0;  // canvas rows painted so far, top down (output px)
   let offset = 0;  // capture y minus page y of the content at the seam (CSS px)
   let minH = pageHeight, maxH = pageHeight;
+  // The offset was last set from the scroll position alone (the page
+  // couldn't say how far its content moved): a guess, until a pixel match
+  // confirms it. www.icaboston.org's header script scrolls the page 139px
+  // past where it was asked without moving any content; read as content
+  // that moved, that put every later tile 139px too high, and since the
+  // page then said nothing moved, the overlap match that saw it could
+  // correct no more than FIRM_REACH.
+  let guessed = false;
   let shots = 0, retakes = 0;
   let lift = 0;    // extra CSS px to shoot higher on a retake after a failed match
   let liftMisses = 0; // lifted shots in a row whose overlap matched nowhere either
@@ -413,7 +421,7 @@ async function stitchTiles(tab, info) {
     if (!res || !res.ok) throw new Error(res && res.error || 'tile failed');
     // The page's own account of whether it moved since the last shot: the
     // drift is measured from the anchors that shot noted.
-    const unmoved = res.drift != null && lastRes != null && Math.abs(res.pageHeight - lastRes.pageHeight) < 1;
+    const unmoved = !guessed && res.drift != null && lastRes != null && Math.abs(res.pageHeight - lastRes.pageHeight) < 1;
     lastRes = res;
     minH = Math.min(minH, res.pageHeight);
     maxH = Math.max(maxH, res.pageHeight);
@@ -426,7 +434,7 @@ async function stitchTiles(tab, info) {
     // the scroll position: when a header shrinks once the page scrolls,
     // Chrome moves the scroll to keep the same content in view.
     if (res.drift != null) offset -= res.drift;
-    else if (res.actualY !== wantY && !atBottom) offset += wantY - res.actualY;
+    else if (res.actualY !== wantY && !atBottom) { offset += wantY - res.actualY; guessed = true; }
     let top = res.actualY + offset;
 
     // The content moved up past the seam since the last tile, so this shot
@@ -483,6 +491,7 @@ async function stitchTiles(tab, info) {
       match = placeTile(grid, gw, seam, top, tileGrid, tileH, unheld, unmoved ? FIRM_REACH : reach);
       if (lift && match.match === 'mismatch') liftMisses++;
       else if (!lift && match.match !== 'mismatch' && match.match !== 'flat' && match.match !== 'none') liftMisses = 0;
+      if (match.match === 'ok' || match.match === 'moved') guessed = false;
       if (match.match === 'moved') {
         top = match.top;
         offset = top - res.actualY;

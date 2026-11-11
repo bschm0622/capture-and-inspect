@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: a header that turns fixed once the page scrolls</title>
+<!-- The site's header sits in the page's flow at the top (120px, dark blue)
+     and turns fixed once the page is scrolled past 100px, as "sticky on
+     scroll" headers do (a spacer keeps the content where it was). The
+     capture should show it once, at the top, and nowhere else.
+     To make the worker shoot the first tile again after the header has
+     turned fixed, the lines of band 3 (in the rows the first two tiles
+     share) are rewritten on the capture's first tile step, a scroll of
+     exactly 772px from the top; the pre-scroll moves 868px at a time and
+     never does that. The two shots then disagree there, and the first tile
+     is reshot at scroll 0, where the header is back in the page's flow. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  #hd{height:120px;background:rgb(20,40,160);color:#fff;font:18px/120px sans-serif;display:flex;gap:32px;padding-left:24px;box-sizing:border-box;width:100%;top:0;left:0;z-index:50}
+  #hd a{color:#fff}
+  body.stuck #hd{position:fixed}
+  body.stuck{padding-top:120px}
+</style>
+<script src="bands.js"></script>
+<header id="hd"><b>Company</b><nav><a href="#a">About</a> <a href="#b">Services</a> <a href="#c">Contact</a></nav></header>
+<main id="m"></main>
+<script>
+  const m = document.getElementById('m');
+  addBands(m, 0, 25);
+  let lastY = 0, changed = false;
+  addEventListener('scroll', () => {
+    document.body.classList.toggle('stuck', scrollY > 100);
+    if (!changed && scrollY === 772 && lastY === 0) {
+      changed = true;
+      m.children[3].querySelectorAll('div').forEach((d) => { d.textContent = d.textContent.split(' ').reverse().join(' '); });
+    }
+    lastY = scrollY;
+  });
+</script>

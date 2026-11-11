@@ -42,6 +42,7 @@
   let anchors = [];              // [{el, y}] page content seen in the last tile, and where it sat
   let covered = [];              // screen rects of overlays hidden during this tile
   let clockHeld = false;         // the worker has stopped the page's clock (background.js pageClock)
+  let flowBoxes = new Map();     // element -> {top, left, width} in the page's flow, until first seen fixed (null after)
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
@@ -97,6 +98,9 @@
       [data-cleanshot-unstick] { position: relative !important; inset: auto !important; }
       [data-cleanshot-keep] { height: var(--cleanshot-height) !important; min-height: 0 !important; max-height: none !important; }
       [data-cleanshot-fade] { opacity: var(--cleanshot-op) !important; }
+      [data-cleanshot-fade-tf] { transform: var(--cleanshot-tf) !important; translate: var(--cleanshot-tr) !important; }
+      [data-cleanshot-hide] { visibility: hidden !important; opacity: 0 !important; }
+      [data-cleanshot-inflow] { position: absolute !important; top: var(--cleanshot-top) !important; left: var(--cleanshot-left) !important; right: auto !important; bottom: auto !important; width: var(--cleanshot-width) !important; margin: 0 !important; }
       [data-cleanshot-probe] { transition: none !important; }
       [data-cleanshot-parallax] { position: absolute !important; transform: none !important; }
       [data-cleanshot-parallax] > * { transform: none !important; }
@@ -504,15 +508,29 @@
           if (!backdrops.has(el)) backdrops.set(el, new Set());
           backdrops.get(el).add(cs.backgroundColor);
         }
+        // Fixed from the first look on: never in the flow. Seen in it
+        // before: that place is kept.
+        const box = flowBoxes.get(el);
+        if (!box) flowBoxes.set(el, null);
+        else box.frozen = true;
+      } else if (r.width > 0 && r.height > 0 && el instanceof HTMLElement &&
+        (!flowBoxes.has(el) || (flowBoxes.get(el) && !flowBoxes.get(el).frozen))) {
+        // Where it sits in the page's flow, for as long as it hasn't been
+        // seen fixed (see placeInFlow).
+        flowBoxes.set(el, { top: r.top + scroller.scrollTop, left: r.left, width: el.offsetWidth });
       }
       const near = r.height > 0 && r.bottom > -vh / 2 && r.top < vh * 1.5;
       const op = Number(cs.opacity);
       const f = fades.get(el);
+      // An entrance usually moves as well as fades (AOS's fade-right slides
+      // 100px in while it turns opaque), so where it sits at its most
+      // visible is noted too: that is where it arrives.
       if (!f) {
-        fades.set(el, { min: op, max: op, last: op, near, linked: false });
+        fades.set(el, { min: op, max: op, last: op, near, linked: false, tf: [cs.transform, cs.translate] });
       } else {
         if (Math.abs(op - f.last) > 0.01 && (near || f.near)) f.linked = true;
         f.min = Math.min(f.min, op);
+        if (op > f.max + 0.01) f.tf = [cs.transform, cs.translate];
         f.max = Math.max(f.max, op);
         f.last = op;
         f.near = near;
@@ -536,7 +554,7 @@
         seen = stops.map((y) => [y, ['none', 'none', 'none', '0% 0%', '50% 50%']]);
         scrollLinked.set(el, seen);
       }
-      seen.push([scroller.scrollTop, v]);
+      seen.push([scroller.scrollTop, v, r.height > 0 && r.bottom > 0 && r.top < vh]);
     });
     if (!fadesOnly) stops.push(scroller.scrollTop);
   }
@@ -574,35 +592,45 @@
   // boulderlanddesign.com's service images) was caught part-way. So go
   // there and read it once it holds still: an eased parallax has arrived, a
   // reveal has finished. Elements whose resting places are close share a
-  // visit. Sideways movement is left to the page, since that's a carousel
-  // or marquee rather than parallax. Elements on the first screen are
+  // visit. Sideways movement is held only once the scroll is shown to drive
+  // it (see below), since it is usually a carousel or marquee rather than
+  // parallax. Elements on the first screen are
   // already held at scroll 0; the inside of an SVG (Lottie runs on a clock)
   // and anything that floats over the page are left alone.
   async function holdScrollLinked() {
     const vh = window.innerHeight;
     const maxScroll = Math.max(0, scroller.scrollHeight - vh);
-    const todo = [];
+    const todo = [], sidewaysTodo = [];
     for (const [el, samples] of scrollLinked) {
       if (firstScreen.has(el) || !el.isConnected || samples.length < 3) continue;
       if (el.closest('svg') || pinnedToScreen(el) || el.closest('[data-cleanshot-filmed]')) continue;
       const sideways = new Set(samples.map(([, v]) => Math.round(matrixOf(v[0]).m41))).size > 1;
       const sidewaysT = new Set(samples.map(([, v]) => translateX(v[1]))).size > 1;
-      const props = HOLD.map((_, k) => k).filter((k) => new Set(samples.map(([, v]) => v[k])).size >= 3 &&
+      const values = (k) => new Set(samples.map(([, v]) => v[k])).size;
+      const changing = (k) => values(k) >= 3;
+      const props = HOLD.map((_, k) => k).filter((k) => changing(k) &&
         !(k === 0 && sideways) && !(k === 1 && sidewaysT));
-      if (!props.length) continue;
+      // Seen at only two values: a reveal that played once, or a scroll
+      // effect the page updates a moment after each scroll, which the
+      // pre-scroll's short stops caught late (r-o.com's footer scene of
+      // parallax layers and a crane changed only at the last stop). One that
+      // changed between two stops it was on screen at both times is put to
+      // the test below with the sideways ones.
+      const whileShown = (k) => samples.some(([, v, on], i) => i > 0 && on && samples[i - 1][2] && v[k] !== samples[i - 1][1][k]);
+      const side = HOLD.map((_, k) => k).filter((k) => !props.includes(k) &&
+        ((changing(k) && (k === 0 ? sideways : sidewaysT)) || (values(k) === 2 && whileShown(k))));
+      if (!props.length && !side.length) continue;
       // (Its layout height too: its own transform can scale what's drawn.)
       const h = el instanceof HTMLElement ? el.offsetHeight : el.getBoundingClientRect().height;
       const rest = Math.min(maxScroll, Math.max(0, layoutTop(el) + h / 2 - vh / 2));
-      todo.push({ el, props, rest });
+      if (props.length) todo.push({ el, props, rest });
+      if (side.length) sidewaysTodo.push({ el, props: side, rest });
     }
     scrollLinked = new Map();
-    todo.sort((a, b) => a.rest - b.rest);
     const NEAR = 60, VISITS = 40, WAIT_MS = 2500;
-    const t0 = performance.now();
-    for (let i = 0, visits = 0; i < todo.length && visits < VISITS && performance.now() - t0 < 15000; visits++) {
-      const group = [];
-      while (i < todo.length && todo[i].rest - todo[group.length ? i - group.length : i].rest <= NEAR) group.push(todo[i++]);
-      scroller.scrollTo(0, group[0].rest + (group[group.length - 1].rest - group[0].rest) / 2);
+    // Go to y and read the group's properties once they hold still.
+    const settled = async (y, group) => {
+      scroller.scrollTo(0, y);
       await raf();
       await raf();
       const read = () => group.map(({ el, props }) => {
@@ -617,9 +645,45 @@
         last = now;
         if (still && t >= 100) break;
       }
+      return last;
+    };
+    const groups = (list) => {
+      list.sort((a, b) => a.rest - b.rest);
+      const out = [];
+      for (let i = 0; i < list.length;) {
+        const group = [];
+        while (i < list.length && list[i].rest - list[group.length ? i - group.length : i].rest <= NEAR) group.push(list[i++]);
+        out.push({ group, at: group[0].rest + (group[group.length - 1].rest - group[0].rest) / 2 });
+      }
+      return out;
+    };
+    const t0 = performance.now();
+    let visits = 0;
+    for (const { group, at } of groups(todo)) {
+      if (visits++ >= VISITS || performance.now() - t0 >= 15000) break;
+      const last = await settled(at, group);
       group.forEach(({ el, props }, g) => props.forEach((k, j) => hold(el, k, last[g][j])));
     }
-    if (!todo.length) return;
+    // Sideways movement is usually a carousel or a marquee, which runs on
+    // the clock. But a scroll effect can slide sideways too
+    // (www.pissetzkylaw.com's Divi column slides in 98px as the page
+    // scrolls to it, and two tiles caught its photo at two offsets). Told
+    // apart by asking the scroll: the same value at its resting place each
+    // time it is visited, and another a third of a screen further, is the
+    // scroll's doing; a clock's motion doesn't come back, and a reveal that
+    // has played stays where it is. Held then.
+    const T1 = performance.now();
+    for (const { group, at } of groups(sidewaysTodo)) {
+      if (visits >= VISITS || performance.now() - t0 >= 15000 || performance.now() - T1 >= 6000) break;
+      visits += 3;
+      const a = await settled(at, group);
+      const b = await settled(at + (at + vh / 3 <= maxScroll ? vh / 3 : -vh / 3), group);
+      const a2 = await settled(at, group);
+      group.forEach(({ el, props }, g) => props.forEach((k, j) => {
+        if (steady(a[g][j], a2[g][j]) && !steady(a[g][j], b[g][j])) hold(el, k, a2[g][j]);
+      }));
+    }
+    if (!todo.length && !sidewaysTodo.length) return;
     // Back at the top, the first screen's own eased parallax takes a moment
     // to return to where it was recorded, which the first tile shows live.
     scroller.scrollTo(0, 0);
@@ -639,7 +703,7 @@
     for (const [el, f] of fades) {
       if (!f.linked || f.max - f.min < 0.05 || !el.isConnected) continue;
       if (!(el instanceof HTMLElement) || el.closest('svg') || pinnedToScreen(el)) continue;
-      list.push({ el, max: f.max, r: el.getBoundingClientRect() });
+      list.push({ el, max: f.max, tf: f.tf, r: el.getBoundingClientRect() });
     }
     fades = new Map();
     const area = (r) => Math.max(0, r.width) * Math.max(0, r.height);
@@ -650,7 +714,7 @@
       return w > 0 && h > 0 && w * h > 0.5 * Math.min(area(a.r), area(b.r));
     };
     held = list.filter((a) => !list.some((b) => b !== a && stacked(a, b)))
-      .map(({ el, max }) => ({ el, max }));
+      .map(({ el, max, tf }) => ({ el, max, tf }));
   }
 
   // Before each tile, let go of the holds and read where the page has each
@@ -661,20 +725,33 @@
   // writing inline opacity. Transitions are off while this happens: letting
   // go would otherwise start one, and the value read back would be where it
   // starts, the held one.
+  // Its place is held with it: an entrance that moves as it fades
+  // (newmanroofing.com's AOS `fade-right`, with `once: false`, starts again
+  // whenever the element is below AOS's trigger line, the bottom 120px of
+  // the screen) was otherwise held opaque at its starting place, 100px to
+  // the side, and the tile below drew the rest of it where it belongs.
   function applyFades() {
     if (!held.length) return;
     held.forEach((h) => {
       h.el.setAttribute('data-cleanshot-probe', '');
       h.el.removeAttribute('data-cleanshot-fade');
+      h.el.removeAttribute('data-cleanshot-fade-tf');
     });
-    const now = held.map((h) => Number(getComputedStyle(h.el).opacity));
+    const css = held.map((h) => getComputedStyle(h.el));
+    const now = css.map((cs) => Number(cs.opacity));
     held.forEach((h, k) => {
       if (now[k] >= h.max - 0.01) {
         h.max = Math.max(h.max, now[k]);
+        h.tf = [css[k].transform, css[k].translate];
         return;
       }
       h.el.style.setProperty('--cleanshot-op', String(h.max));
       h.el.setAttribute('data-cleanshot-fade', '');
+      if (h.tf && (h.tf[0] !== css[k].transform || h.tf[1] !== css[k].translate)) {
+        h.el.style.setProperty('--cleanshot-tf', h.tf[0]);
+        h.el.style.setProperty('--cleanshot-tr', h.tf[1]);
+        h.el.setAttribute('data-cleanshot-fade-tf', '');
+      }
     });
     held.forEach((h) => getComputedStyle(h.el).opacity);
     held.forEach((h) => h.el.removeAttribute('data-cleanshot-probe'));
@@ -852,6 +929,88 @@
     layer.style.setProperty('top', `${gap.top + gap.size / 2 - vh / 2 - placed}px`, 'important');
   }
 
+  // A full-screen backdrop behind the first screen (www.maggioroofing.com's
+  // `ul.cb-slideshow`, a fixed crossfading slideshow) is shown in the first
+  // tile and hidden after, so a section that shows it and runs on past the
+  // first screen (that hero is 901px tall in an 868px window) shows the
+  // page's background in its last rows. A visitor scrolling down sees the
+  // backdrop through every part of that section in turn, so it is laid
+  // over the section, from the top of the page to where it stops showing
+  // through, and stays there for every tile. Measured at the stack under
+  // nine points across each row below the first screen: the backdrop shows
+  // where nothing opaque (a background colour, a picture, an image or
+  // video) lies over it. One that shows through for a screen and a half or
+  // more is the whole page's background, not a section's, and is left as
+  // it is.
+  async function extendBackdrops() {
+    const vw = document.documentElement.clientWidth;
+    const vh = window.innerHeight;
+    // (The root's background is painted under everything, and so is body's
+    // when html has none and body's is painted for it.)
+    const rootBg = getComputedStyle(document.documentElement);
+    const bodyLifted = rootBg.backgroundImage === 'none' && /rgba\(.*,\s*0\)|transparent/.test(rootBg.backgroundColor);
+    const opaque = (e) => {
+      if (e === document.documentElement || (e === document.body && bodyLifted)) return false;
+      if (/^(IMG|VIDEO|CANVAS|IFRAME|PICTURE|OBJECT|EMBED)$/.test(e.tagName)) return true;
+      const cs = getComputedStyle(e);
+      if (cs.visibility === 'hidden' || Number(cs.opacity) < 0.5) return false;
+      if (/url\(/.test(cs.backgroundImage)) return true;
+      const a = cs.backgroundColor.match(/rgba?\(([^)]*)\)/);
+      const parts = a ? a[1].split(/[,\s/]+/).filter(Boolean) : [];
+      return parts.length >= 3 && (parts.length < 4 || Number(parts[3]) >= 0.95);
+    };
+    for (const [el, role] of overlays) {
+      if (role !== 'backdrop' || !el.isConnected || !(el instanceof HTMLElement)) continue;
+      const r0 = el.getBoundingClientRect();
+      if (r0.width < vw * 0.9 || r0.height < vh * 0.9 || r0.top > 1) continue;
+      // (With the rows looked at in the middle of the screen, clear of the
+      // site's header; whatever else floats over the page is looked through.)
+      scroller.scrollTo(0, vh / 2);
+      await raf();
+      const y0 = scroller.scrollTop;
+      if (y0 < vh / 2 - 1) break;
+      const shows = (pageY) => {
+        for (let fx = 0.05; fx < 1; fx += 0.1125) {
+          const over = [];
+          for (const e of document.elementsFromPoint(vw * fx, pageY - y0)) {
+            if (e === el || el.contains(e)) { through = over; return true; }
+            if (opaque(e) && !pinnedToScreen(e)) break;
+            over.push(e);
+          }
+        }
+        return false;
+      };
+      let through = [];
+      const limit = Math.round(y0 + vh - 1);
+      let end = vh;
+      while (end < limit && shows(end)) end += 2;
+      // The last rows can show only in a corner narrower than the points
+      // are apart (a hero cut by a diagonal): up to the bottom of the box
+      // it shows through, when that is just below.
+      for (const e of through) {
+        const b = Math.ceil(e.getBoundingClientRect().bottom + y0);
+        if (e !== document.body && b > end && b <= end + 24 && b < limit) end = b;
+      }
+      scroller.scrollTo(0, 0);
+      await raf();
+      // Still showing a screen and a half down: the page's background.
+      if (end <= vh + 2 || end >= limit) continue;
+      unwrapped.push({ el, style: el.getAttribute('style') });
+      el.setAttribute('data-cleanshot-probe', '');
+      el.style.setProperty('position', 'absolute', 'important');
+      el.style.setProperty('inset', '0 0 auto 0', 'important');
+      el.style.setProperty('width', '100%', 'important');
+      el.style.setProperty('height', `${end}px`, 'important');
+      el.style.setProperty('transform', 'none', 'important');
+      const placed = el.getBoundingClientRect().top + scroller.scrollTop;
+      if (Math.abs(placed) > 0.5) el.style.setProperty('top', `${-placed}px`, 'important');
+      getComputedStyle(el).top;
+      el.removeAttribute('data-cleanshot-probe');
+      overlays.set(el, 'content');
+    }
+    scroller.scrollTo(0, 0);
+  }
+
   // Scroll through the whole page (top→bottom) once to trigger
   // IntersectionObserver reveals and lazy-loading before real capture.
   //
@@ -880,10 +1039,14 @@
       sampleScrollEffects();
     }
     // One extra stop at the very bottom, looked at twice: fades started by
-    // the last few stops are still running when the first look comes.
+    // the last few stops are still running when the first look comes. The
+    // first look counts for placement too when the page ends short of a
+    // whole stop: a footer scene on screen at only two stops before it
+    // (r-o.com's layered parallax) was otherwise seen in too few places
+    // to be held, now and then.
     scroller.scrollTo(0, h);
     await sleep(120);
-    sampleScrollEffects(true);
+    sampleScrollEffects(Math.abs(scroller.scrollTop - stops[stops.length - 1]) < 1);
     await sleep(300);
     sampleScrollEffects(true);
     scroller.scrollTo(0, 0);
@@ -1052,10 +1215,27 @@
   // scroll" header, a chat bubble that slid in, a popup on a timer, or a
   // content section pinned while the rest scrolls past. Only the last is
   // part of the page: tall, wide and not a dialog or a scrim.
+  // The header that turns fixed on scroll sat in the page's flow at the top
+  // when the visitor arrived, where the first tile shows it: it is the
+  // site's header, like one fixed from the start, kept in the first tile and
+  // hidden after. Known by sitting at the top of the screen and holding the
+  // site's navigation, so a promo bar that slides in up there stays extra.
+  //
+  // One the pre-scroll saw in the page's flow before it turned fixed (a
+  // header or a column a script makes sticky: terrenlandscapes.com's
+  // Elementor "Our Symphony of Services" column turns `position: fixed`
+  // once scrolled to, and was hidden with the extras, its lower half lost)
+  // is page content the page pins while it is read: 'flow', put back where
+  // the page had it (see placeInFlow).
   function lateRole(el) {
     const r = screenBox(el);
+    if (el.matches(DIALOG) || isScrimOrDialog(el)) return 'extra';
     const tall = r.height >= window.innerHeight * 0.6 && r.width >= document.documentElement.clientWidth * 0.5;
-    return tall && !el.matches(DIALOG) && !isScrimOrDialog(el) ? 'content' : 'extra';
+    if (tall) return 'content';
+    if (flowBoxes.get(el)) return 'flow';
+    if (r.top <= 150 && r.top > -r.height && r.height < window.innerHeight * 0.6 &&
+      (el.matches(NAV) || el.querySelector(NAV) || el.querySelectorAll('a[href]').length >= 3)) return 'nav';
+    return 'extra';
   }
 
   // Sort every fixed element on screen that hasn't been sorted yet. At scroll
@@ -1107,34 +1287,101 @@
   // The worker can ask for the first tile again (to reshoot it next to the
   // second when the two disagree), so at index 0 the header and the rest
   // that only later tiles hide are shown again.
+  //
+  // Hidden through the stylesheet as well, by an attribute: a widget that
+  // writes its whole style attribute again (shiftelectricco.com's chat
+  // bubble sets `style="bottom:0px;position:fixed;…"` a few seconds after it
+  // mounts) wipes an inline hide, and the bubble came back in every later
+  // tile. The inline one stays for a widget that sets visibility or opacity
+  // inline with !important of its own. Each tile checks again that what it
+  // hid is still hidden.
+  function unhide(h) {
+    h.el.removeAttribute('data-cleanshot-hide');
+    // Only what the hide wrote: the page may have rewritten the style since.
+    const ours = (p, v) => h.el.style.getPropertyPriority(p) === 'important' && h.el.style.getPropertyValue(p) === v;
+    if (ours('visibility', 'hidden')) {
+      if (h.prev) h.el.style.setProperty('visibility', h.prev);
+      else h.el.style.removeProperty('visibility');
+    }
+    if (ours('opacity', '0')) {
+      if (h.prevOpacity) h.el.style.setProperty('opacity', h.prevOpacity);
+      else h.el.style.removeProperty('opacity');
+    }
+  }
+
+  // Where the page has it fixed now, put it back where the pre-scroll saw
+  // it in the page's flow, through the stylesheet (the page's script keeps
+  // writing `position: fixed` inline). Where the page has it in flow
+  // itself (at the top again, for a header), it is left alone. The script
+  // usually leaves a spacer where it was, so it goes back over that, out of
+  // the flow: put back in the flow it would take the space twice.
+  let inflow = new Set();
+  function placeInFlow(el) {
+    // (Transitions off meanwhile, or the box read back is where a 1ms
+    // transition from the old place starts.)
+    const box = flowBoxes.get(el);
+    el.setAttribute('data-cleanshot-probe', '');
+    el.removeAttribute('data-cleanshot-inflow');
+    if (box && el.isConnected && getComputedStyle(el).position === 'fixed') {
+      el.style.setProperty('--cleanshot-top', '0px');
+      el.style.setProperty('--cleanshot-left', '0px');
+      el.style.setProperty('--cleanshot-width', `${box.width}px`);
+      el.setAttribute('data-cleanshot-inflow', '');
+      const r = el.getBoundingClientRect();
+      el.style.setProperty('--cleanshot-top', `${box.top - (r.top + scroller.scrollTop)}px`);
+      el.style.setProperty('--cleanshot-left', `${box.left - r.left}px`);
+      getComputedStyle(el).top;
+      inflow.add(el);
+    }
+    el.removeAttribute('data-cleanshot-probe');
+  }
+
   function hideOverlays(index) {
     const vh = window.innerHeight;
     if (index === 0) {
       hiddenEls = hiddenEls.filter((h) => {
         if (!h.later) return true;
-        if (h.prev) h.el.style.setProperty('visibility', h.prev);
-        else h.el.style.removeProperty('visibility');
-        if (h.prevOpacity) h.el.style.setProperty('opacity', h.prevOpacity);
-        else h.el.style.removeProperty('opacity');
+        unhide(h);
         return false;
       });
     }
     const hide = (el, later) => {
-      if (hiddenEls.some((h) => h.el === el)) return;
-      const cs = getComputedStyle(el);
-      if (cs.visibility === 'hidden' || cs.display === 'none') return;
+      const known = hiddenEls.find((h) => h.el === el);
+      if (!known) {
+        const cs = getComputedStyle(el);
+        if (cs.visibility === 'hidden' || cs.display === 'none') return;
+      }
       // Where it sat on screen: the last tile showed it there, this one
       // won't, so the worker leaves that area out when it lines them up.
+      // (One already hidden that the page showed again counts too.)
       const r = el.getBoundingClientRect();
-      if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < vh) {
+      const showing = !known || (getComputedStyle(el).visibility !== 'hidden' && Number(getComputedStyle(el).opacity) > 0);
+      if (showing && r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < vh) {
         covered.push({ top: Math.round(r.top), bottom: Math.round(r.bottom), left: Math.round(r.left), right: Math.round(r.right) });
       }
-      hiddenEls.push({ el, later, prev: el.style.visibility, prevOpacity: el.style.opacity });
+      if (!known) hiddenEls.push({ el, later, prev: el.style.visibility, prevOpacity: el.style.opacity });
+      el.setAttribute('data-cleanshot-hide', '');
       el.style.setProperty('visibility', 'hidden', 'important');
       el.style.setProperty('opacity', '0', 'important');
     };
     sortOverlays(index === 0);
     for (const [el, role] of overlays) {
+      if (role === 'flow') {
+        const h = hiddenEls.find((x) => x.el === el);
+        if (h) { unhide(h); hiddenEls = hiddenEls.filter((x) => x !== h); }
+        placeInFlow(el);
+        continue;
+      }
+      // Sorted because it was fixed, and back in the page's flow now: part
+      // of the page here, whatever it was before (a header that turns fixed
+      // only once the page scrolls, back at scroll 0 when the worker shoots
+      // the first tile again: emcocooling.com and icaboston.org lost their
+      // headers from the top of the capture that way).
+      if (/^(static|relative)$/.test(getComputedStyle(el).position)) {
+        const h = hiddenEls.find((x) => x.el === el);
+        if (h) { unhide(h); hiddenEls = hiddenEls.filter((x) => x !== h); }
+        continue;
+      }
       if (role === 'extra') hide(el, false);
       else if (index > 0 && role !== 'content') hide(el, true);
     }
@@ -1366,9 +1613,30 @@
         const pt = /calc/.test(at(pos, i)) ? ['50%', '50%'] : at(pos, i).split(/\s+/);
         const px = pt[0].endsWith('%') ? (vw - w) * parseFloat(pt[0]) / 100 : parseFloat(pt[0]) || 0;
         const py = (pt[1] || '50%').endsWith('%') ? (vh - h) * parseFloat(pt[1] || '50') / 100 : parseFloat(pt[1]) || 0;
+        let x = px - left, yy = rest + py - top;
+        // A section taller (or wider) than what that leaves covered: a
+        // visitor scrolling through it sees the picture behind every part
+        // of it in turn, but one window's worth of picture, placed for the
+        // section centred, leaves its top and bottom bare
+        // (schlueterplumbing.com's 1269px services section: 200px of white
+        // over its white "PLUMBING SERVICES" heading). Grow the picture
+        // until it covers the section, about the same centre. A picture
+        // that repeats in that direction has no bare part to cover.
+        const rep = at(layers(cs.backgroundRepeat), i).split(/\s+/);
+        const repX = !/no-repeat/.test(rep[0]) && !/^repeat-y$/.test(rep[0]);
+        const repY = !/no-repeat/.test(rep[rep.length - 1]) && !/^repeat-x$/.test(rep[0]);
+        const bareX = !repX && (x > 0.5 || x + w < r.width - 0.5);
+        const bareY = !repY && (yy > 0.5 || yy + h < r.height - 0.5);
+        if ((bareX || bareY) && w > 0 && h > 0 && w >= vw - 1 && h >= vh - 1) {
+          const s = Math.max(1, r.width / w, r.height / h);
+          const cx = x + w / 2, cy = yy + h / 2;
+          w *= s; h *= s;
+          x = Math.min(0, Math.max(r.width - w, cx - w / 2));
+          yy = Math.min(0, Math.max(r.height - h, cy - h / 2));
+        }
         out.att.push('scroll');
         out.size.push(`${w}px ${h}px`);
-        out.pos.push(`${px - left}px ${rest + py - top}px`);
+        out.pos.push(`${x}px ${yy}px`);
       }
       unwrapped.push({ el, style: el.getAttribute('style') });
       el.style.setProperty('background-attachment', out.att.join(', '), 'important');
@@ -1455,10 +1723,12 @@
 
   // How far the content noted on the last tile has moved since, in page px
   // (positive: it moved down). Null when too few pieces agree to trust.
+  // A piece pinned to the screen since (a column a script made sticky) left
+  // the page's flow; where it went says nothing about the content.
   function measureDrift() {
     const y = scroller.scrollTop;
     const deltas = anchors
-      .filter((a) => a.el.isConnected)
+      .filter((a) => a.el.isConnected && !pinnedToScreen(a.el))
       .map((a) => ({ a, r: a.el.getBoundingClientRect() }))
       .filter(({ r }) => r.height > 0)
       .map(({ a, r }) => r.top + y - a.y)
@@ -1557,13 +1827,14 @@
       else el.setAttribute('style', style);
     }
     unwrapped = [];
-    for (const { el, prev, prevOpacity } of hiddenEls) {
-      if (prev) el.style.setProperty('visibility', prev);
-      else el.style.removeProperty('visibility');
-      if (prevOpacity) el.style.setProperty('opacity', prevOpacity);
-      else el.style.removeProperty('opacity');
-    }
+    hiddenEls.forEach(unhide);
     hiddenEls = [];
+    for (const el of inflow) {
+      el.removeAttribute('data-cleanshot-inflow');
+      ['--cleanshot-top', '--cleanshot-left', '--cleanshot-width'].forEach((p) => el.style.removeProperty(p));
+    }
+    inflow = new Set();
+    flowBoxes = new Map();
     for (const [v, { wasPlaying }] of frozenVideos) {
       if (wasPlaying) v.play().catch(() => {});
     }
@@ -1596,8 +1867,11 @@
     stops = [];
     for (const { el } of held) {
       el.removeAttribute('data-cleanshot-fade');
+      el.removeAttribute('data-cleanshot-fade-tf');
       el.removeAttribute('data-cleanshot-probe');
       el.style.removeProperty('--cleanshot-op');
+      el.style.removeProperty('--cleanshot-tf');
+      el.style.removeProperty('--cleanshot-tr');
     }
     held = [];
     scrollLinked = new Map();
@@ -1651,6 +1925,7 @@
           placeRevealedBackdrop();
           findStickyHeaders(); // measured at scroll 0, after preScroll settles
           sortOverlays(true);
+          await extendBackdrops();
           await settleAtTop();
           recordFirstScreen();
           await holdScrollLinked();
