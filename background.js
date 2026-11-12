@@ -1150,6 +1150,15 @@ function stopCarousels() {
 // those were held), so it runs for HOLD_AFTER_MS from its own start before
 // it is kept back too. A slider's next step is asked for from inside its
 // last one, so it belongs to the old chain and stays held.
+// A chain that writes numbers into the page's text is the exception: a
+// statistic counting up to its value as it comes into view. Held, it shows
+// a number it was only passing through (www.calldad.com's "75,000+
+// customers" came out as 66,875+, rodanbuilders.com's 1,585 projects as
+// 227: both start counting at the pre-scroll's stop and were held at the
+// end of the grace). It runs on until it stops, up to COUNT_MS from its
+// start, so a live ticker is still held in the end, and the page side asks
+// with 'cleanshot-counts' before each shot, and waits, while one on screen
+// is still counting.
 // 'release' puts the page's functions back and runs what was held, so the
 // page carries on as if it had only been paused.
 //
@@ -1185,6 +1194,9 @@ function stopCarousels() {
 function pageClock(cmd, graceMs, afterMs) {
   const KEY = '__cleanShotClock';
   const LONG_MS = 1000;
+  const COUNT_MS = 10000;
+  // A counting chain that hasn't written a number for this long has stopped.
+  const COUNT_IDLE_MS = 300;
   let S = window[KEY];
   const now = () => performance.now();
   if (cmd === 'watch') {
@@ -1223,13 +1235,39 @@ function pageClock(cmd, graceMs, afterMs) {
       try { return cb.apply(self, args); } finally {
         // (The observer's records are taken here, while it is still known
         // which chain made the changes.)
-        if (S.mo && !prev) { try { S.freeze(S.mo.takeRecords(), c); } catch (e) {} }
+        if (S.mo && !prev) {
+          try {
+            const records = S.mo.takeRecords();
+            counts(records, c);
+            S.freeze(records, c);
+          } catch (e) {}
+        }
         S.ctx = prev;
       }
     };
+    // A chain whose changes leave a short number as an element's whole
+    // text is counting (not a clock: a colon isn't part of a number).
+    const NUMBER = /^[^\d\s:]{0,3}\s?\d[\d,.'\s\u00a0\u202f]*\s?[^\d:]{0,4}$/;
+    S.counting = new Set();
+    const counts = (records, c) => {
+      for (const m of records) {
+        if (m.type !== 'characterData' && m.type !== 'childList') continue;
+        const e = m.type === 'characterData' ? m.target.parentElement : m.target;
+        if (!e || e.nodeType !== 1 || e.childElementCount > 1) continue;
+        const text = e.textContent.trim();
+        if (text.length > 24 || !NUMBER.test(text)) continue;
+        c.counting = true;
+        c.lastCount = now();
+        if (!c.countEls) c.countEls = new Set();
+        c.countEls.add(e);
+        S.counting.add(c);
+      }
+    };
+    const counting = (c) => c.counting && now() - c.start < COUNT_MS;
     // Whether a callback of chain `c` (asked for `delay` ms ahead) is held now.
     const held = (c, delay) => {
       if (!S.holding) return false;
+      if (counting(c)) return false;
       if (c.start < S.holdAt) return delay >= LONG_MS || now() - S.holdAt >= S.grace;
       return now() - c.start >= S.after;
     };
@@ -1680,6 +1718,25 @@ function pageClock(cmd, graceMs, afterMs) {
       });
     };
     document.addEventListener('cleanshot-stills', S.onStills);
+    // Counts: answered once no number on screen is still counting.
+    S.onCounts = () => {
+      const t0 = now();
+      const check = () => {
+        const vh = innerHeight;
+        const busy = [...S.counting].some((c) => {
+          if (!counting(c) || now() - c.lastCount > COUNT_IDLE_MS) return false;
+          return [...c.countEls].some((e) => {
+            if (!e.isConnected) return false;
+            const r = e.getBoundingClientRect();
+            return r.bottom > 0 && r.top < vh && r.width > 0;
+          });
+        });
+        if (busy && now() - t0 < COUNT_MS) { o.setTimeout.call(window, check, 50); return; }
+        document.dispatchEvent(new CustomEvent('cleanshot-counts-done', { detail: String(Math.round(now() - t0)) }));
+      };
+      check();
+    };
+    document.addEventListener('cleanshot-counts', S.onCounts);
     return 'watching';
   }
   if (!S) return 'not watching';
@@ -1701,6 +1758,7 @@ function pageClock(cmd, graceMs, afterMs) {
     S.mo = null;
     for (const [type, f] of S.listeners) window.removeEventListener(type, f, { capture: true });
     document.removeEventListener('cleanshot-stills', S.onStills);
+    document.removeEventListener('cleanshot-counts', S.onCounts);
     for (const { el, c, style } of S.stills.reverse()) {
       c.remove();
       el.removeAttribute('data-cleanshot-stilled');

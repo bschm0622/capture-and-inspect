@@ -211,6 +211,22 @@
     });
   }
 
+  // Numbers counting up to their value (background.js pageClock): resolves
+  // once none on screen is still counting.
+  function waitForCounts() {
+    return new Promise((resolve) => {
+      let t = null;
+      const done = () => {
+        clearTimeout(t);
+        document.removeEventListener('cleanshot-counts-done', done);
+        resolve();
+      };
+      t = setTimeout(done, 11000);
+      document.addEventListener('cleanshot-counts-done', done);
+      document.dispatchEvent(new CustomEvent('cleanshot-counts'));
+    });
+  }
+
   // Elements the page changes on its own clock: a slider whose timer was set
   // when the page loaded, before the capture could reach it, or a loop the
   // page drives with its own reference to the browser's frame timer. They
@@ -2437,6 +2453,7 @@
           await freezeVideos();
           let dirty = [];
           if (clockHeld) {
+            await waitForCounts();
             pauseClockAnimations();
             pausePlayers();
             // (A page that plays its videos again when they come into view
