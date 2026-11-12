@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: a frame from another site that paints slowly</title>
+<!-- A frame from another origin ([::1] against the page's 127.0.0.1) that
+     paints its content only once it has been on screen for 1.5s, like a map
+     embed drawing its tiles. It sits inside one tile (y 1700-2100), so that
+     tile is the one that must wait for it. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  iframe{display:block;width:100%;height:400px;border:0}
+</style>
+<script src="bands.js"></script>
+<main id="a"></main>
+<iframe id="f" title="slow frame"></iframe>
+<main id="b"></main>
+<script>
+  addBands(document.getElementById('a'), 0, 8);
+  addBands(document.getElementById('b'), 10, 15);
+  // 8 bands (1600px), then a 100px spacer band, so the frame starts at 1700.
+  const spacer = makeBand(8);
+  spacer.style.height = '100px';
+  document.getElementById('a').appendChild(spacer);
+  document.getElementById('f').src = `http://[::1]:${location.port}/frame-slow-inner.html`;
+</script>

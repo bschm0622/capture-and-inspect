@@ -94,6 +94,12 @@ declared color values, so photos and gradients-as-images won't muddy the result.
 2. Pre-scrolls the whole page once to trigger lazy content and reveals.
 3. Scrolls tile-by-tile, waiting for images and JS animations to settle at
    each stop (≈0.5s), then captures the visible viewport.
+   Holds the page still while it shoots: sliders, animations and other
+   changes the page makes on its own to anything already shot are put back
+   before they're painted, canvases and paused videos are swapped for a
+   still of one frame, frames from other sites (maps, players) are shot
+   again until they stop changing, and an image whose request failed is
+   asked for once more.
 4. After the first tile, hides `fixed` overlays and sticky top-navs so they
    appear once at the top instead of repeating. Sticky *content* sections
    (pinned scroll-storytelling) are detected by position and left intact.

@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: an image whose first request fails</title>
+<!-- The server answers the first request for flaky-orange.png with a 500,
+     as a network hiccup would; the image is laid out 600px tall and shows
+     nothing. Asked for again it loads. The capture must show it. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  img{display:block;width:100%;height:600px}
+</style>
+<script src="bands.js"></script>
+<main id="a"></main>
+<img id="pic" src="flaky-orange.png" alt="">
+<main id="b"></main>
+<script>
+  addBands(document.getElementById('a'), 0, 5);
+  addBands(document.getElementById('b'), 8, 15);
+</script>

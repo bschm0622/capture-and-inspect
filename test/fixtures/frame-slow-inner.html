@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html,body{margin:0;height:100%;background:rgb(128,128,128)}
+  body.painted{background:rgb(0,200,90)}
+</style>
+<body>
+<script src="bands.js"></script>
+<script>
+  addLines(document.body, 16);
+  // Paints once it has been on screen for 1.5s without a break.
+  let timer = null;
+  new IntersectionObserver(([e]) => {
+    if (document.body.classList.contains('painted')) return;
+    if (e.isIntersecting) timer = timer || setTimeout(() => document.body.classList.add('painted'), 1500);
+    else { clearTimeout(timer); timer = null; }
+  }).observe(document.body);
+</script>
+</body>

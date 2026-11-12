@@ -16,6 +16,11 @@
   const SETTLE_GRACE_MS = 550;
   // Longest a pre-scroll stop waits for the images it brought on screen.
   const PRESCROLL_IMAGES_MS = 300;
+  // Where a paused video is put (seconds; the middle of a shorter one).
+  const VIDEO_FRAME_S = 2;
+  // The times tried for a still frame, in order, and how long trying may take.
+  const VIDEO_TIMES = [2, 1, 3, 4, 6, 8];
+  const VIDEO_PICK_MS = 4000;
 
   const scroller = document.scrollingElement || document.documentElement;
   let originalScrollY = 0;
@@ -184,6 +189,27 @@
     });
   }
 
+  // Canvases and paused videos on screen are copied into stills that stand
+  // in for them for the rest of the capture, so every tile shows the same
+  // frame (background.js pageClock, in the page's own world, where a WebGL
+  // canvas can be read right after the page draws it). Answered with an
+  // event; bounded, in case the page's world never answers.
+  function requestStills() {
+    return new Promise((resolve) => {
+      let t = null;
+      const done = (e) => {
+        clearTimeout(t);
+        document.removeEventListener('cleanshot-stills-done', done);
+        let r = null;
+        try { r = JSON.parse(e.detail); } catch (_) {}
+        resolve(r);
+      };
+      t = setTimeout(() => { document.removeEventListener('cleanshot-stills-done', done); resolve(null); }, 3000);
+      document.addEventListener('cleanshot-stills-done', done);
+      document.dispatchEvent(new CustomEvent('cleanshot-stills'));
+    });
+  }
+
   // Elements the page changes on its own clock: a slider whose timer was set
   // when the page loaded, before the capture could reach it, or a loop the
   // page drives with its own reference to the browser's frame timer. They
@@ -210,9 +236,19 @@
     lastScrollAt = performance.now();
     restlessWatch = new MutationObserver((list) => {
       if (performance.now() - lastScrollAt < QUIET_MS) return;
+      // A change the capture put back at once (background.js pageClock) is
+      // no change: the first record of each attribute holds its value from
+      // before the batch.
+      const before = new Map();
+      for (const m of list) {
+        const k = m.target;
+        if (!before.has(k)) before.set(k, new Map());
+        if (!before.get(k).has(m.attributeName)) before.get(k).set(m.attributeName, m.oldValue);
+      }
       for (const m of list) {
         const el = m.target;
         if (el.nodeType !== 1 || el === document.body || el === document.documentElement || restless.has(el)) continue;
+        if (before.get(el).get(m.attributeName) === el.getAttribute(m.attributeName)) continue;
         if (m.attributeName === 'style' && pageStyle(m.oldValue) === pageStyle(el.getAttribute('style'))) continue;
         const first = changedOnce.get(el);
         if (first == null) changedOnce.set(el, performance.now());
@@ -225,6 +261,54 @@
     lastScrollAt = performance.now();
     scroller.scrollTo(0, y);
   };
+
+  // Images whose request failed (www.shiftelectricco.com: a 1500px tall one
+  // came back 0x0 in 2 of 6 loads, a blank band in the capture). Each is
+  // asked for once more as it is, then once with a cache-busting query
+  // (a failed answer can be cached); one that still fails is reported.
+  let retried = new WeakSet();
+  let failedImages = new Set();
+  const imageUrl = (img) => {
+    const u = img.currentSrc || img.src || '';
+    return /^(https?|file):/i.test(u) ? u : null;
+  };
+  const fetchImage = (url) => new Promise((resolve) => {
+    const probe = new Image();
+    probe.onload = () => resolve(probe.naturalWidth > 0);
+    probe.onerror = () => resolve(false);
+    setTimeout(() => resolve(false), 4000);
+    probe.src = url;
+  });
+  async function retryImage(img) {
+    const url = imageUrl(img);
+    const settled = () => new Promise((resolve) => {
+      if (img.complete && img.naturalWidth > 0) return resolve();
+      img.addEventListener('load', resolve, { once: true });
+      img.addEventListener('error', resolve, { once: true });
+      setTimeout(resolve, 3000);
+    });
+    let use = (await fetchImage(url)) ? url : null;
+    if (!use) {
+      const busted = `${url}${url.includes('?') ? '&' : '?'}cleanshot-retry=${Date.now()}`;
+      if (await fetchImage(busted)) use = busted;
+    }
+    if (use === url) {
+      // Setting a source attribute again, even to the same value, makes the
+      // image load again; the answer is in the cache now.
+      if (img.hasAttribute('srcset')) img.setAttribute('srcset', img.getAttribute('srcset'));
+      if (img.hasAttribute('src')) img.setAttribute('src', img.getAttribute('src'));
+      const pic = img.parentElement && img.parentElement.tagName === 'PICTURE' ? img.parentElement : null;
+      if (pic) pic.querySelectorAll('source[srcset]').forEach((s) => s.setAttribute('srcset', s.getAttribute('srcset')));
+    } else if (use) {
+      // (Only the address that answered: a srcset would pick the failing one again.)
+      const pic = img.parentElement && img.parentElement.tagName === 'PICTURE' ? img.parentElement : null;
+      if (pic) pic.querySelectorAll('source').forEach((s) => s.removeAttribute('srcset'));
+      img.removeAttribute('srcset');
+      img.setAttribute('src', use);
+    }
+    if (use) await settled();
+    if (!(img.complete && img.naturalWidth > 0)) failedImages.add(img);
+  }
 
   // Wait for images on screen to finish loading: <img> (whichever source a
   // <picture> or srcset picked) and CSS background images, which lazy
@@ -248,6 +332,14 @@
     const pending = Array.from(document.images)
       .filter((img) => !img.complete && onScreen(img))
       .map(loaded);
+    // An image whose request failed (a network hiccup) leaves its box
+    // empty: asked for once more.
+    for (const img of document.images) {
+      if (img.complete && img.naturalWidth === 0 && !retried.has(img) && onScreen(img) && imageUrl(img)) {
+        retried.add(img);
+        pending.push(retryImage(img));
+      }
+    }
     const urls = new Set();
     allElements().forEach((el) => {
       const bg = getComputedStyle(el).backgroundImage;
@@ -388,6 +480,57 @@
       } catch (_) {}
     });
     const waits = [];
+    // Frozen on the same frame every time, not wherever playback had got
+    // to (www.element-outdoorliving.com's section video stopped on a bright
+    // frame behind white text now and then): a fixed time early on, past a
+    // fade-in, or the middle of a short one. (background.js pageClock shows
+    // the poster instead, where the page gave one.)
+    const seekTo = (v, t) => new Promise((resolve) => {
+      if (Math.abs(v.currentTime - t) <= 0.01) return resolve();
+      v.addEventListener('seeked', resolve, { once: true });
+      setTimeout(resolve, timeoutMs);
+      v.currentTime = t;
+    });
+    // And never a cross-fade between two clips (www.bayfrontdental.com's
+    // hero froze mid-dissolve, a ghost of the next shot over the last): of
+    // a few early times, the first where the picture hardly changes over
+    // the next 0.3s; failing that, the stillest. A video from another site
+    // without CORS can't be read back, and keeps the first time.
+    const stillest = async (v, d) => {
+      const times = VIDEO_TIMES.filter((t) => t < d - 0.4);
+      if (times.length < 2) return null;
+      const c = document.createElement('canvas');
+      c.width = 64; c.height = 36;
+      const x = c.getContext('2d', { willReadFrequently: true });
+      const grab = async (t) => {
+        await seekTo(v, t);
+        x.drawImage(v, 0, 0, 64, 36);
+        return x.getImageData(0, 0, 64, 36).data;
+      };
+      const t0 = performance.now();
+      let best = null;
+      try {
+        for (const t of times) {
+          if (performance.now() - t0 > VIDEO_PICK_MS) break;
+          const a = await grab(t), b = await grab(t + 0.3);
+          let s = 0;
+          for (let i = 0; i < a.length; i += 4) s += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+          const change = s / (a.length / 4) / 3;
+          if (!best || change < best.change) best = { t, change };
+          if (change < 3) break;
+        }
+      } catch (_) { return null; }
+      return best && best.t;
+    };
+    const freeze = async (v) => {
+      const d = v.duration;
+      frozenVideos.set(v, { time: v.currentTime, wasPlaying: !v.paused });
+      v.pause();
+      if (!(Number.isFinite(d) && d > 0)) return;
+      const time = (await stillest(v, d)) ?? Math.min(VIDEO_FRAME_S, d / 2);
+      frozenVideos.get(v).time = time;
+      return seekTo(v, time);
+    };
     for (const v of visible) {
       const frozen = frozenVideos.get(v);
       if (!frozen) {
@@ -397,13 +540,11 @@
             setTimeout(resolve, timeoutMs);
           }).then(() => {
             if (frozenVideos.has(v)) return;
-            frozenVideos.set(v, { time: v.currentTime, wasPlaying: !v.paused });
-            v.pause();
+            return freeze(v);
           }));
           continue;
         }
-        frozenVideos.set(v, { time: v.currentTime, wasPlaying: !v.paused });
-        v.pause();
+        waits.push(freeze(v));
       } else {
         v.pause();
         if (Math.abs(v.currentTime - frozen.time) > 0.01) {
@@ -1316,20 +1457,48 @@
   // usually leaves a spacer where it was, so it goes back over that, out of
   // the flow: put back in the flow it would take the space twice.
   let inflow = new Set();
+  let inflowInline = new Set(); // ones placed by inline style (see below)
   function placeInFlow(el) {
     // (Transitions off meanwhile, or the box read back is where a 1ms
     // transition from the old place starts.)
     const box = flowBoxes.get(el);
     el.setAttribute('data-cleanshot-probe', '');
     el.removeAttribute('data-cleanshot-inflow');
+    // (Let go of the inline placing too, so what the page does with it now
+    // shows: back at the top of the page, a header is in the flow again.)
+    if (inflowInline.has(el)) {
+      for (const p of ['position', 'top', 'left', 'right', 'bottom', 'width', 'margin']) {
+        if (el.style.getPropertyPriority(p) === 'important') el.style.removeProperty(p);
+      }
+    }
     if (box && el.isConnected && getComputedStyle(el).position === 'fixed') {
       el.style.setProperty('--cleanshot-top', '0px');
       el.style.setProperty('--cleanshot-left', '0px');
       el.style.setProperty('--cleanshot-width', `${box.width}px`);
       el.setAttribute('data-cleanshot-inflow', '');
+      // A page rule that pins it with !important of its own and an id
+      // (Divi's `#main-header.et-fixed-header`, on hermansplumbing.com)
+      // outranks the stylesheet's: then the same goes inline, where
+      // nothing outranks it. The page's script may write the inline style
+      // again; this runs before every tile.
+      const inline = getComputedStyle(el).position === 'fixed';
+      if (inline) {
+        if (!inflowInline.has(el)) {
+          inflowInline.add(el);
+          unwrapped.push({ el, style: el.getAttribute('style') });
+        }
+        for (const [p, v] of [['position', 'absolute'], ['top', '0px'], ['left', '0px'], ['right', 'auto'], ['bottom', 'auto'], ['width', `${box.width}px`], ['margin', '0px']]) {
+          el.style.setProperty(p, v, 'important');
+        }
+      }
       const r = el.getBoundingClientRect();
-      el.style.setProperty('--cleanshot-top', `${box.top - (r.top + scroller.scrollTop)}px`);
-      el.style.setProperty('--cleanshot-left', `${box.left - r.left}px`);
+      const top = `${box.top - (r.top + scroller.scrollTop)}px`, left = `${box.left - r.left}px`;
+      el.style.setProperty('--cleanshot-top', top);
+      el.style.setProperty('--cleanshot-left', left);
+      if (inline) {
+        el.style.setProperty('top', top, 'important');
+        el.style.setProperty('left', left, 'important');
+      }
       getComputedStyle(el).top;
       inflow.add(el);
     }
@@ -1752,6 +1921,10 @@
   // changing on its own (see watchRestless). A wrapper taller than two
   // screens that the page restyles (a body class, a section marked as
   // visited) says nothing about where the motion is, so it's left out.
+  let frameSeen = new WeakMap(); // frame from another site -> when it came on screen (null: off screen)
+  const frameWatch = new IntersectionObserver((list) => {
+    for (const e of list) frameSeen.set(e.target, e.isIntersecting ? (frameSeen.get(e.target) ?? e.time) : null);
+  });
   function liveRegions() {
     const vh = window.innerHeight;
     const vw = document.documentElement.clientWidth;
@@ -1790,11 +1963,19 @@
       // that row, which must come from the same shot as the rest of it.)
       out.push({ id: liveIds.get(el), kind, top: Math.floor(r.top), bottom: Math.ceil(r.bottom), left: Math.floor(Math.max(0, r.left)), right: Math.ceil(Math.min(vw, r.right)) });
     };
-    document.querySelectorAll('canvas').forEach((el) => add(el, 'canvas'));
+    // (A still that stands in for a canvas or video holds one frame.)
+    document.querySelectorAll('canvas:not([data-cleanshot-still])').forEach((el) => add(el, 'canvas'));
     document.querySelectorAll('iframe, embed, object').forEach((el) => {
       let reachable = false;
       try { reachable = !!el.contentDocument; } catch (_) {}
-      if (!reachable) add(el, 'frame');
+      if (reachable) return;
+      add(el, 'frame');
+      // (How long it has been on screen without a break, for the worker's
+      // wait for it to finish painting.)
+      if (!frameSeen.has(el)) { frameSeen.set(el, null); frameWatch.observe(el); }
+      const since = frameSeen.get(el);
+      const r = out[out.length - 1];
+      if (r && r.id === liveIds.get(el)) r.shownMs = since == null ? 0 : Math.round(performance.now() - since);
     });
     for (const v of frozenVideos.keys()) if (v.isConnected && !v.paused) add(v, 'video');
     // A small part that changes (a slider's dots, a line of text a demo
@@ -1834,6 +2015,7 @@
       ['--cleanshot-top', '--cleanshot-left', '--cleanshot-width'].forEach((p) => el.style.removeProperty(p));
     }
     inflow = new Set();
+    inflowInline = new Set();
     flowBoxes = new Map();
     for (const [v, { wasPlaying }] of frozenVideos) {
       if (wasPlaying) v.play().catch(() => {});
@@ -1842,6 +2024,9 @@
     pausedAnimations.forEach((anim) => anim.play());
     pausedAnimations = [];
     clockHeld = false;
+    document.documentElement.removeAttribute('data-cleanshot-shot');
+    retried = new WeakSet();
+    failedImages = new Set();
     for (const { f, play, resume } of players) {
       if (resume && f.isConnected) try { f.contentWindow.postMessage(play, '*'); } catch (_) {}
     }
@@ -1966,9 +2151,12 @@
           if (msg.index > 0) pinFirstScreen();
           applyFades();
           await freezeVideos();
+          let dirty = [];
           if (clockHeld) {
             pauseClockAnimations();
             pausePlayers();
+            const st = await requestStills();
+            if (st && st.dirty) dirty = st.dirty;
           }
           await raf();
           await raf();
@@ -1979,8 +2167,18 @@
           const drift = msg.keepAnchors ? null : measureDrift();
           if (!msg.keepAnchors) recordAnchors();
           const actualY = scroller.scrollTop || window.scrollY || 0;
+          // From here on what is on screen counts as shot, and the page
+          // isn't let change it (background.js pageClock).
+          if (clockHeld) {
+            const shotTo = Math.max(Number(document.documentElement.getAttribute('data-cleanshot-shot')) || 0, Math.ceil(actualY + window.innerHeight));
+            document.documentElement.setAttribute('data-cleanshot-shot', String(shotTo));
+          }
+          const broken = [...failedImages].filter((img) => img.isConnected && !(img.complete && img.naturalWidth > 0)).map((img) => {
+            const r = img.getBoundingClientRect();
+            return { y0: Math.round(r.top + actualY), y1: Math.round(r.bottom + actualY) };
+          }).filter((b) => b.y1 - b.y0 >= 24);
           sendResponse({
-            ok: true, actualY, drift, covered, live: liveRegions(),
+            ok: true, actualY, drift, covered, live: liveRegions(), broken, dirty,
             pageHeight: pageHeight(),
             maxScroll: Math.max(0, scroller.scrollHeight - window.innerHeight)
           });

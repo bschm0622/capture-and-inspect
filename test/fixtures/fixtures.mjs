@@ -143,6 +143,23 @@ function rowsWith(img, rgb, { min = 6, y0 = 0, y1 = img.H } = {}) {
   return runs;
 }
 
+// One moment of something that changes on its own: every row of CSS rows
+// [y0, y1) shows the same colour in the plain strip at the right as the
+// region's first row (within 16 levels a channel), and that colour is no
+// band's. A tile edge through two moments shows as rows of another colour.
+function oneMoment(img, y0, y1) {
+  const first = meanRgb(img, y0, y0 + 1);
+  const off = [];
+  for (let y = y0; y < Math.min(y1, img.H); y++) {
+    const c = meanRgb(img, y, y + 1);
+    if (Math.max(...c.map((v, k) => Math.abs(v - first[k]))) > 16) {
+      const f = off[off.length - 1];
+      if (f && y <= f.y1) f.y1 = y + 1; else off.push({ y0: y, y1: y + 1, note: `rgb(${c.map(Math.round).join(',')}) here, rgb(${first.map(Math.round).join(',')}) at y ${y0}` });
+    }
+  }
+  return result(off.length === 0, off.length, off.length ? `${off.length} run(s) of rows show another moment than the region's top` : `rows ${y0}-${y1} show one moment, rgb(${first.map(Math.round).join(',')})`, off.slice(0, 10));
+}
+
 export const FIXTURES = [
   {
     name: 'tall-40k', file: 'tall-40k.html', refShots: [32768],
@@ -258,6 +275,61 @@ export const FIXTURES = [
         const runs = rowsWith(img, [255, 0, 255]);
         return result(runs.length === 0, runs.length, `${runs.length} place(s) in the capture show the chat bubble`,
           runs.map((r) => ({ ...r, note: 'chat bubble in the capture' })));
+      }
+    }
+  },
+  {
+    name: 'slider-timer', file: 'slider-timer.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { first: 6, top: 1200 }),
+      // A slider turned by a timer from page load, cut by a tile edge.
+      'hero-one-slide': ({ img }) => oneMoment(img, 2, 1198)
+    }
+  },
+  {
+    name: 'webgl-tall', file: 'webgl-tall.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { first: 6, top: 1200 }),
+      // A WebGL canvas drawn every frame, cut by a tile edge.
+      'canvas-one-frame': ({ img }) => oneMoment(img, 1, 1199)
+    }
+  },
+  {
+    name: 'restart-anim', file: 'restart-anim.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { first: 6, top: 1100 }),
+      // An animation the page starts again on the capture's scroll.
+      'animation-one-frame': ({ img }) => oneMoment(img, 2, 1098)
+    }
+  },
+  {
+    name: 'flaky-image', file: 'flaky-image.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { until: 1000 }),
+      // The image whose first request failed is in the capture (orange).
+      'image-shown': ({ img }) => {
+        const bad = [];
+        for (let y = 1005; y < 1595; y++) {
+          const c = meanRgb(img, y, y + 1);
+          if (Math.max(Math.abs(c[0] - 240), Math.abs(c[1] - 120), Math.abs(c[2])) > 16) bad.push(y);
+        }
+        return result(bad.length === 0, bad.length, `${590 - bad.length} of 590 rows of the image show it`, bad.length ? [{ y0: bad[0], y1: bad[bad.length - 1] + 1, note: 'image missing' }] : []);
+      }
+    }
+  },
+  {
+    name: 'frame-slow', file: 'frame-slow.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { until: 1600 }),
+      // The frame from another site, shot once it had painted (green, not
+      // its grey placeholder).
+      'frame-painted': ({ img }) => {
+        const bad = [];
+        for (let y = 1705; y < 2095; y++) {
+          const c = meanRgb(img, y, y + 1);
+          if (Math.max(Math.abs(c[0]), Math.abs(c[1] - 200), Math.abs(c[2] - 90)) > 16) bad.push(y);
+        }
+        return result(bad.length === 0, bad.length, `${390 - bad.length} of 390 rows of the frame show it painted`, bad.length ? [{ y0: bad[0], y1: bad[bad.length - 1] + 1, note: 'frame not painted' }] : []);
       }
     }
   },

@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: a slider on a timer set at page load, taller than the window</title>
+<!-- A 1200px hero of three stacked slides, turned every 0.7s by a
+     setInterval the page registers while it loads, before the capture can
+     wrap the page's timers. The window is 868px, so the hero is cut by the
+     first tile edge and shot in two tiles. Both parts must show the same
+     slide. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  #hero{position:relative;height:1200px;overflow:hidden}
+  .slide{position:absolute;inset:0;opacity:0;transition:opacity .4s}
+  .slide.on{opacity:1}
+  .slide h2{margin:0;padding:80px 40px;font:48px/1.2 sans-serif;color:#fff}
+</style>
+<script src="bands.js"></script>
+<div id="hero">
+  <div class="slide on" style="background:rgb(250,20,20)"><h2>Slide one</h2></div>
+  <div class="slide" style="background:rgb(20,250,20)"><h2>Slide two</h2></div>
+  <div class="slide" style="background:rgb(20,20,250)"><h2>Slide three</h2></div>
+</div>
+<main id="m"></main>
+<script>
+  addBands(document.getElementById('m'), 6, 20);
+  const slides = document.querySelectorAll('.slide');
+  slides.forEach((s) => addLines(s, 40));
+  let i = 0;
+  setInterval(() => {
+    slides[i].classList.remove('on');
+    i = (i + 1) % slides.length;
+    slides[i].classList.add('on');
+  }, 700);
+</script>

@@ -307,6 +307,23 @@ function disagreement(sig, w, seam, top, tile, tileH, hidden) {
   return { y0, y1, blocks, worst: Math.round(worst * 1000) / 1000 };
 }
 
+// Frames from other sites: shots taken again, at most this many, until two
+// in a row show the frame's box the same (within the luma grid's noise).
+const FRAME_SETTLE_SHOTS = 6;
+const FRAME_MIN_MS = 2000;
+function boxSame(a, b, w, h, r) {
+  const y0 = Math.max(0, Math.floor(r.top)), y1 = Math.min(h, Math.ceil(r.bottom));
+  const x0 = Math.max(0, Math.floor(r.left / GRID_PX)), x1 = Math.min(w, Math.ceil(r.right / GRID_PX));
+  let n = 0, changed = 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = y * w + x0, e = y * w + x1; x < e; x++) {
+      n++;
+      if (Math.abs(a[x] - b[x]) > AGREE_CELL) changed++;
+    }
+  }
+  return n === 0 || changed / n < 0.002;
+}
+
 async function stitchTiles(tab, info) {
   const { viewportHeight: vh, pageWidth, dpr } = info;
   const warnings = [];
@@ -416,6 +433,8 @@ async function stitchTiles(tab, info) {
   const liveSeen = new Map(); // canvas id -> where it sits in the capture
   const paintStarts = [];     // capture px where each tile's painted rows start
   const changedAt = [];       // seams (CSS px) where two tiles disagreed or didn't match: the page changed between them
+  const settledFrames = new Set(); // ids of frames from other sites seen holding still
+  const brokenSeen = new Set();
 
   // Whether `n` more shots for this tile leave enough of the budget to
   // reach the bottom of the page one plain tile at a time. Asked only when
@@ -512,9 +531,40 @@ async function stitchTiles(tab, info) {
     setBadge(`${i + 1}/${total}`, '#555');
     notify({ phase: 'tile', index: i, total });
 
-    const bmp = await dataUrlToBitmap(await throttledCapture(tab.windowId));
+    let bmp = await dataUrlToBitmap(await throttledCapture(tab.windowId));
     const tileH = Math.round(bmp.height / dpr);
-    const tileGrid = lumaGrid(bmp, gw, tileH);
+    let tileGrid = lumaGrid(bmp, gw, tileH);
+    // A frame from another site paints on its own time (a Google map draws
+    // blurry tiles first and its controls last), out of the page's reach.
+    // The first time one is on screen, shoot again until two shots in a
+    // row show its box the same, a few times at most.
+    // A frame that has only just come on screen may not have started
+    // painting at all (a placeholder looks as still as a finished map), so
+    // the earlier shot of the agreeing two must also come FRAME_MIN_MS after
+    // it came on screen.
+    const fresh = (res.live || []).filter((r) => r.kind === 'frame' && !settledFrames.has(r.id));
+    if (fresh.length) {
+      const shownAt = Date.now() - Math.min(...fresh.map((r) => r.shownMs || 0));
+      let same = false, shotAt = lastCaptureTs;
+      for (let k = 0; k < FRAME_SETTLE_SHOTS && !same; k++) {
+        const b2 = await dataUrlToBitmap(await throttledCapture(tab.windowId));
+        const g2 = lumaGrid(b2, gw, tileH);
+        same = shotAt - shownAt >= FRAME_MIN_MS && fresh.every((r) => boxSame(tileGrid, g2, gw, tileH, r));
+        shotAt = lastCaptureTs;
+        bmp.close();
+        bmp = b2;
+        tileGrid = g2;
+      }
+      fresh.forEach((r) => settledFrames.add(r.id));
+      if (!same) {
+        for (const r of fresh) warnings.push({ kind: 'frame-unsettled', y0: Math.round(top + r.top), y1: Math.round(top + r.bottom), note: `a frame from another site (y ${Math.round(top + r.top)}-${Math.round(top + r.bottom)}) was still changing after ${FRAME_SETTLE_SHOTS + 1} shots; it is shown as the last one saw it` });
+      }
+    }
+    for (const b of res.broken || []) {
+      if (brokenSeen.has(`${b.y0} ${b.y1}`)) continue;
+      brokenSeen.add(`${b.y0} ${b.y1}`);
+      warnings.push({ kind: 'image-failed', y0: b.y0, y1: b.y1, note: `an image (y ${b.y0}-${b.y1}) failed to load, and again when asked for once more; its place is empty` });
+    }
 
     // The page scrolled but the shot didn't change: shoot it again.
     let stale = false;
@@ -571,7 +621,18 @@ async function stitchTiles(tab, info) {
     // again, then this one, back to back. The repeat keeps the page's
     // anchors from this shot, so this one is still measured from here.
     if ((agree && agree.blocks > 0) || (match && match.match === 'mismatch')) changedAt.push(seam);
-    if (agree && agree.blocks > 0 && last && seamReshoots < RESHOOTS_PER_SEAM && reshoots < MAX_RESHOOTS && affords(2, res)) {
+    // The page also says so itself: something it changed in answer to this
+    // tile's scroll (a reveal, a decoration that dropped in) reaches into
+    // rows the tile above painted (background.js pageClock, `dirty`). Too
+    // small a change to tell from the pixels, it is still a cut.
+    const off = top - res.actualY;
+    // Only when the tile above holds all of the change that was shot: one
+    // reaching higher was painted by older tiles too, which a new shot of
+    // the tile above would leave behind (hitt.com's project cards, which
+    // change as the page scrolls, came out cut where they had been whole).
+    const dirtyAbove = i > 0 && last && (res.dirty || []).some(([a, b]) =>
+      a + off < seam - 1 && a + off >= last.from / scale - 1);
+    if (((agree && agree.blocks > 0) || dirtyAbove) && last && seamReshoots < RESHOOTS_PER_SEAM && reshoots < MAX_RESHOOTS && affords(2, res)) {
       seamReshoots++;
       reshoots++;
       placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, match, agree, retake: true });
@@ -1046,6 +1107,7 @@ function stopCarousels() {
   return stopped;
 }
 
+
 // Injected into the page (MAIN world), so it must be self-contained. The
 // page's own clock: timers and animation frames that turn sliders, run
 // marquees, count numbers up and draw canvas animations. A seam between two
@@ -1070,9 +1132,36 @@ function stopCarousels() {
 // last one, so it belongs to the old chain and stays held.
 // 'release' puts the page's functions back and runs what was held, so the
 // page carries on as if it had only been paused.
-// What it can't reach: timers registered before 'watch' (at page load, by
-// the page itself), and loops that kept a reference to the browser's own
-// requestAnimationFrame; the page side shoots those whole where it can.
+//
+// Two things the wrappers can't reach are handled by what they change
+// instead of by their timers:
+// - Timers the page registered at load, before 'watch' (www.novellahomes.com
+//   turns its 1000px hero every 8s from one; Squarespace galleries and
+//   taylorsway.com's slider the same way), and work the page starts again
+//   after the hold in answer to the capture's scrolling (saybriefly.com
+//   restarts its hero animation on the first scroll). Once a part of the
+//   page has been shot, it must look the same in every later shot, or a
+//   tile edge through it shows two moments. So from the first shot on, a
+//   change the page makes to an element already shot (its class, style or
+//   other attributes, its text, and from the page's own timers and frames
+//   its children) is put back as it was, at once: a MutationObserver's
+//   callback runs before the browser paints, so the change never shows.
+//   What the capture itself needs is let through: changes made in answer
+//   to an image (or other resource) loading or to a transition ending, a
+//   direct answer to the capture's scroll (a reveal), image sources, and
+//   the capture's own marks. The page keeps its own idea of where it is
+//   and carries on from there after 'release'.
+// - Canvases (and paused videos) taller than a screen: their pixels are out
+//   of the DOM's reach. 'stills' (asked for by the page side before each
+//   shot) copies each one on screen into a plain 2D canvas that takes its
+//   place for the rest of the capture, so every tile shows the same frame.
+//   A WebGL canvas without preserveDrawingBuffer is empty outside the frame
+//   that drew it, so it is copied in a frame callback that runs right after
+//   the page's own (the frames the hold kept back are let run once for it).
+//   A canvas that can't be read (drawn from another site without CORS still
+//   copies, since only reading pixels back is refused; one moved to a
+//   worker by transferControlToOffscreen can come out empty) is left live,
+//   and the worker shoots it whole where it can.
 function pageClock(cmd, graceMs, afterMs) {
   const KEY = '__cleanShotClock';
   const LONG_MS = 1000;
@@ -1080,19 +1169,43 @@ function pageClock(cmd, graceMs, afterMs) {
   const now = () => performance.now();
   if (cmd === 'watch') {
     if (S) return 'watching';
-    S = { holding: false, holdAt: 0, grace: 1000, after: 3000, heldTimeouts: new Map(), heldFrames: new Map(), skipped: 0, ctx: null };
+    S = {
+      holding: false, holdAt: 0, grace: 1000, after: 3000, heldTimeouts: new Map(), heldFrames: new Map(), skipped: 0, ctx: null,
+      lastScroll: -1e9, lastLoad: -1e9, lastSettle: -1e9, mo: null, reverted: 0, fights: new WeakMap(),
+      stills: [], stilled: new WeakSet(), dirty: []
+    };
     Object.defineProperty(window, KEY, { value: S, configurable: true, enumerable: false, writable: true });
     const o = S.orig = {
       setTimeout: window.setTimeout, setInterval: window.setInterval, clearTimeout: window.clearTimeout,
       requestAnimationFrame: window.requestAnimationFrame, cancelAnimationFrame: window.cancelAnimationFrame
     };
-    // Each callback carries the time its chain started: a timer or frame
-    // asked for from inside another one continues that one's chain.
-    const chain = () => (S.ctx ? S.ctx : { start: now() });
+    // What set off the work being done now: the capture's scroll (a scroll
+    // event, then the observers and handlers it wakes, come within a few
+    // frames), a resource that finished loading, or a transition or
+    // animation that ended. Nothing: the page's own clock.
+    // (Only the browser's own events: the stills below send the page a
+    // scroll event of their own.)
+    const mark = (k) => (e) => { if (e.isTrusted) S[k] = now(); };
+    S.listeners = [['scroll', mark('lastScroll')], ['load', mark('lastLoad')], ['error', mark('lastLoad')],
+      ['transitionend', mark('lastSettle')], ['animationend', mark('lastSettle')]];
+    for (const [type, f] of S.listeners) window.addEventListener(type, f, { capture: true, passive: true });
+    const cause = () => {
+      const t = now();
+      return t - S.lastLoad < 30 ? 'load' : t - S.lastSettle < 30 ? 'settle' : t - S.lastScroll < 60 ? 'scroll' : null;
+    };
+    // Each callback carries the time its chain started, and what started
+    // it: a timer or frame asked for from inside another one continues that
+    // one's chain.
+    const chain = () => (S.ctx ? S.ctx : { start: now(), cause: cause() });
     const run = (c, cb, self, args) => {
       const prev = S.ctx;
       S.ctx = c;
-      try { return cb.apply(self, args); } finally { S.ctx = prev; }
+      try { return cb.apply(self, args); } finally {
+        // (The observer's records are taken here, while it is still known
+        // which chain made the changes.)
+        if (S.mo && !prev) { try { S.freeze(S.mo.takeRecords(), c); } catch (e) {} }
+        S.ctx = prev;
+      }
     };
     // Whether a callback of chain `c` (asked for `delay` ms ahead) is held now.
     const held = (c, delay) => {
@@ -1117,7 +1230,7 @@ function pageClock(cmd, graceMs, afterMs) {
     };
     window.setInterval = function (cb, ms, ...args) {
       if (typeof cb !== 'function') return o.setInterval.call(window, cb, ms, ...args);
-      const c = { start: now() };
+      const c = { start: now(), cause: cause() };
       const delay = Number(ms) || 0;
       return o.setInterval.call(window, function () {
         if (held(c, delay)) { S.skipped++; return; }
@@ -1137,6 +1250,7 @@ function pageClock(cmd, graceMs, afterMs) {
           S.heldFrames.set(id, (t2) => run(c, cb, window, [t2]));
           return;
         }
+        c.frames = (c.frames || 0) + 1;
         return run(c, cb, this, [t]);
       });
       return id;
@@ -1145,6 +1259,236 @@ function pageClock(cmd, graceMs, afterMs) {
       S.heldFrames.delete(id);
       return o.cancelAnimationFrame.call(window, id);
     };
+
+    // Changes to what has been shot, put back (see above). `c` is the chain
+    // that made them, or null for work the wrappers don't see.
+    const LOADING = /^(src|srcset|sizes|poster|loading|decoding|fetchpriority|href|xlink:href)$|^data-cleanshot|^data-(.*-)?(src|srcset|bg|background|lazy[\w-]*|ll-status|was-processed)$/i;
+    const MEDIA = /^(IFRAME|VIDEO|AUDIO|SOURCE|IMG|PICTURE|OBJECT|EMBED)$/;
+    const SKIP_NODES = /^(SCRIPT|STYLE|LINK|META|NOSCRIPT|IFRAME|TEMPLATE|BASE|TITLE)$/;
+    // The capture's own style writes: !important declarations and its
+    // --cleanshot variables.
+    const pageStyle = (s) => (s || '').split(';').map((d) => d.trim())
+      .filter((d) => d && !/!\s*important$/i.test(d) && !d.startsWith('--cleanshot')).join(';');
+    // A page that answers every revert with the same change again (its own
+    // observer, a framework re-rendering) would spin forever: an element
+    // reverted more than this many times in a second is let go.
+    const FIGHT = 150;
+    const fighting = (t) => {
+      const f = S.fights.get(t) || { n: 0, at: now() };
+      if (now() - f.at > 1000) { f.n = 0; f.at = now(); }
+      f.n++;
+      S.fights.set(t, f);
+      return f.n > FIGHT;
+    };
+    S.freeze = (records, c) => {
+      if (!records.length || !S.holding || now() - S.holdAt < S.grace) return;
+      const bottom = Number(document.documentElement.getAttribute('data-cleanshot-shot')) || 0;
+      if (!bottom) return;
+      const why = c ? c.cause : cause();
+      if (why === 'load' || why === 'settle') return;
+      const y = window.scrollY;
+      // A direct answer to the capture's scroll is let through (a reveal,
+      // a decoration that drops in), but where it touches what was shot
+      // the page side is told, and the worker shoots the tile above again.
+      // So is a timer the page set in that answer (a debounce that clears a
+      // 'scrolling' class) and the first frame of an animation it started.
+      // The animation's later frames are put back where they touch what was
+      // shot: saybriefly.com plays its hero again on every scroll.
+      if (why === 'scroll' && !(c && c.frames >= 2)) {
+        for (const m of records) {
+          // (Only what can change how it looks; and not the inline style of
+          // an element the capture holds through its stylesheet, whose
+          // writes then show nothing: hitt.com's project cards move with the
+          // scroll, held still, and their every write would have cost a
+          // shot of the tile above for nothing.)
+          if (m.type === 'attributes') {
+            if (!/^(class|style|hidden|d|transform|fill|opacity)$/.test(m.attributeName)) continue;
+            if (m.attributeName === 'style' && m.target.matches('[data-cleanshot-hold], [data-cleanshot-fade]')) continue;
+          }
+          const els = m.type === 'childList' ? [...m.addedNodes].filter((n) => n.nodeType === 1) : [m.target.nodeType === 1 ? m.target : m.target.parentElement];
+          for (let e of els) {
+            if (!e || e === document.body || e === document.documentElement) continue;
+            while (e.ownerSVGElement) e = e.ownerSVGElement;
+            // (What floats over the page, a header that changes as the page
+            // scrolls, is the page side's to place, not part of a tile.)
+            if (pinned(e)) continue;
+            const r = e.getBoundingClientRect();
+            if (r.height > 0 && r.width > 0 && r.top + y < bottom && r.bottom + y > 0 && r.height < 4 * innerHeight) {
+              S.dirty.push([Math.floor(r.top + y), Math.ceil(r.bottom + y)]);
+              if (S.dirty.length > 200) S.dirty.shift();
+            }
+          }
+        }
+        return;
+      }
+      const memo = new Map();
+      // Shot already: above the bottom of the last screen shot. The inside
+      // of an SVG goes by the SVG; a box with no size (a slide hidden by
+      // display: none) by its nearest parent that has one.
+      const shot = (n) => {
+        let e = n.nodeType === 1 ? n : n.parentElement;
+        if (!e) return false;
+        while (e.ownerSVGElement) e = e.ownerSVGElement;
+        if (memo.has(e)) return memo.get(e);
+        let a = e, r = a.getBoundingClientRect();
+        for (let k = 0; r.width === 0 && r.height === 0 && a.parentElement && k < 4; k++) { a = a.parentElement; r = a.getBoundingClientRect(); }
+        // (What floats over the page is the page side's to hide and show.)
+        const v = r.height > 0 && r.top + y < bottom && r.bottom + y > 0 && !pinned(a);
+        memo.set(e, v);
+        return v;
+      };
+      let done = false;
+      for (let i = records.length - 1; i >= 0; i--) {
+        const m = records[i], t = m.target;
+        if (t === document.documentElement || t === document.body || (document.head && document.head.contains(t))) continue;
+        if (t.nodeType === 1 && t.closest('[data-cleanshot-still]')) continue;
+        if (m.type === 'attributes') {
+          const name = m.attributeName;
+          if (LOADING.test(name) || MEDIA.test(t.nodeName)) continue;
+          const cur = t.getAttribute(name);
+          if (cur === m.oldValue || (name === 'style' && pageStyle(cur) === pageStyle(m.oldValue))) continue;
+          if (!shot(t) || fighting(t)) continue;
+          if (m.oldValue == null) t.removeAttribute(name);
+          else t.setAttribute(name, m.oldValue);
+          done = true;
+        } else if (m.type === 'characterData') {
+          if (t.data === m.oldValue || !shot(t) || fighting(t)) continue;
+          t.data = m.oldValue;
+          done = true;
+        } else if (m.type === 'childList' && c) {
+          // Only from the page's own timers and frames: children that
+          // arrive otherwise are mostly content loading (a widget filling in).
+          const nodes = [...m.addedNodes, ...m.removedNodes];
+          if (!nodes.length || nodes.some((n) => n.nodeType === 1 && (SKIP_NODES.test(n.nodeName) || n.hasAttribute('data-cleanshot-still')))) continue;
+          if (!shot(t) || fighting(t)) continue;
+          for (const n of m.addedNodes) if (n.parentNode === t) t.removeChild(n);
+          const before = m.nextSibling && m.nextSibling.parentNode === t ? m.nextSibling
+            : m.previousSibling && m.previousSibling.parentNode === t ? m.previousSibling.nextSibling : null;
+          for (const n of m.removedNodes) if (!n.parentNode) t.insertBefore(n, before);
+          done = true;
+        }
+      }
+      if (done) {
+        S.reverted++;
+        // (The reverts' own records.)
+        S.mo.takeRecords();
+      }
+    };
+
+    // Stills: the page side asks with a 'cleanshot-stills' event before each
+    // shot and waits for 'cleanshot-stills-done'.
+    const stillProps = ['position', 'top', 'right', 'bottom', 'left', 'width', 'height', 'box-sizing',
+      'margin-top', 'margin-right', 'margin-bottom', 'margin-left', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+      'border-top', 'border-right', 'border-bottom', 'border-left', 'border-radius', 'display', 'vertical-align', 'float',
+      'transform', 'transform-origin', 'z-index', 'object-fit', 'object-position', 'opacity', 'filter', 'mix-blend-mode',
+      'clip-path', 'flex-grow', 'flex-shrink', 'flex-basis', 'align-self', 'order', 'grid-row', 'grid-column', 'min-width', 'min-height', 'max-width', 'max-height'];
+    const pinned = (el) => {
+      for (let a = el; a && a !== document.body; a = a.parentElement) {
+        if (/^(fixed|sticky)$/.test(getComputedStyle(a).position)) return true;
+      }
+      return false;
+    };
+    const blank = (c) => {
+      try {
+        const t = document.createElement('canvas');
+        t.width = t.height = 16;
+        const x = t.getContext('2d', { willReadFrequently: true });
+        x.drawImage(c, 0, 0, 16, 16);
+        const d = x.getImageData(0, 0, 16, 16).data;
+        for (let i = 3; i < d.length; i += 4) if (d[i]) return false;
+        return true;
+      } catch (e) { return false; } // tainted: shown all the same
+    };
+    // A copy of `src` (a canvas, a video or an image) in a canvas that
+    // takes `el`'s place, styled to the same box.
+    const stand = (el, src, w, h) => {
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, w);
+      c.height = Math.max(1, h);
+      try { c.getContext('2d').drawImage(src, 0, 0, c.width, c.height); } catch (e) { return null; }
+      return c;
+    };
+    const place = (el, c) => {
+      const cs = getComputedStyle(el);
+      if (el.getAttribute('class')) c.setAttribute('class', el.getAttribute('class'));
+      c.setAttribute('data-cleanshot-still', '');
+      c.setAttribute('aria-hidden', 'true');
+      for (const p of stillProps) c.style.setProperty(p, cs.getPropertyValue(p), 'important');
+      if (cs.display === 'none') c.style.setProperty('display', 'block', 'important');
+      const style = el.getAttribute('style');
+      el.after(c);
+      el.setAttribute('data-cleanshot-stilled', '');
+      el.style.setProperty('display', 'none', 'important');
+      S.stills.push({ el, c, style });
+      S.stilled.add(el);
+    };
+    const loadImage = (url) => new Promise((resolve) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = () => resolve(null);
+      o.setTimeout.call(window, () => resolve(null), 2000);
+      im.src = url;
+    });
+    S.makeStills = async () => {
+      const vh = innerHeight, vw = document.documentElement.clientWidth;
+      const list = [...document.querySelectorAll('canvas:not([data-cleanshot-still]), video')].filter((el) => {
+        if (S.stilled.has(el) || !el.isConnected) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width < 100 || r.height < 60 || r.bottom <= 0 || r.top >= vh || r.right <= 0 || r.left >= vw) return false;
+        if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) || pinned(el)) return false;
+        return el.tagName === 'CANVAS' || (el.paused && (el.readyState >= 2 || el.poster));
+      });
+      let made = 0;
+      const later = [];
+      for (const el of list) {
+        if (el.tagName === 'VIDEO') {
+          // A poster is what the page chose to stand for the video; else
+          // the frame the page side put it on.
+          const im = el.poster ? await loadImage(el.poster) : null;
+          const c = im ? stand(el, im, im.naturalWidth, im.naturalHeight)
+            : el.readyState >= 2 ? stand(el, el, el.videoWidth, el.videoHeight) : null;
+          if (c) { place(el, c); made++; }
+          continue;
+        }
+        const c = stand(el, el, el.width, el.height);
+        if (c && !blank(c)) { place(el, c); made++; } else later.push(el);
+      }
+      // Empty outside the frame that drew it (WebGL): copy right after the
+      // page's next frame, with what the hold kept back let run once. A
+      // canvas the page draws only when the page scrolls (Squarespace's
+      // image effects) is told it scrolled, where it already is.
+      if (later.length) {
+        const copies = await new Promise((resolve) => {
+          const frames = [...S.heldFrames.values()];
+          S.heldFrames.clear();
+          try { document.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (e) {}
+          frames.forEach((f) => o.requestAnimationFrame.call(window, f));
+          o.requestAnimationFrame.call(window, () => resolve(later.map((el) => stand(el, el, el.width, el.height))));
+          o.setTimeout.call(window, () => resolve([]), 1000);
+        });
+        later.forEach((el, k) => {
+          const c = copies[k];
+          if (c && !blank(c)) { place(el, c); made++; }
+        });
+      }
+      return { made, failed: later.filter((el) => !S.stilled.has(el)).length };
+    };
+    S.onStills = () => {
+      S.makeStills().catch(() => ({ made: 0, failed: -1 })).then((r) => {
+        // (And the page rows the page changed in answer to the scroll since
+        // the last ask, merged.)
+        if (S.mo) { try { S.freeze(S.mo.takeRecords(), null); } catch (e) {} }
+        const runs = [];
+        for (const [a, b] of S.dirty.sort((p, q) => p[0] - q[0])) {
+          const last = runs[runs.length - 1];
+          if (last && a <= last[1]) last[1] = Math.max(last[1], b); else runs.push([a, b]);
+        }
+        S.dirty = [];
+        r.dirty = runs;
+        document.dispatchEvent(new CustomEvent('cleanshot-stills-done', { detail: JSON.stringify(r) }));
+      });
+    };
+    document.addEventListener('cleanshot-stills', S.onStills);
     return 'watching';
   }
   if (!S) return 'not watching';
@@ -1153,11 +1497,25 @@ function pageClock(cmd, graceMs, afterMs) {
     S.after = afterMs || 3000;
     S.holdAt = now();
     S.holding = true;
+    if (!S.mo) {
+      S.mo = new MutationObserver((list) => { try { S.freeze(list, null); } catch (e) {} });
+      S.mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeOldValue: true, characterData: true, characterDataOldValue: true });
+    }
     return 'holding';
   }
   if (cmd === 'release') {
     const o = S.orig;
     S.holding = false;
+    if (S.mo) S.mo.disconnect();
+    S.mo = null;
+    for (const [type, f] of S.listeners) window.removeEventListener(type, f, { capture: true });
+    document.removeEventListener('cleanshot-stills', S.onStills);
+    for (const { el, c, style } of S.stills.reverse()) {
+      c.remove();
+      el.removeAttribute('data-cleanshot-stilled');
+      if (style == null) el.removeAttribute('style');
+      else el.setAttribute('style', style);
+    }
     for (const k of Object.keys(o)) window[k] = o[k];
     const timeouts = [...S.heldTimeouts.values()], frames = [...S.heldFrames.values()];
     S.heldTimeouts.clear();
@@ -1165,6 +1523,6 @@ function pageClock(cmd, graceMs, afterMs) {
     timeouts.forEach((f) => o.setTimeout.call(window, f, 0));
     frames.forEach((f) => o.requestAnimationFrame.call(window, f));
     delete window[KEY];
-    return { timeouts: timeouts.length, frames: frames.length, skipped: S.skipped };
+    return { timeouts: timeouts.length, frames: frames.length, skipped: S.skipped, reverted: S.reverted, stills: S.stills.length };
   }
 }
