@@ -131,7 +131,7 @@ function runChild(payload, hardMs) {
 // to a network hiccup.
 async function serveFixtures() {
   const http = await import('node:http');
-  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg' };
+  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml' };
   const asked = new Set();
   const handler = (req, res) => {
     const name = path.basename(decodeURIComponent(new URL(req.url, 'http://x').pathname));

@@ -48,6 +48,7 @@
   let covered = [];              // screen rects of overlays hidden during this tile
   let clockHeld = false;         // the worker has stopped the page's clock (background.js pageClock)
   let flowBoxes = new Map();     // element -> {top, left, width} in the page's flow, until first seen fixed (null after)
+  let stickySeen = new WeakSet(); // sticky elements already sorted (settleOverlays, sortOverlays)
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
@@ -310,6 +311,37 @@
     if (!(img.complete && img.naturalWidth > 0)) failedImages.add(img);
   }
 
+  // An image on screen still showing what a lazy loader put there to hold
+  // its place. Loaders (Perfmatters, lazysizes, WP Rocket, LiteSpeed, a3)
+  // keep the real source in a data attribute and swap it in when their
+  // observer sees the image come into view; an image the loader never
+  // looked at keeps its placeholder for good. A carousel's loop copies
+  // are made that way, after the loader looked: paulbunyanplumbing.com's
+  // third review, a copy, had no stars. So an image on screen that still
+  // shows a placeholder (a data: URI, or nothing) and carries a source in
+  // one of those attributes is given it, with its <picture> sources, as
+  // its loader would. The browser's own lazy loading is told to load now.
+  const LAZY_SRC = ['data-src', 'data-lazy-src', 'data-original', 'data-lazy'];
+  const LAZY_SRCSET = ['data-srcset', 'data-lazy-srcset'];
+  function wakeLazyImage(img) {
+    if (img.loading === 'lazy') img.loading = 'eager';
+    const cur = img.currentSrc || img.getAttribute('src') || '';
+    if (cur && !cur.startsWith('data:') && img.naturalWidth > 0) return;
+    const pick = (el, names) => names.map((n) => el.getAttribute(n)).find((v) => v && !v.startsWith('data:'));
+    const src = pick(img, LAZY_SRC);
+    const set = pick(img, LAZY_SRCSET);
+    if (!src && !set) return;
+    const pic = img.parentElement && img.parentElement.tagName === 'PICTURE' ? img.parentElement : null;
+    if (pic) {
+      pic.querySelectorAll('source').forEach((s) => {
+        const ss = pick(s, LAZY_SRCSET);
+        if (ss && s.getAttribute('srcset') !== ss) s.setAttribute('srcset', ss);
+      });
+    }
+    if (set && img.getAttribute('srcset') !== set) img.setAttribute('srcset', set);
+    if (src && img.getAttribute('src') !== src) img.setAttribute('src', src);
+  }
+
   // Wait for images on screen to finish loading: <img> (whichever source a
   // <picture> or srcset picked) and CSS background images, which lazy
   // loaders such as WP Rocket's set only once a section scrolls into view.
@@ -329,6 +361,7 @@
       img.addEventListener('load', resolve, { once: true });
       img.addEventListener('error', resolve, { once: true });
     });
+    Array.from(document.images).forEach((img) => { if (onScreen(img)) wakeLazyImage(img); });
     const pending = Array.from(document.images)
       .filter((img) => !img.complete && onScreen(img))
       .map(loaded);
@@ -647,6 +680,7 @@
       if (!pageColors.has(el)) pageColors.set(el, new Set());
       pageColors.get(el).add(getComputedStyle(el).backgroundColor);
     }
+    const fixedNow = [];
     allElements().forEach((el) => {
       const cs = getComputedStyle(el);
       const r = el.getBoundingClientRect();
@@ -654,7 +688,7 @@
         if (r.width >= vw * 0.9 && r.height >= vh * 0.9) {
           if (!backdrops.has(el)) backdrops.set(el, new Set());
           backdrops.get(el).add(cs.backgroundColor);
-        }
+        } else fixedNow.push(el);
         // Fixed from the first look on: never in the flow. Seen in it
         // before: that place is kept.
         const box = flowBoxes.get(el);
@@ -703,6 +737,19 @@
       }
       seen.push([scroller.scrollTop, v, r.height > 0 && r.bottom > 0 && r.top < vh]);
     });
+    // Whatever sat in something fixed to the screen at this stop changes
+    // with the state of what floats over the page, not with the page: a
+    // header that turns fixed on scroll swaps its wordmark for a compact
+    // logo (www.guggenheim.org fades a "G" in over its wordmark). Held at
+    // its most visible, that state would show in the first tile, where the
+    // header is as it is at scroll 0. (Not a full-screen layer: a page
+    // that scrolls its content through one has its fades in it.)
+    for (const box of fixedNow) {
+      for (const el of [box, ...box.querySelectorAll('*')]) {
+        const f = fades.get(el);
+        if (f) f.floats = true;
+      }
+    }
     if (!fadesOnly) stops.push(scroller.scrollTop);
   }
 
@@ -848,7 +895,7 @@
   function holdFades() {
     const list = [];
     for (const [el, f] of fades) {
-      if (!f.linked || f.max - f.min < 0.05 || !el.isConnected) continue;
+      if (!f.linked || f.floats || f.max - f.min < 0.05 || !el.isConnected) continue;
       if (!(el instanceof HTMLElement) || el.closest('svg') || pinnedToScreen(el)) continue;
       list.push({ el, max: f.max, tf: f.tf, r: el.getBoundingClientRect() });
     }
@@ -1389,11 +1436,40 @@
   // 0 that is the rule above; further down, only the late rule can apply.
   // Elements with nothing to show yet (a closed drawer, a popup not opened)
   // wait until they do.
+  //
+  // One parked wholly off the screen at scroll 0 (a closed drawer, a panel
+  // slid out to the side, a bar waiting below the bottom edge) shows nothing
+  // of itself, only what spills from it, a shadow or a glow
+  // (www.richardscriminallaw.com's accessibility panel, a <nav> 580px off
+  // the left edge, cast its shadow on the first screen). It isn't the
+  // header a visitor sees there, so it is an extra. One big enough to be a
+  // pinned section is left to be sorted when it shows.
+  //
+  // Sticky elements the page adds later are looked at too (see floatsLow):
+  // a "back to top" box made sticky once the page has scrolled (www.louvre.fr
+  // adds one at the end of its content) would otherwise ride along in every
+  // tile.
   function sortOverlays(atTop) {
+    const vw = document.documentElement.clientWidth;
+    const vh = window.innerHeight;
     allElements().forEach((el) => {
-      if (overlays.has(el) || getComputedStyle(el).position !== 'fixed') return;
+      if (overlays.has(el)) return;
+      const cs = getComputedStyle(el);
+      if (cs.position === 'sticky') {
+        if (!stickySeen.has(el)) {
+          stickySeen.add(el);
+          if (floatsLow(el, cs)) overlays.set(el, 'extra');
+        }
+        return;
+      }
+      if (cs.position !== 'fixed') return;
       const r = screenBox(el);
       if (!r || r.width <= 0 || r.height <= 0) return;
+      if (atTop && (r.right <= 0 || r.left >= vw || r.bottom <= 0 || r.top >= vh)) {
+        if (r.height >= vh * 0.6 && r.width >= vw * 0.5) return;
+        overlays.set(el, 'extra');
+        return;
+      }
       overlays.set(el, atTop ? overlayRole(el) : lateRole(el));
     });
   }
@@ -1647,14 +1723,72 @@
   // copies down the space the page reserves for it, which they fill. The
   // section itself is hidden. One that looks the same at every stage is
   // left as it is.
+  //
+  // A smaller sticky panel can do the same beside a column of content
+  // (saybriefly.com's meeting features: a picture stuck beside a list of
+  // four, swapped by script for the item level with it). Back in flow it
+  // would show the first picture once and leave empty space beside the
+  // other three. It is laid out as its stages too, but only when what it
+  // shows changes from stage to stage (another picture, other text, a part
+  // shown or hidden) over a quarter of it or more: a table of contents
+  // that lights up the heading in view changes one line, and stays a
+  // single panel.
+  function stickyPanel(el) {
+    const cs = getComputedStyle(el);
+    const r = screenBox(el);
+    const h = shownHeight(el);
+    const box = el.parentElement && el.parentElement.getBoundingClientRect();
+    return !!r && r.width >= 150 && h >= 150 && h < window.innerHeight && !floatsLow(el, cs) &&
+      !!box && box.height >= h * 1.5;
+  }
+
+  // What a panel shows, for telling its stages apart: each visible part
+  // that paints something (text, a picture, a canvas, a background), with
+  // where it sits in the panel and how much of the panel it covers.
+  function shownParts(frame) {
+    const fr = frame.getBoundingClientRect();
+    const out = new Map();
+    const walk = (el, op) => {
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none') return;
+      const o = op * Number(cs.opacity);
+      if (o < 0.5) return;
+      const r = el.getBoundingClientRect();
+      if (cs.visibility === 'visible' && r.width > 0 && r.height > 0) {
+        const text = Array.from(el.childNodes).filter((n) => n.nodeType === 3).map((n) => n.textContent.trim()).join(' ');
+        const media = el.currentSrc || (el.getAttribute && el.getAttribute('src')) || '';
+        const bg = cs.backgroundImage !== 'none' ? cs.backgroundImage : '';
+        const fill = /rgba\([^)]*,\s*0\)|transparent/.test(cs.backgroundColor) ? '' : cs.backgroundColor;
+        if (text || media || bg || fill || /^(CANVAS|svg|VIDEO)$/.test(el.tagName)) {
+          const w = Math.min(r.right, fr.right) - Math.max(r.left, fr.left);
+          const h = Math.min(r.bottom, fr.bottom) - Math.max(r.top, fr.top);
+          const key = `${el.tagName}|${text}|${media}|${bg}|${fill}|${Math.round((r.left - fr.left) / 8)},${Math.round((r.top - fr.top) / 8)}`;
+          out.set(key, (out.get(key) || 0) + Math.max(0, w) * Math.max(0, h));
+        }
+      }
+      for (const c of el.children) walk(c, o);
+    };
+    walk(frame, 1);
+    return out;
+  }
+
+  // The share of a panel's area whose parts differ between two looks.
+  function partsChanged(a, b, area) {
+    let gone = 0, came = 0;
+    for (const [k, v] of a) if (!b.has(k)) gone += v;
+    for (const [k, v] of b) if (!a.has(k)) came += v;
+    return area > 0 ? Math.min(1, Math.max(gone, came) / area) : 0;
+  }
+
   async function filmPinnedSections() {
     const vh = window.innerHeight;
     const frames = allElements().filter((el) => {
       if (!(el instanceof HTMLElement) || getComputedStyle(el).position !== 'sticky') return false;
-      return !inHeaderZone(el) && isPinnedSection(el);
+      return !inHeaderZone(el) && (isPinnedSection(el) || stickyPanel(el));
     });
     for (const frame of frames) {
       if (frames.some((f) => f !== frame && f.contains(frame))) continue;
+      const panel = !isPinnedSection(frame);
       const parent = frame.parentElement;
       const stick = parseFloat(getComputedStyle(frame).top) || 0;
       const y = scroller.scrollTop;
@@ -1673,9 +1807,21 @@
         await raf();
         await sleep(150);
         await waitForVisibleImages(800);
-        stages.push({ at: off + travel * k / (n - 1), node: frame.cloneNode(true) });
+        const stage = { at: off + travel * k / (n - 1), node: frame.cloneNode(true) };
+        if (panel) {
+          stage.parts = shownParts(frame);
+          // How each part looks here, for the copy to keep: a script that
+          // swaps the pictures by inline opacity finds the copies too.
+          stage.looks = Array.from(frame.querySelectorAll('*')).map((e) => {
+            const cs = getComputedStyle(e);
+            return [cs.opacity, cs.visibility];
+          });
+        }
+        stages.push(stage);
       }
-      if (stages.every((s) => s.node.outerHTML === stages[0].node.outerHTML)) continue;
+      if (panel
+        ? stages.every((s) => partsChanged(stages[0].parts, s.parts, r.width * h) < 0.25)
+        : stages.every((s) => s.node.outerHTML === stages[0].node.outerHTML)) continue;
       // The page's script may size the container by how many frames it
       // holds (agcsf.com's grew a screen per copy), so it keeps its height.
       parent.style.setProperty('--cleanshot-height', `${pr.height}px`);
@@ -1691,7 +1837,7 @@
       frame.setAttribute('data-cleanshot-filmed', '');
       const left = r.left - pr.left - parseFloat(ps.borderLeftWidth);
       let after = frame;
-      for (const { at, node } of stages) {
+      for (const { at, node, looks } of stages) {
         node.setAttribute('data-cleanshot-clone', '');
         node.setAttribute('aria-hidden', 'true');
         for (const [p, v] of [['position', 'absolute'], ['top', `${at - parseFloat(ps.borderTopWidth)}px`], ['left', `${left}px`],
@@ -1702,11 +1848,20 @@
         // scroll (agcsf.com's slides every row of photos it can find, every
         // frame), so each copy's styles as copied are held through the
         // stylesheet, where the script's inline writes lose.
-        const rules = [node, ...node.querySelectorAll('[style]')].map((c) => {
+        // A panel's parts keep how they looked at that stage as well.
+        const parts = Array.from(node.querySelectorAll('*'));
+        const list = looks ? [node, ...parts] : [node, ...node.querySelectorAll('[style]')];
+        const rules = list.map((c) => {
           const id = String(clones.length);
           clones.push(c);
           c.setAttribute('data-cleanshot-cid', id);
-          const decl = Array.from(c.style).map((p) => `${p}: ${c.style.getPropertyValue(p)} !important;`).join(' ');
+          const props = Array.from(c.style);
+          let decl = props.map((p) => `${p}: ${c.style.getPropertyValue(p)} !important;`).join(' ');
+          const look = looks && c !== node ? looks[parts.indexOf(c)] : null;
+          if (look) {
+            if (!props.includes('opacity')) decl += ` opacity: ${look[0]} !important;`;
+            if (!props.includes('visibility')) decl += ` visibility: ${look[1]} !important;`;
+          }
           return `[data-cleanshot-cid="${id}"] { ${decl} }`;
         });
         styleEl.textContent += `\n${rules.join('\n')}`;
@@ -1714,7 +1869,7 @@
         after = node;
       }
       const top = Math.round(pr.top + y);
-      notes.push({ kind: 'pinned-stages', y0: top, y1: Math.round(top + pr.height), note: `a section that stays on screen while the page scrolls past it, changing as it goes (y ${top}-${Math.round(top + pr.height)}), is shown as ${n} screens, one for each stage` });
+      notes.push({ kind: 'pinned-stages', y0: top, y1: Math.round(top + pr.height), note: `${panel ? 'a panel' : 'a section'} that stays on screen while the page scrolls past it, changing as it goes (y ${top}-${Math.round(top + pr.height)}), is shown as ${n} ${panel ? 'copies down its column' : 'screens'}, one for each stage` });
     }
     scroller.scrollTo(0, 0);
     await sleep(150);
@@ -1823,11 +1978,16 @@
   // A small sticky element told to stick in the lower half of the screen
   // (Loops' "Book a demo" card, `top: calc(100vh - …)`) is a floating button
   // that follows the reader, not a heading. Put back in flow it lands in
-  // the middle of the content, so it's hidden like the other extras.
+  // the middle of the content, so it's hidden like the other extras. So is
+  // a small one stuck by its bottom edge (`top: auto; bottom: 24px`): it
+  // rides the bottom of the screen, the way a "back to top" button or a
+  // floating call button does (www.louvre.fr's is a zero-height box whose
+  // button hangs out of it, measured by what it holds).
   function floatsLow(el, cs) {
     const top = parseFloat(cs.top);
+    const byBottom = cs.top === 'auto' && cs.bottom !== 'auto';
     const r = screenBox(el);
-    return top >= window.innerHeight * 0.5 && !!r &&
+    return (top >= window.innerHeight * 0.5 || byBottom) && !!r && r.width > 0 && r.height > 0 &&
       r.height < window.innerHeight * 0.3 && r.width < document.documentElement.clientWidth * 0.5;
   }
 
@@ -1835,6 +1995,7 @@
     allElements().forEach((el) => {
       const cs = getComputedStyle(el);
       if (cs.position === 'sticky') {
+        stickySeen.add(el);
         if (floatsLow(el, cs)) overlays.set(el, 'extra');
         else if (!inHeaderZone(el) && !isPinnedSection(el)) el.setAttribute('data-cleanshot-unstick', '');
       } else if (cs.position === 'fixed' && el.classList.contains('Parallax-item')) {
@@ -2077,6 +2238,7 @@
       el.style.removeProperty('--cleanshot-pad');
     });
     firstScreen = new Map();
+    stickySeen = new WeakSet();
     anchors = [];
     stickyHeaders = new Set();
     overlays = new Map();

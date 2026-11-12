@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: a header whose logo swaps by class once the page scrolls</title>
+<!-- The header (120px, white) sits in the page's flow at the top with the
+     full wordmark (cyan). Once the page is scrolled past 100px it turns
+     fixed, and a class swaps the wordmark for a compact logo (orange) by
+     opacity, as www.guggenheim.org's does (its wordmark is an SVG). The top of the capture must show
+     the header as a visitor sees it at scroll 0: the wordmark, and no
+     compact logo there or anywhere else. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  #hd{height:120px;background:#fff;position:relative;width:100%;top:0;left:0;z-index:50;font:18px/120px sans-serif}
+  #hd nav{position:absolute;left:400px;top:0}
+  #word,#g{position:absolute;left:54px;top:30px;height:60px;transition:opacity .3s}
+  #word{width:240px}
+  #g{width:60px;background:rgb(255,128,0);opacity:0}
+  body.stuck #hd{position:fixed}
+  body.stuck #word{opacity:0}
+  body.stuck #g{opacity:1}
+  body.stuck{padding-top:120px}
+</style>
+<script src="bands.js"></script>
+<header id="hd"><svg id="word" viewBox="0 0 240 60"><rect width="240" height="60" fill="rgb(0,200,200)"/></svg><div id="g"></div><nav><a href="#a">About</a> <a href="#b">Services</a> <a href="#c">Contact</a></nav></header>
+<main id="m"></main>
+<script>
+  addBands(document.getElementById('m'), 0, 25);
+  addEventListener('scroll', () => { document.body.classList.toggle('stuck', scrollY > 100); });
+</script>

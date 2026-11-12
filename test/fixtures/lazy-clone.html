@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: a lazy image inside a carousel slide copied after the loader started</title>
+<!-- Bands 0-7, then a testimonial carousel (300px), then bands 8-17. Each
+     slide has a star rating image held back by a lazy loader in the
+     Perfmatters / lazysizes style: a blank SVG placeholder in `src`, the
+     real picture (magenta, lazy-star.svg) in `data-src`, swapped in by an
+     IntersectionObserver the loader sets up when the page loads. The
+     carousel then copies its first slide to the end for looping, as Swiper
+     does; the copy is never observed, so it keeps the placeholder
+     (paulbunyanplumbing.com's third review). All three slides are on
+     screen side by side; each shows its stars to a visitor once loaded, and
+     must in the capture. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  #car{height:300px;overflow:hidden;background:#fff}
+  #track{display:flex;gap:40px;padding:60px 40px}
+  .slide{flex:0 0 360px;height:180px;background:#eee;font:20px/28px sans-serif;padding:20px;box-sizing:border-box}
+  .slide img{display:block;width:288px;height:48px;margin-top:20px}
+</style>
+<script src="bands.js"></script>
+<div id="above"></div>
+<div id="car"><div id="track"></div></div>
+<div id="below"></div>
+<script>
+  addBands(document.getElementById('above'), 0, 8);
+  addBands(document.getElementById('below'), 8, 10);
+  const blank = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='288'%20height='48'%20viewBox='0%200%20288%2048'%3E%3C/svg%3E";
+  const track = document.getElementById('track');
+  track.innerHTML = ['Great service, on time.', 'Fixed it the same day.']
+    .map((t) => `<div class="slide">${t}<img class="lazy" src="${blank}" data-src="lazy-star.svg" alt="5 stars"></div>`).join('');
+  const io = new IntersectionObserver((entries) => entries.forEach((e) => {
+    if (!e.isIntersecting) return;
+    e.target.src = e.target.dataset.src;
+    e.target.classList.remove('lazy');
+    io.unobserve(e.target);
+  }));
+  document.querySelectorAll('img.lazy').forEach((img) => io.observe(img));
+  // The carousel's loop copy, made after the loader looked.
+  const copy = track.firstElementChild.cloneNode(true);
+  copy.classList.add('slide-duplicate');
+  track.appendChild(copy);
+</script>
