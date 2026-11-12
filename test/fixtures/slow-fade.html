@@ -1,0 +1,37 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: a scroll-linked fade that answers late</title>
+<!-- A black heading block (y 2284-2384) on a white section, its opacity set
+     by script from where it sits on screen, the way Squarespace's block
+     fades work (www.element-outdoorliving.com): opaque once it is 250px
+     above the bottom of the screen, fading out below that. The script
+     answers only once the scroll has stopped for 150ms, so the
+     pre-scroll's short stops never see it change. The second tile (scroll 1544) has it 740px down the screen, at
+     0.43; the third (scroll 2316) has it at the top, opaque, in the rows
+     the two tiles share. The capture must show it opaque, whole. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  #white{height:300px;background:#fff;position:relative}
+  #block{position:absolute;left:100px;top:84px;width:1000px;height:100px;background:#000;opacity:0}
+</style>
+<script src="bands.js"></script>
+<main id="m"></main>
+<script>
+  const m = document.getElementById('m');
+  addBands(m, 0, 11);
+  const w = document.createElement('section');
+  w.id = 'white';
+  w.innerHTML = '<div id="block"></div>';
+  m.appendChild(w);
+  addBands(m, 11, 14);
+  const block = document.getElementById('block');
+  let t = null;
+  const target = () => {
+    const top = block.getBoundingClientRect().top;
+    return Math.max(0, Math.min(1, (innerHeight - top) / 300));
+  };
+  addEventListener('scroll', () => {
+    clearTimeout(t);
+    t = setTimeout(() => { block.style.opacity = String(target()); }, 150);
+  }, { passive: true });
+</script>
