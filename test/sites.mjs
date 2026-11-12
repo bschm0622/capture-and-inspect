@@ -11,7 +11,7 @@
 
 import { seams, repeatedOverlays, boundaries } from './lib/detectors.mjs';
 import { flatShare, findStrip, seamRepeats, showsIn, inkLevel, textContrast, result } from './lib/regions.mjs';
-import { cols } from './lib/image.mjs';
+import { cols, rowDiff } from './lib/image.mjs';
 
 // Floating extras (cookie banners, popups, promo and widget buttons) found on
 // the live page's first screen after the capture, and the site's fixed
@@ -846,6 +846,123 @@ export const SITES = [
           s >= 0.9 ? [] : [{ y0: l.top, y1: l.top + l.h, note: 'logo differs from the first screen' }]);
       }
     }
+  },
+  {
+    // A Divi header, in the page's flow at scroll 0 and fixed once the page
+    // scrolls, through a rule more specific than the capture's and
+    // !important. It stayed fixed at the top of every later tile, and its
+    // bottom 11px showed below each overlap, a black stripe across the page
+    // at every tile edge. It must be at the top, and its rows must not show
+    // again where a tile starts painting.
+    host: 'hermansplumbing.com',
+    url: 'https://hermansplumbing.com',
+    collect: () => {
+      const h = document.getElementById('main-header') || document.querySelector('header');
+      if (!h) return { nav: null };
+      const r = h.getBoundingClientRect();
+      return { nav: { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) } };
+    },
+    checks: {
+      'fixed-nav-kept': navKept,
+      'late-header-once'({ img, tiles, facts }) {
+        const n = facts.nav;
+        if (!n || n.top > 2) return result(false, null, 'header not found at the top of the page');
+        // Where a tile starts painting below its own top, the rows it shot
+        // there are the header's same rows, if the header rode along.
+        const flags = [];
+        for (const t of tiles.slice(1)) {
+          const o = (t.drawY ?? t.y) - t.y;
+          if (o < 0 || o >= n.h - 4) continue;
+          const rows = [];
+          for (let k = o; k < n.h && t.y + k < img.H; k++) rows.push(rowDiff(img, n.top + k, t.y + k));
+          if (rows.length >= 4 && rows.reduce((a, b) => a + b, 0) / rows.length < 4) {
+            flags.push({ y0: t.y + o, y1: t.y + n.h, note: `the header's bottom ${n.h - o}px below the tile edge at ${t.y + o}px` });
+          }
+        }
+        return result(!flags.length, flags.length, `${flags.length} tile edge(s) show the header's bottom rows`, flags);
+      }
+    }
+  },
+  {
+    // A sticky panel ("Roofing Options Tailored to Your Home") beside a
+    // column of cards. It slides in as a whole (AOS fade-right), so its
+    // stages looked different, and it was drawn four times down its column,
+    // each copy measured mid-slide and cut off at the left. Its content
+    // doesn't change: it belongs once, at its place, whole.
+    host: 'newmanroofing.com',
+    url: 'https://newmanroofing.com',
+    collect: () => {
+      const L = (el) => { let top = 0, left = 0; for (let a = el; a; a = a.offsetParent) { top += a.offsetTop; left += a.offsetLeft; } return { top, left, w: el.offsetWidth, h: el.offsetHeight }; };
+      const h = [...document.querySelectorAll('h1, h2, h3')].find((e) => /Roofing Options Tailored/i.test(e.textContent));
+      if (!h) return { heading: null };
+      let sec = h.parentElement;
+      while (sec && sec.parentElement && sec.getBoundingClientRect().height < innerHeight * 1.5) sec = sec.parentElement;
+      return { heading: L(h), section: sec ? L(sec) : null };
+    },
+    checks: {
+      'sticky-panel-once'({ img, facts }) {
+        const h = facts.heading;
+        if (!h) return result(false, null, '"Roofing Options Tailored to Your Home" not found on the page');
+        const s0 = facts.section ? facts.section.top : h.top - 1500, s1 = facts.section ? facts.section.top + facts.section.h : h.top + 2500;
+        const { rows, matches } = findStrip(img, h, s0, s1);
+        // (Its first letters, at the left of the heading: cut off in a copy
+        // measured mid-slide.)
+        const lead = inkLevel(img, { top: h.top, left: h.left, w: 60, h: Math.min(h.h, 60) });
+        const extra = matches.filter((y) => Math.abs(y - h.top) > 8).map((y) => ({ y0: y, y1: y + h.h, note: 'copy of the sticky panel heading' }));
+        const flags = [...extra, ...(lead == null || lead > 120 ? [{ y0: h.top, y1: h.top + h.h, note: `heading's first letters missing (darkest marks ${lead})` }] : [])];
+        return result(rows >= 8 && !flags.length, matches.length, `heading appears ${matches.length}x in its section; first letters' darkest marks ${lead} (fail above 120)`, flags);
+      }
+    }
+  },
+  {
+    // An outlined button ("Explore Our Offices") that AOS fades up when it
+    // comes into view, which the pre-scroll didn't always see. It sat at the
+    // bottom of a tile: shown there not yet revealed, shown revealed in the
+    // tile below, and when the tile above was shot again (after a scroll
+    // from above, so not yet revealed again) the seam cut it, its top lost.
+    // Both halves of it must show the same red marks.
+    host: 'www.clunegc.com',
+    url: 'https://www.clunegc.com',
+    collect: () => {
+      const L = (el) => { let top = 0, left = 0; for (let a = el; a; a = a.offsetParent) { top += a.offsetTop; left += a.offsetLeft; } return { top, left, w: el.offsetWidth, h: el.offsetHeight }; };
+      const a = [...document.querySelectorAll('a')].find((e) => /Explore Our Offices/i.test(e.textContent) && e.offsetHeight > 20);
+      return { button: a ? L(a) : null };
+    },
+    checks: {
+      'reveal-whole'({ img, facts }) {
+        const b = facts.button;
+        if (!b) return result(false, null, '"Explore Our Offices" button not found on the page');
+        const k = Math.floor(b.h / 2);
+        const top = inkLevel(img, { ...b, h: k }), bottom = inkLevel(img, { ...b, top: b.top + k, h: b.h - k });
+        const bad = top == null || bottom == null || top > 160 || bottom > 160 || Math.abs(top - bottom) > 50;
+        return result(!bad, Math.max(top ?? 255, bottom ?? 255), `button's darkest marks ${top} in its top half, ${bottom} in its bottom half (fail above 160 or 50 apart)`,
+          bad ? [{ y0: b.top, y1: b.top + b.h, note: 'button cut or missing' }] : []);
+      }
+    }
+  },
+  {
+    // A Squarespace heading block whose opacity the page eases by where it
+    // sits on screen, late enough after a scroll that the pre-scroll never
+    // saw it change. A tile caught it near the bottom of the screen, at
+    // about 0.4, and the tile below, opaque; the tile above was shot again
+    // and caught it at 0.4 again, so the capture showed it pale grey. Its
+    // dark text must be at full strength.
+    host: 'www.element-outdoorliving.com',
+    url: 'https://www.element-outdoorliving.com',
+    collect: () => {
+      const L = (el) => { let top = 0, left = 0; for (let a = el; a; a = a.offsetParent) { top += a.offsetTop; left += a.offsetLeft; } return { top, left, w: el.offsetWidth, h: el.offsetHeight }; };
+      const h = [...document.querySelectorAll('h1, h2, h3')].find((e) => /TEAM YOU CAN TRUST/i.test(e.textContent));
+      return { heading: h ? L(h) : null };
+    },
+    checks: {
+      'late-fade-opaque'({ img, facts }) {
+        const h = facts.heading;
+        if (!h) return result(false, null, '"A team you can trust…" heading not found on the page');
+        const ink = inkLevel(img, h);
+        return result(ink != null && ink <= 110, ink, `heading's darkest marks ${ink} (fail above 110)`,
+          ink != null && ink <= 110 ? [] : [{ y0: h.top, y1: h.top + h.h, note: 'heading faded' }]);
+      }
+    }
   }
 ];
 
@@ -904,6 +1021,10 @@ export const KNOWN = {
   'clock-released': "Page left frozen after the capture: its slider didn't move again",
   'slider-in-one-shot': 'Slider on a timer set at page load cut by a tile edge (two moments, or right only by luck)',
   'sticky-column-whole': 'Column a script makes sticky hidden as a floating extra: its text lost below a tile edge',
-  'header-as-at-scroll-0': "Header's scrolled-state logo held visible over its wordmark at the top of the capture"
+  'header-as-at-scroll-0': "Header's scrolled-state logo held visible over its wordmark at the top of the capture",
+  'late-header-once': 'Header fixed by a stronger page rule rode along in every tile: its bottom rows a stripe at each tile edge',
+  'sticky-panel-once': 'Sticky panel with an entrance slide shown as copies down its column, each cut off at the left',
+  'reveal-whole': 'Reveal the pre-scroll missed, cut by the seam between a shot without it and one with it',
+  'late-fade-opaque': 'Scroll-linked fade too late for the pre-scroll caught part-way in a tile shot again: heading pale'
 };
 
