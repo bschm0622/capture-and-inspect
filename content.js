@@ -911,6 +911,50 @@
       .map(({ el, max, tf }) => ({ el, max, tf }));
   }
 
+  // An entrance the pre-scroll missed, seen between tiles: something near
+  // the screen that was fainter at an earlier tile and is more visible now
+  // has been revealed by the capture's scroll (www.clunegc.com's AOS
+  // `fade-up` button, which the pre-scroll's quick stops sometimes never
+  // saw change). It is held as the fades above are, from the next shot on:
+  // the tile above, shot again because the two disagree, would show it as
+  // not yet revealed (the page plays it again once it is scrolled back
+  // below its trigger line), and the seam between the shots cut it.
+  // Not what the page changes on its own clock, what floats over the page
+  // or the inside of an SVG, and not a layer stacked on another held one
+  // or on one that faded out meanwhile (a slideshow's or a tab set's next
+  // panel coming up over the last).
+  let tileOps = new WeakMap();   // element -> {op, tf} as last seen near the screen at a tile
+  function noteEntrances() {
+    const vh = window.innerHeight;
+    const heldEls = new Set(held.map((h) => h.el));
+    const fresh = [], gone = [];
+    allElements().forEach((el) => {
+      if (!(el instanceof HTMLElement) || heldEls.has(el)) return;
+      const r = el.getBoundingClientRect();
+      if (!(r.height > 0 && r.width > 0 && r.bottom > -vh / 2 && r.top < vh * 1.5)) return;
+      const cs = getComputedStyle(el);
+      const op = Number(cs.opacity);
+      const was = tileOps.get(el);
+      tileOps.set(el, { op });
+      if (was && op < was.op - 0.05) gone.push({ el, r });
+      if (!was || op < was.op + 0.05 || restless.has(el) || el.closest('svg') || pinnedToScreen(el)) return;
+      fresh.push({ el, max: op, tf: [cs.transform, cs.translate], r });
+    });
+    if (!fresh.length) return;
+    const boxes = held.filter((h) => h.el.isConnected).map((h) => ({ el: h.el, r: h.el.getBoundingClientRect() })).concat(fresh, gone);
+    const area = (r) => Math.max(0, r.width) * Math.max(0, r.height);
+    const stacked = (a, b) => {
+      if (a.el.contains(b.el) || b.el.contains(a.el)) return false;
+      const w = Math.min(a.r.right, b.r.right) - Math.max(a.r.left, b.r.left);
+      const h = Math.min(a.r.bottom, b.r.bottom) - Math.max(a.r.top, b.r.top);
+      return w > 0 && h > 0 && w * h > 0.5 * Math.min(area(a.r), area(b.r));
+    };
+    for (const a of fresh) {
+      if (boxes.some((b) => b !== a && stacked(a, b))) continue;
+      held.push({ el: a.el, max: a.max, tf: a.tf });
+    }
+  }
+
   // Before each tile, let go of the holds and read where the page has each
   // fade now. One still below the most it has reached is held there; one at
   // or past it (a fade-in that has since finished, maybe beyond what the
@@ -2248,6 +2292,7 @@
       el.style.removeProperty('--cleanshot-tr');
     }
     held = [];
+    tileOps = new WeakMap();
     scrollLinked = new Map();
     topOffsets = new Map();
     fades = new Map();
@@ -2345,6 +2390,7 @@
           hideOverlays(msg.index);
           if (msg.index > 0) pinFirstScreen();
           applyFades();
+          noteEntrances();
           await freezeVideos();
           let dirty = [];
           if (clockHeld) {
