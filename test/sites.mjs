@@ -963,6 +963,39 @@ export const SITES = [
           ink != null && ink <= 110 ? [] : [{ y0: h.top, y1: h.top + h.h, note: 'heading faded' }]);
       }
     }
+  },
+  {
+    // A Divi header row that its script makes fixed once the page scrolls,
+    // writing `position: fixed !important` inline, and in flow again at the
+    // top. The capture put back the stuck values after the script had
+    // unstuck it, so the row stayed fixed with its spacer gone: the top of
+    // the capture showed the hero photo where the white bar and the boxed
+    // logo belong, the nav drawn over the photo, and the hero cut at the
+    // first seam. The bar must be white with the logo on it.
+    host: 'arnettcustomhomes.com',
+    url: 'https://arnettcustomhomes.com',
+    collect: () => {
+      const logo = document.querySelector('header img');
+      if (!logo) return { logo: null };
+      let row = logo.parentElement;
+      while (row && row.getBoundingClientRect().width < innerWidth * 0.9) row = row.parentElement;
+      const B = (el) => { const r = el.getBoundingClientRect(); return { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; };
+      return { logo: B(logo), row: row ? B(row) : null };
+    },
+    checks: {
+      'header-whole'({ img, facts }) {
+        const { logo, row } = facts;
+        if (!logo || !row || row.top > 2 || row.h > 200) return result(false, null, 'header row with the logo not found at the top of the page');
+        const [x0, x1] = cols(img, row.left, row.w);
+        let n = 0, white = 0;
+        for (let y = row.top; y < Math.min(img.H, row.top + row.h); y++) for (let x = x0; x < x1; x++) { n++; if (img.luma[y * img.W + x] >= 235) white++; }
+        const share = n ? white / n : 0;
+        const ink = inkLevel(img, logo);
+        const ok = share >= 0.75 && ink != null && ink <= 80;
+        return result(ok, +share.toFixed(2), `${Math.round(share * 100)}% of the header row white (fail under 75%); logo's darkest marks ${ink} (fail above 80)`,
+          ok ? [] : [{ y0: row.top, y1: row.top + row.h, note: 'header bar or logo missing' }]);
+      }
+    }
   }
 ];
 
@@ -1025,6 +1058,7 @@ export const KNOWN = {
   'late-header-once': 'Header fixed by a stronger page rule rode along in every tile: its bottom rows a stripe at each tile edge',
   'sticky-panel-once': 'Sticky panel with an entrance slide shown as copies down its column, each cut off at the left',
   'reveal-whole': 'Reveal the pre-scroll missed, cut by the seam between a shot without it and one with it',
-  'late-fade-opaque': 'Scroll-linked fade too late for the pre-scroll caught part-way in a tile shot again: heading pale'
+  'late-fade-opaque': 'Scroll-linked fade too late for the pre-scroll caught part-way in a tile shot again: heading pale',
+  'header-whole': "Header a script fixes inline kept fixed after it unstuck: the bar and logo lost, the hero cut at the first seam"
 };
 
