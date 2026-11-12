@@ -386,6 +386,29 @@ export const FIXTURES = [
     }
   },
   {
+    name: 'widget-layer', file: 'widget-layer.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { top: 100 }),
+      // Chat launchers (magenta) held in see-through full-window layers,
+      // one there at load and one added on scroll: neither may show.
+      'launchers-hidden': ({ img }) => {
+        const runs = rowsWith(img, [255, 0, 255], { min: 4 });
+        return result(runs.length === 0, runs.length, `${runs.length} place(s) in the capture show a chat launcher`,
+          runs.map((r) => ({ ...r, note: 'chat launcher in the capture' })));
+      },
+      // The header (cyan) held in a layer of the same kind: at the top of
+      // the capture, and nowhere else.
+      'header-once-at-top': ({ img }) => {
+        const runs = rowsWith(img, [0, 200, 200], { min: 30 });
+        const top = runs.find((r) => r.y0 <= 4 && r.y1 >= 90);
+        const rest = runs.filter((r) => r !== top);
+        return result(!!top && rest.length === 0, rest.length,
+          `${top ? 'header at the top' : 'no header at the top'}; ${rest.length} other place(s) show it`,
+          [...(top ? [] : [{ y0: 0, y1: 100, note: 'header missing' }]), ...rest.map((r) => ({ ...r, note: 'header repeated' }))]);
+      }
+    }
+  },
+  {
     name: 'header-swap', file: 'header-swap.html', settleMs: 500,
     checks: {
       'bands-in-place': ({ img }) => bandsInPlace(img, { top: 120 }),

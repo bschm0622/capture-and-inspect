@@ -179,6 +179,7 @@ Name it for the failure it catches, and keep it to that one failure: never asser
 | `header-swap` | a header that turns fixed on scroll and swaps its SVG wordmark for a compact logo by opacity: fades under something fixed aren't held (`sampleScrollEffects`, `holdFades`) | wordmark at the top, compact logo nowhere |
 | `sticky-swap` | a sticky panel beside four items whose picture a script swaps for the item level with it: `filmPinnedSections` (panels) | each item has its own picture beside it |
 | `lazy-clone` | a carousel's loop copy of a slide made after the lazy loader set up its observer: placeholder `src`, real one in `data-src` (`wakeLazyImage`) | stars in every slide on screen |
+| `widget-layer` | chat launchers placed inside a see-through full-window layer stacked high in a shadow root (one at load, one added on scroll), and a header in a layer of the same kind: `heldFloats` | no launcher anywhere, header at the top once |
 
 `edges-match-page` compares with screenshots the harness takes after the capture (`refShots` on a fixture: CSS y to centre in the window). At a6c3f84 and 9e30e54: `tall-40k` and `tall-64k` fail outright ("The size of the OffscreenCanvas is zero": the stitching canvas is created taller than 65535 px, holds nothing, and `convertToBlob` throws; the area check doesn't look at the side limit); the other four pass. Since the bands, all pass. The pages trigger their behaviour only on the capture's own scrolls (a tile step, or scrolls 400 ms or more apart), not on the pre-scroll's quick stops.
 

@@ -1378,11 +1378,17 @@
   function overlayRole(el) {
     const vw = document.documentElement.clientWidth;
     const vh = window.innerHeight;
-    const r = screenBox(el);
+    let r = screenBox(el);
     if (el.matches(DIALOG)) return 'extra';
-    if (r.width >= vw * 0.9 && r.height >= vh * 0.9) return isScrimOrDialog(el) ? 'extra' : 'backdrop';
+    let held = null;
+    if (r.width >= vw * 0.9 && r.height >= vh * 0.9) {
+      if (isScrimOrDialog(el)) return 'extra';
+      held = heldFloats(el);
+      if (!held) return 'backdrop';
+      r = held;
+    }
     if (r.top <= 150) {
-      const h = Math.max(r.height, el.scrollHeight);
+      const h = held ? r.height : Math.max(r.height, el.scrollHeight);
       if (r.width >= vw * 0.5 && h < vh * 0.6) return 'nav';
       if (el.matches(NAV) || el.querySelector(NAV) || el.querySelectorAll('a[href]').length >= 3) return 'nav';
       if (h < 150 && el.querySelector('a[href], button, img, svg')) return 'nav';
@@ -1393,6 +1399,41 @@
     // far above everything else.
     if (r.width * r.height >= vw * vh * 0.2 && stackLevel(el) <= 10 && !isScrimOrDialog(el)) return 'backdrop';
     return 'extra';
+  }
+
+  // A full-screen layer stacked over the page that paints nothing itself,
+  // only a few small things inside it: a widget's root spread over the
+  // window so its launcher can be placed anywhere (www.bloomdentist.com's
+  // chat, a transparent 1388x868 layer at z-index 10000 in a shadow root
+  // with its "Chat with us" pill in the corner, was taken for a backdrop
+  // and kept in the first tile). Returns the box of what it shows, to be
+  // sorted by that, or null when the layer is a real backdrop.
+  function heldFloats(el) {
+    if (stackLevel(el) <= 10) return null;
+    const vw = document.documentElement.clientWidth;
+    const vh = window.innerHeight;
+    const bare = (e) => {
+      const cs = getComputedStyle(e);
+      return cs.backgroundImage === 'none' && (!cs.backdropFilter || cs.backdropFilter === 'none') &&
+        /^(transparent|rgba\(.*,\s*0\))$/.test(cs.backgroundColor);
+    };
+    if (!bare(el)) return null;
+    let box = null;
+    const inner = el.querySelectorAll('*');
+    for (let i = 0; i < inner.length && i < 300; i++) {
+      const c = inner[i].getBoundingClientRect();
+      if (c.width < 2 || c.height < 2) continue;
+      if (c.right <= 0 || c.left >= vw || c.bottom <= 0 || c.top >= vh) continue;
+      // A wrapper as big as the layer and as bare is more of the same.
+      if (c.width >= vw * 0.9 && c.height >= vh * 0.9 && bare(inner[i])) continue;
+      if (inner[i].checkVisibility && !inner[i].checkVisibility({ opacityProperty: true, visibilityProperty: true })) continue;
+      box = box
+        ? { left: Math.min(box.left, c.left), top: Math.min(box.top, c.top), right: Math.max(box.right, c.right), bottom: Math.max(box.bottom, c.bottom) }
+        : { left: c.left, top: c.top, right: c.right, bottom: c.bottom };
+    }
+    if (!box) return null;
+    box = { ...box, width: box.right - box.left, height: box.bottom - box.top };
+    return box.width * box.height < vw * vh * 0.2 ? box : null;
   }
 
   // The z-index an element is painted at: its own, or the nearest
@@ -1422,8 +1463,10 @@
   // is page content the page pins while it is read: 'flow', put back where
   // the page had it (see placeInFlow).
   function lateRole(el) {
-    const r = screenBox(el);
+    let r = screenBox(el);
     if (el.matches(DIALOG) || isScrimOrDialog(el)) return 'extra';
+    const held = r.width >= document.documentElement.clientWidth * 0.9 && r.height >= window.innerHeight * 0.9 && heldFloats(el);
+    if (held) r = held;
     const tall = r.height >= window.innerHeight * 0.6 && r.width >= document.documentElement.clientWidth * 0.5;
     if (tall) return 'content';
     if (flowBoxes.get(el)) return 'flow';
