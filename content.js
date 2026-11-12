@@ -513,6 +513,12 @@
         for (const t of times) {
           if (performance.now() - t0 > VIDEO_PICK_MS) break;
           const a = await grab(t), b = await grab(t + 0.3);
+          // (A frame of one colour, black before a fade-in, holds still
+          // too, and shows nothing: www.hitt.com's hero came out black.)
+          let m = 0, m2 = 0;
+          for (let i = 0; i < a.length; i += 4) { const l = (a[i] * 77 + a[i + 1] * 150 + a[i + 2] * 29) >> 8; m += l; m2 += l * l; }
+          const n = a.length / 4;
+          if (Math.sqrt(Math.max(0, m2 / n - (m / n) ** 2)) < 12) continue;
           let s = 0;
           for (let i = 0; i < a.length; i += 4) s += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
           const change = s / (a.length / 4) / 3;
@@ -2132,6 +2138,11 @@
         } else if (msg.cmd === 'tile') {
           covered = [];
           unlockScroll();
+          if (msg.from != null && msg.from < msg.y) {
+            scrollPage(msg.from);
+            await raf();
+            await raf();
+          }
           scrollPage(msg.y);
           await raf();
           await raf();
@@ -2155,6 +2166,9 @@
           if (clockHeld) {
             pauseClockAnimations();
             pausePlayers();
+            // (A page that plays its videos again when they come into view
+            // has had the settle wait to do it: back on their frame first.)
+            await freezeVideos();
             const st = await requestStills();
             if (st && st.dirty) dirty = st.dirty;
           }

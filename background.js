@@ -642,7 +642,10 @@ async function stitchTiles(tab, info) {
       // frozen frame, with no time for the page to start them again.
       await captureReady();
       shots++;
-      const again = await sendToTab(tab.id, { cmd: 'tile', y: last.actualY, index: last.index, total, keepAnchors: true });
+      // (Reached from above, the way it was the first time: some pages
+      // set things by the direction the page last scrolled, r-o.com's
+      // footer crane leaning with it.)
+      const again = await sendToTab(tab.id, { cmd: 'tile', y: last.actualY, index: last.index, total, keepAnchors: true, from: Math.max(0, last.actualY - step) });
       if (!again || !again.ok) throw new Error(again && again.error || 'tile failed');
       if (Math.abs(again.actualY - last.actualY) < 1) {
         const b2 = await dataUrlToBitmap(await throttledCapture(tab.windowId));
@@ -687,7 +690,14 @@ async function stitchTiles(tab, info) {
       }
     }
     for (const r of shown) r.whole = r.whole && !liveSeen.get(r.id).follows;
-    const redraw = shown.filter((r) => r.whole && r.top < seam && r.bottom > seam).map((r) => Math.round(r.top * scale));
+    // (And one the tile above saw live and cut, which this tile was shot
+    // from the top of and holds whole, though it no longer reports it: a
+    // video the page side has since put on its still. saybriefly.com's demo
+    // video, playing again when the tile above was shot, was cut where the
+    // still began.)
+    const carried = live.filter((r) => r.top < seam && r.bottom > seam && r.top >= top && r.bottom <= top + tileH &&
+      !shown.some((s) => s.id === r.id) && !(liveSeen.get(r.id) || {}).follows);
+    const redraw = shown.filter((r) => r.whole && r.top < seam && r.bottom > seam).concat(carried).map((r) => Math.round(r.top * scale));
     let from = Math.max(Math.min(cursor, ...redraw), topOut, 0);
     // But not from inside one the tile above already held whole: two such
     // boxes can overlap (saybriefly.com's stacked demo cards share 56px),
@@ -1172,7 +1182,7 @@ function pageClock(cmd, graceMs, afterMs) {
     S = {
       holding: false, holdAt: 0, grace: 1000, after: 3000, heldTimeouts: new Map(), heldFrames: new Map(), skipped: 0, ctx: null,
       lastScroll: -1e9, lastLoad: -1e9, lastSettle: -1e9, mo: null, reverted: 0, fights: new WeakMap(),
-      stills: [], stilled: new WeakSet(), dirty: []
+      stills: [], stilled: new WeakSet(), dirty: [], provisional: new WeakMap()
     };
     Object.defineProperty(window, KEY, { value: S, configurable: true, enumerable: false, writable: true });
     const o = S.orig = {
@@ -1272,7 +1282,24 @@ function pageClock(cmd, graceMs, afterMs) {
     // A page that answers every revert with the same change again (its own
     // observer, a framework re-rendering) would spin forever: an element
     // reverted more than this many times in a second is let go.
+    // Whether two inline styles differ only in where the element is placed.
+    const PLACE = /^(-webkit-)?(transform|translate|rotate|scale|clip-path|background-position|object-position|transform-origin|will-change)$/;
+    const decls = (v) => new Map(pageStyle(v).split(';').map((d) => {
+      const i = d.indexOf(':');
+      return i < 0 ? null : [d.slice(0, i).trim().toLowerCase(), d.slice(i + 1).trim()];
+    }).filter(Boolean));
+    const onlyPlacement = (a, b) => {
+      const x = decls(a), z = decls(b);
+      let changed = 0;
+      for (const k of new Set([...x.keys(), ...z.keys()])) {
+        if (x.get(k) === z.get(k)) continue;
+        if (!PLACE.test(k)) return false;
+        changed++;
+      }
+      return changed > 0;
+    };
     const FIGHT = 150;
+    const PROVISIONAL_MS = 1500;
     const fighting = (t) => {
       const f = S.fights.get(t) || { n: 0, at: now() };
       if (now() - f.at > 1000) { f.n = 0; f.at = now(); }
@@ -1295,6 +1322,7 @@ function pageClock(cmd, graceMs, afterMs) {
       // The animation's later frames are put back where they touch what was
       // shot: saybriefly.com plays its hero again on every scroll.
       if (why === 'scroll' && !(c && c.frames >= 2)) {
+        const back = [];
         for (const m of records) {
           // (Only what can change how it looks; and not the inline style of
           // an element the capture holds through its stylesheet, whose
@@ -1314,11 +1342,34 @@ function pageClock(cmd, graceMs, afterMs) {
             if (pinned(e)) continue;
             const r = e.getBoundingClientRect();
             if (r.height > 0 && r.width > 0 && r.top + y < bottom && r.bottom + y > 0 && r.height < 4 * innerHeight) {
+              // Only where it is placed changed, inline (a transform, a
+              // background position): that is the scroll moving something
+              // already shot, a parallax or a sway the pre-scroll's short
+              // stops missed (r-o.com's footer crane, one run in two), not a
+              // reveal. Kept as shot.
+              if (m.type === 'attributes' && m.attributeName === 'style' && onlyPlacement(m.oldValue, m.target.getAttribute('style'))) {
+                back.push(m);
+                continue;
+              }
               S.dirty.push([Math.floor(r.top + y), Math.ceil(r.bottom + y)]);
               if (S.dirty.length > 200) S.dirty.shift();
+              // What it was before, in case the page goes on to animate it:
+              // see the put-back below.
+              if (m.type === 'attributes') {
+                if (!S.provisional.has(m.target)) S.provisional.set(m.target, new Map());
+                const p = S.provisional.get(m.target);
+                if (!p.has(m.attributeName)) p.set(m.attributeName, { old: m.oldValue, at: now() });
+              }
             }
           }
         }
+        for (let i = back.length - 1; i >= 0; i--) {
+          const m = back[i];
+          if (fighting(m.target)) continue;
+          if (m.oldValue == null) m.target.removeAttribute('style');
+          else m.target.setAttribute('style', m.oldValue);
+        }
+        if (back.length) { S.reverted++; S.mo.takeRecords(); }
         return;
       }
       const memo = new Map();
@@ -1338,6 +1389,7 @@ function pageClock(cmd, graceMs, afterMs) {
         return v;
       };
       let done = false;
+      const restored = new Map();
       for (let i = records.length - 1; i >= 0; i--) {
         const m = records[i], t = m.target;
         if (t === document.documentElement || t === document.body || (document.head && document.head.contains(t))) continue;
@@ -1348,8 +1400,29 @@ function pageClock(cmd, graceMs, afterMs) {
           const cur = t.getAttribute(name);
           if (cur === m.oldValue || (name === 'style' && pageStyle(cur) === pageStyle(m.oldValue))) continue;
           if (!shot(t) || fighting(t)) continue;
-          if (m.oldValue == null) t.removeAttribute(name);
-          else t.setAttribute(name, m.oldValue);
+          // A change let through as an answer to the scroll that the page
+          // then keeps animating is a passing effect, not a new state: a
+          // sway with the scroll's speed (r-o.com's footer crane leans one
+          // way scrolling down and the other scrolling up, and the tile
+          // above was shot again after a scroll up), an animation started
+          // again. It goes back to how it was before that scroll, as the
+          // tile above shot it. (Within PROVISIONAL_MS of the scroll only;
+          // a reveal that stays put is left.)
+          const prov = S.provisional.get(t) && S.provisional.get(t).get(name);
+          let old = m.oldValue;
+          // (Records are taken newest first: once put back that far, the
+          // older ones of the same batch are not to undo it.)
+          if (restored.get(t) && restored.get(t).has(name)) continue;
+          if (prov) {
+            S.provisional.get(t).delete(name);
+            if (now() - prov.at < PROVISIONAL_MS) {
+              old = prov.old;
+              if (!restored.has(t)) restored.set(t, new Set());
+              restored.get(t).add(name);
+            }
+          }
+          if (old == null) t.removeAttribute(name);
+          else t.setAttribute(name, old);
           done = true;
         } else if (m.type === 'characterData') {
           if (t.data === m.oldValue || !shot(t) || fighting(t)) continue;
