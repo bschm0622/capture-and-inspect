@@ -923,21 +923,47 @@
   // or the inside of an SVG, and not a layer stacked on another held one
   // or on one that faded out meanwhile (a slideshow's or a tab set's next
   // panel coming up over the last).
-  let tileOps = new WeakMap();   // element -> {op, tf} as last seen near the screen at a tile
+  //
+  // An entrance can grow instead of fading in: a part scaled down that the
+  // page scales up to its own size through a transform transition when it
+  // is reached (www.folk.app's section marks, an SVG's dot and fill that a
+  // class switches on while the section crosses the middle of the screen).
+  // The tile with the section lower down showed the mark empty, the next
+  // one filled, and the seam cut it in half. Held the same way, at its
+  // full size, inside an SVG too: a transition the page's stylesheet asks
+  // for is not Lottie's clock, which writes each frame itself.
+  let tileOps = new WeakMap();   // element -> {op, sc} as last seen near the screen at a tile
+  const scaleOf = (cs) => {
+    const m = /^matrix(3d)?\(([^)]*)\)/.exec(cs.transform);
+    if (!m) return 1;
+    const [a, b] = m[2].split(',').map(Number);
+    return Math.hypot(a, b);
+  };
   function noteEntrances() {
     const vh = window.innerHeight;
     const heldEls = new Set(held.map((h) => h.el));
     const fresh = [], gone = [];
     allElements().forEach((el) => {
-      if (!(el instanceof HTMLElement) || heldEls.has(el)) return;
-      const r = el.getBoundingClientRect();
+      if (heldEls.has(el)) return;
+      const html = el instanceof HTMLElement;
+      if (!html && !(el instanceof SVGElement)) return;
+      // (One scaled to nothing has no box of its own: where it will show
+      // is its parent's.)
+      let r = el.getBoundingClientRect();
+      if (!(r.height > 0 && r.width > 0) && el.parentElement && /^matrix/.test(getComputedStyle(el).transform)) r = el.parentElement.getBoundingClientRect();
       if (!(r.height > 0 && r.width > 0 && r.bottom > -vh / 2 && r.top < vh * 1.5)) return;
       const cs = getComputedStyle(el);
       const op = Number(cs.opacity);
+      const sc = scaleOf(cs);
       const was = tileOps.get(el);
-      tileOps.set(el, { op });
-      if (was && op < was.op - 0.05) gone.push({ el, r });
-      if (!was || op < was.op + 0.05 || restless.has(el) || el.closest('svg') || pinnedToScreen(el)) return;
+      tileOps.set(el, { op, sc });
+      if (html && was && op < was.op - 0.05) gone.push({ el, r });
+      if (!was || restless.has(el)) return;
+      if (was.sc <= 0.9 && sc >= 0.95 && sc <= 1.05 && op >= was.op - 0.05 && /\btransform\b/.test(cs.transitionProperty)) {
+        if (!pinned.has(el) && !pinnedToScreen(el)) fresh.push({ el, max: op, tf: [cs.transform, cs.translate], sc, r, grew: true });
+        return;
+      }
+      if (!html || op < was.op + 0.05 || el.closest('svg') || pinnedToScreen(el)) return;
       fresh.push({ el, max: op, tf: [cs.transform, cs.translate], r });
     });
     if (!fresh.length) return;
@@ -949,9 +975,11 @@
       const h = Math.min(a.r.bottom, b.r.bottom) - Math.max(a.r.top, b.r.top);
       return w > 0 && h > 0 && w * h > 0.5 * Math.min(area(a.r), area(b.r));
     };
+    // (Parts that grow together, a dot over its fill, are one entrance, not
+    // layers taking turns.)
     for (const a of fresh) {
-      if (boxes.some((b) => b !== a && stacked(a, b))) continue;
-      held.push({ el: a.el, max: a.max, tf: a.tf });
+      if (boxes.some((b) => b !== a && !(a.grew && b.grew) && stacked(a, b))) continue;
+      held.push({ el: a.el, max: a.max, tf: a.tf, sc: a.sc });
     }
   }
 
@@ -978,7 +1006,8 @@
     const css = held.map((h) => getComputedStyle(h.el));
     const now = css.map((cs) => Number(cs.opacity));
     held.forEach((h, k) => {
-      if (now[k] >= h.max - 0.01) {
+      // (One that grew in is held too where it is smaller again.)
+      if (now[k] >= h.max - 0.01 && !(h.sc && scaleOf(css[k]) < h.sc - 0.05)) {
         h.max = Math.max(h.max, now[k]);
         h.tf = [css[k].transform, css[k].translate];
         return;
@@ -1632,13 +1661,21 @@
   // top of every tile, its edge showing below each overlap. Only an inline
   // !important beats that, so where the rule lost, the same declarations
   // are written inline too, and taken off again before the next look.
+  // Taken off only where they are still what the capture wrote: a script
+  // that writes the place inline itself (arnettcustomhomes.com's Divi
+  // sticky row, `position: fixed !important` inline while stuck) clears
+  // it again once the page scrolls back up, and the stuck values put back
+  // over that kept the row fixed at the top with its spacer gone, the
+  // page under it moved up by its height.
   const INFLOW_PROPS = ['position', 'top', 'left', 'right', 'bottom', 'width', 'margin'];
+  const INFLOW_SET = { position: 'absolute', top: 'var(--cleanshot-top)', left: 'var(--cleanshot-left)', right: 'auto', bottom: 'auto', width: 'var(--cleanshot-width)', margin: '0' };
   let inflow = new Set();
-  let inflowInline = new Map(); // element -> [[property, value, priority]] as the page had them
+  let inflowInline = new Map(); // element -> [[property, value, priority, as written]] as the page had them
   function dropInflowInline(el) {
     const prev = inflowInline.get(el);
     if (!prev) return;
-    for (const [p, v, pr] of prev) {
+    for (const [p, v, pr, ours] of prev) {
+      if (el.style.getPropertyValue(p) !== ours || el.style.getPropertyPriority(p) !== 'important') continue;
       if (v) el.style.setProperty(p, v, pr);
       else el.style.removeProperty(p);
     }
@@ -1657,9 +1694,9 @@
       el.style.setProperty('--cleanshot-width', `${box.width}px`);
       el.setAttribute('data-cleanshot-inflow', '');
       if (getComputedStyle(el).position !== 'absolute') {
-        inflowInline.set(el, INFLOW_PROPS.map((p) => [p, el.style.getPropertyValue(p), el.style.getPropertyPriority(p)]));
-        const set = { position: 'absolute', top: 'var(--cleanshot-top)', left: 'var(--cleanshot-left)', right: 'auto', bottom: 'auto', width: 'var(--cleanshot-width)', margin: '0' };
-        for (const p of INFLOW_PROPS) el.style.setProperty(p, set[p], 'important');
+        const prev = INFLOW_PROPS.map((p) => [p, el.style.getPropertyValue(p), el.style.getPropertyPriority(p)]);
+        for (const p of INFLOW_PROPS) el.style.setProperty(p, INFLOW_SET[p], 'important');
+        inflowInline.set(el, prev.map(([p, v, pr]) => [p, v, pr, el.style.getPropertyValue(p)]));
       }
       const r = el.getBoundingClientRect();
       el.style.setProperty('--cleanshot-top', `${box.top - (r.top + scroller.scrollTop)}px`);
