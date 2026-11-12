@@ -128,7 +128,7 @@ function runChild(payload, hardMs) {
 // Plain files only, from test/fixtures.
 async function serveFixtures() {
   const http = await import('node:http');
-  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg' };
+  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml' };
   const server = http.createServer((req, res) => {
     const name = path.basename(decodeURIComponent(new URL(req.url, 'http://x').pathname));
     const file = path.join(FIXTURE_DIR, name);

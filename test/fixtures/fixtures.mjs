@@ -143,6 +143,20 @@ function rowsWith(img, rgb, { min = 6, y0 = 0, y1 = img.H } = {}) {
   return runs;
 }
 
+// Mean colour of the capture over CSS x [x, x + w) and rows [y0, y1).
+function meanBox(img, x, w, y0, y1) {
+  const [x0, x1] = cols(img, x, w);
+  const s = [0, 0, 0];
+  let n = 0;
+  for (let y = y0; y < Math.min(y1, img.H); y++) for (let c = x0; c < x1; c++) {
+    const j = (y * img.W + c) * 3;
+    s[0] += img.rgb[j]; s[1] += img.rgb[j + 1]; s[2] += img.rgb[j + 2]; n++;
+  }
+  return n ? s.map((v) => v / n) : [NaN, NaN, NaN];
+}
+const near = (got, want, slack = 40) => got.every((v, k) => Math.abs(v - want[k]) <= slack);
+const rgbText = (c) => `rgb(${c.map(Math.round).join(',')})`;
+
 export const FIXTURES = [
   {
     name: 'tall-40k', file: 'tall-40k.html', refShots: [32768],
@@ -276,6 +290,78 @@ export const FIXTURES = [
         return result(!!top && !elsewhere.length && reshot, runs.length,
           `${top ? 'header at the top' : 'no header at the top'}; ${elsewhere.length} other place(s) show it; first tile ${reshot ? 'shot again' : 'not shot again (the path this fixture is for did not run)'}`,
           [...(top ? [] : [{ y0: 0, y1: 120, note: 'header missing from the top' }]), ...elsewhere.map((r) => ({ ...r, note: 'header repeated' }))]);
+      }
+    }
+  },
+  {
+    name: 'late-float', file: 'late-float.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img),
+      // Two back-to-top buttons (magenta) the page adds only once it has
+      // scrolled: a zero-height sticky box at the end of the content and a
+      // fixed button. Neither may show anywhere in the capture.
+      'late-buttons-hidden': ({ img }) => {
+        const runs = rowsWith(img, [255, 0, 255], { min: 4 });
+        return result(runs.length === 0, runs.length, `${runs.length} place(s) in the capture show a back-to-top button`,
+          runs.map((r) => ({ ...r, note: 'back-to-top button in the capture' })));
+      },
+      // A closed drawer parked off the left edge: its shadow (green) must
+      // not show at the edge of the first screen.
+      'offscreen-drawer-hidden': ({ img }) => {
+        const runs = rowsWith(img, [0, 255, 0], { min: 4 });
+        return result(runs.length === 0, runs.length, `${runs.length} place(s) in the capture show the off-screen drawer's shadow`,
+          runs.map((r) => ({ ...r, note: 'drawer shadow in the capture' })));
+      }
+    }
+  },
+  {
+    name: 'header-swap', file: 'header-swap.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { top: 120 }),
+      // At the top, the header as it is at scroll 0: the wordmark (cyan)
+      // and not the compact logo (orange) that replaces it once the page
+      // scrolls.
+      'header-as-at-scroll-0': ({ img }) => {
+        const word = rowsWith(img, [0, 200, 200], { min: 30 });
+        const top = word.find((r) => r.y0 <= 32 && r.y1 >= 88);
+        const g = rowsWith(img, [255, 128, 0], { min: 4 });
+        return result(!!top && g.length === 0, g.length,
+          `${top ? 'wordmark at the top' : 'no wordmark at the top'}; ${g.length} place(s) show the scrolled-state logo`,
+          [...(top ? [] : [{ y0: 0, y1: 120, note: 'wordmark missing' }]), ...g.map((r) => ({ ...r, note: 'scrolled-state logo in the capture' }))]);
+      }
+    }
+  },
+  {
+    name: 'sticky-swap', file: 'sticky-swap.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { until: 2000 }),
+      // Beside the middle of each of the four items (y 2000 + 500k + 250),
+      // the panel column shows that item's picture.
+      'picture-beside-each-item': ({ img }) => {
+        const want = [[255, 0, 0], [0, 0, 255], [255, 0, 255], [0, 255, 0]];
+        const flags = [];
+        want.forEach((c, k) => {
+          const y = 2000 + 500 * k + 250;
+          const got = meanBox(img, 900, 200, y - 20, y + 20);
+          if (!near(got, c)) flags.push({ y0: y - 250, y1: y + 250, note: `item ${k + 1}: the panel column shows ${rgbText(got)}, not its picture ${rgbText(c)}` });
+        });
+        return result(flags.length === 0, flags.length, `${4 - flags.length} of 4 items have their own picture beside them`, flags);
+      }
+    }
+  },
+  {
+    name: 'lazy-clone', file: 'lazy-clone.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { until: 1600 }),
+      // Each of the three slides on screen shows its star image (magenta),
+      // the carousel's loop copy included.
+      'stars-in-every-slide': ({ img }) => {
+        const flags = [];
+        [60, 460, 860].forEach((x, k) => {
+          const got = meanBox(img, x + 40, 200, 1740, 1765);
+          if (!near(got, [255, 0, 255])) flags.push({ y0: 1728, y1: 1776, note: `slide ${k + 1}: ${rgbText(got)} where its stars should be` });
+        });
+        return result(flags.length === 0, flags.length, `${3 - flags.length} of 3 slides show their stars`, flags);
       }
     }
   }

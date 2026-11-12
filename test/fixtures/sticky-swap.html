@@ -1,0 +1,52 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: a sticky panel whose picture swaps for each part beside it</title>
+<!-- Bands 0-9 (2000px), then a two-column section 2000px tall: four items
+     of 500px down the left, and on the right a sticky panel (400px tall,
+     half the width) holding four pictures stacked in one place, of which a
+     script shows the one for the item level with the panel's middle, as
+     saybriefly.com's meeting features do. Then bands 10-19. A visitor
+     scrolling through sees each item with its own picture beside it; the
+     capture must show that, not the first picture once and empty space
+     beside the other three. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  #sec{display:flex;background:#f4f1ea}
+  #list{width:50%}
+  .item{height:500px;box-sizing:border-box;padding:40px;font:28px/36px sans-serif;color:#222}
+  #col{width:50%}
+  #panel{position:sticky;top:100px;height:400px;margin-right:40px}
+  #panel div{position:absolute;inset:0;opacity:0}
+</style>
+<script src="bands.js"></script>
+<div id="above"></div>
+<section id="sec">
+  <div id="list">
+    <div class="item">One: ask anything, months later.</div>
+    <div class="item">Two: from "we should" to done.</div>
+    <div class="item">Three: the whole meeting in a minute.</div>
+    <div class="item">Four: could this have been an email?</div>
+  </div>
+  <div id="col"><div id="panel">
+    <div style="background:rgb(255,0,0);opacity:1"></div>
+    <div style="background:rgb(0,0,255)"></div>
+    <div style="background:rgb(255,0,255)"></div>
+    <div style="background:rgb(0,255,0)"></div>
+  </div></div>
+</section>
+<div id="below"></div>
+<script>
+  addBands(document.getElementById('above'), 0, 10);
+  addBands(document.getElementById('below'), 10, 10);
+  const panel = document.getElementById('panel');
+  const pics = [...panel.children];
+  const items = [...document.querySelectorAll('.item')];
+  const pick = () => {
+    const r = panel.getBoundingClientRect();
+    const mid = r.top + r.height / 2;
+    let k = items.findIndex((it) => { const b = it.getBoundingClientRect(); return mid >= b.top && mid < b.bottom; });
+    if (k < 0) k = mid < items[0].getBoundingClientRect().top ? 0 : items.length - 1;
+    pics.forEach((p, i) => { p.style.opacity = i === k ? '1' : '0'; });
+  };
+  addEventListener('scroll', pick, { passive: true });
+</script>
