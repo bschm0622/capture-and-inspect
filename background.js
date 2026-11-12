@@ -630,8 +630,12 @@ async function stitchTiles(tab, info) {
     // reaching higher was painted by older tiles too, which a new shot of
     // the tile above would leave behind (hitt.com's project cards, which
     // change as the page scrolls, came out cut where they had been whole).
+    // And only a change the seam goes through: one wholly above it is
+    // another moment of the page, not a cut (whitney.org's hero changes as
+    // the page scrolls, and shooting the first tile again for it lost the
+    // place of the second).
     const dirtyAbove = i > 0 && last && (res.dirty || []).some(([a, b]) =>
-      a + off < seam - 1 && a + off >= last.from / scale - 1);
+      a + off < seam - 1 && b + off > seam + 1 && a + off >= last.from / scale - 1);
     // A new shot of the tile above repaints its rows from where it began
     // painting; something the page changed that reaches above that row was
     // painted there by an older tile, and would be cut there instead
