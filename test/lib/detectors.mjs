@@ -47,6 +47,12 @@ export const T = {
   cutInk: 40,          // grey levels from it for a row below to be ink
   cutMaxW: 12,         // CSS px: a stroke no wider than this (a wider start is an edge in the page)
   cutMinStrokes: 2,
+  // copies of a pinned panel (stagedCopies)
+  copyBlocks: 16,
+  copyMatch: 2,        // median over rows of mean |Δluma| (each row's own level taken out) for a block to repeat a copy above
+  copyRun: 3,          // neighbouring blocks that repeat, every copy alike
+  edgeInk: 0.1,        // share of the staged rows with marks at the capture's side edge
+  edgeRatio: 3,        // ...this many times the share over the rest of the capture
   // truncation
   truncSlack: 16       // CSS px the capture may fall short of the page
 };
@@ -602,6 +608,84 @@ export async function seamCuts(img, cap, tiles) {
   return { pass: flags.length === 0, value: most, detail: `${looked} warned seam(s) looked at; most strokes cut at one: ${most}`, flags };
 }
 
+// (c3) Copies of a pinned panel: where the extension shows a panel that
+// stays on screen as the page scrolls once per stage, down its column
+// (`pinned-stages`), each copy should show a different stage. Two marks of
+// copies gone wrong (newmanroofing.com: a sticky column drawn four times
+// over, alike, its text cut off at the left edge of the capture):
+// - the copies are the same picture: at the stage height (the range over
+//   the number of copies, give or take a quarter), 3 neighbouring column
+//   blocks repeat from one copy to the next (in most of their rows: the
+//   range runs past the copies). Each row's own level is taken
+//   out first, so a background gradient behind the copies doesn't hide it.
+//   A panel that really changes breaks the run where it changes (a picture
+//   swapped, a phone screen between its frame's sides);
+// - content touches the capture's left or right edge inside the range (at
+//   least 10% of its rows, three times as often as over the rest of the
+//   capture): copies placed off the side of the page.
+// Blind spots: copies that differ only in a part narrower than a column
+// block; copies with no texture; records from before the warnings.
+export function stagedCopies(img, cap) {
+  const warned = (cap.warnings || []).filter((w) => w.kind === 'pinned-stages');
+  const flags = [];
+  const L = (x, y) => img.luma[y * img.W + x];
+  const NB = T.copyBlocks;
+  const edgeShare = (y0, y1, x) => {
+    let n = 0;
+    for (let y = y0; y < y1; y++) {
+      let lo = 255, hi = 0;
+      for (let dy = -2; dy <= 2; dy++) { const v = L(x, Math.min(img.H - 1, Math.max(0, y + dy))); lo = Math.min(lo, v); hi = Math.max(hi, v); }
+      if (hi - lo > 80) n++;
+    }
+    return y1 > y0 ? n / (y1 - y0) : 0;
+  };
+  // Median over textured rows of the mean |Δ| between rows y and y + P over
+  // block k, each row less its own mean there (the range runs past the
+  // copies, so some rows never repeat); null where the block has too few
+  // textured rows.
+  const blockDiff = (k, P, y0, y1) => {
+    const x0 = Math.floor(img.W * k / NB), x1 = Math.floor(img.W * (k + 1) / NB);
+    const ds = [];
+    for (let y = y0; y + P < y1; y += 2) {
+      let ma = 0, mb = 0, lo = 255, hi = 0;
+      for (let x = x0; x < x1; x++) { const a = L(x, y), b = L(x, y + P); ma += a; mb += b; lo = Math.min(lo, a, b); hi = Math.max(hi, a, b); }
+      if (hi - lo < 40) continue;
+      ma /= x1 - x0; mb /= x1 - x0;
+      let d = 0;
+      for (let x = x0; x < x1; x++) d += Math.abs((L(x, y) - ma) - (L(x, y + P) - mb));
+      ds.push(d / (x1 - x0));
+    }
+    return ds.length >= 20 ? median(ds) : null;
+  };
+  let best = 0;
+  for (const w of warned) {
+    const m = w.note && w.note.match(/as (\d+) /);
+    const n = m ? +m[1] : 0;
+    const y0 = Math.max(0, w.y0), y1 = Math.min(img.H, w.y1);
+    if (n < 2 || y1 - y0 < 200) continue;
+    const step = (y1 - y0) / n;
+    let run = 0, at = 0;
+    for (let P = Math.round(step * 0.75); P <= Math.round(step * 1.25) && y0 + P < y1; P++) {
+      let r = 0;
+      for (let k = 0; k < NB; k++) {
+        const d = blockDiff(k, P, y0, y1);
+        r = d != null && d < T.copyMatch ? r + 1 : 0;
+        if (r > run) { run = r; at = P; }
+      }
+    }
+    best = Math.max(best, run);
+    if (run >= T.copyRun) flags.push({ y0, y1, note: `the ${n} copies of a pinned panel are alike: ${run} neighbouring column blocks repeat every ${at}px` });
+    for (const [side, x] of [['left', 0], ['right', img.W - 1]]) {
+      const inside = edgeShare(y0, y1, x);
+      const outside = (edgeShare(0, y0, x) * y0 + edgeShare(y1, img.H, x) * (img.H - y1)) / Math.max(1, img.H - (y1 - y0));
+      if (inside >= T.edgeInk && inside >= T.edgeRatio * outside) {
+        flags.push({ y0, y1, note: `content runs into the ${side} edge of the capture in ${Math.round(inside * 100)}% of the staged rows (${Math.round(outside * 100)}% elsewhere): copies placed off the page's side` });
+      }
+    }
+  }
+  return { pass: flags.length === 0, value: best, detail: `${warned.length} staged range(s); longest run of repeating column blocks ${best}`, flags };
+}
+
 // (d) Truncation: the capture is much shorter than the page's real
 // scrollable height (measured before the capture, including an inner
 // scrolling container when the document itself doesn't scroll).
@@ -652,6 +736,7 @@ export async function runGeneric(img, cap) {
     'repeated-overlay': repeatedOverlays(img, tiles, { fixedBoxes, vh }),
     'seam': seams(img, tiles, { placements: cap.placements }),
     'seam-cut': await seamCuts(img, cap, tiles),
+    'staged-copies': stagedCopies(img, cap),
     'truncation': truncation(img, cap),
     'unpainted-rows': unpaintedRows(img),
     'text-same-colour': await textSameColour(img, cap)
