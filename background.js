@@ -1246,20 +1246,29 @@ function pageClock(cmd, graceMs, afterMs) {
       }
     };
     // A chain whose changes leave a short number as an element's whole
-    // text is counting (not a clock: a colon isn't part of a number).
+    // text, again and again in quick succession, is counting. Not a clock
+    // (a colon isn't part of a number) nor a slider's "02" turning every
+    // few seconds.
     const NUMBER = /^[^\d\s:]{0,3}\s?\d[\d,.'\s\u00a0\u202f]*\s?[^\d:]{0,4}$/;
+    const COUNT_STEP_MS = 250;
     S.counting = new Set();
     const counts = (records, c) => {
+      const els = new Set();
       for (const m of records) {
         if (m.type !== 'characterData' && m.type !== 'childList') continue;
         const e = m.type === 'characterData' ? m.target.parentElement : m.target;
         if (!e || e.nodeType !== 1 || e.childElementCount > 1) continue;
         const text = e.textContent.trim();
-        if (text.length > 24 || !NUMBER.test(text)) continue;
+        if (text.length <= 24 && NUMBER.test(text)) els.add(e);
+      }
+      if (!els.size) return;
+      const t = now();
+      c.countRun = c.lastCount && t - c.lastCount < COUNT_STEP_MS ? (c.countRun || 1) + 1 : 1;
+      c.lastCount = t;
+      if (!c.countEls) c.countEls = new Set();
+      els.forEach((e) => c.countEls.add(e));
+      if (c.countRun >= 3 && !c.counting) {
         c.counting = true;
-        c.lastCount = now();
-        if (!c.countEls) c.countEls = new Set();
-        c.countEls.add(e);
         S.counting.add(c);
       }
     };
