@@ -20,6 +20,14 @@ export const T = {
   repeatMin: 24,       // CSS px of matched content rows to flag
   repeatOffRow: 12,    // ...of which at least this many unlike their commonest row
   repeatBlocks: 8,
+  // repeated overlay, small (smallRepeats)
+  smallMatch: 4,       // |Δluma| at which a grid pixel is the same in two tiles
+  smallMinPx: 40,      // grid pixels (4x1 CSS px each) in an island
+  smallMinRows: 16,    // ...over at least this many rows
+  smallMinInk: 8,      // ...with at least this many marks of its own
+  smallMaxW: 0.25,     // ...no wider than this share of the width
+  smallMaxH: 0.3,      // ...no taller than this share of the window
+  smallMinPairs: 3,    // ...there between this many consecutive tile pairs (4 copies)
   // seam
   seamBlocks: 8,
   seamNotFlat: 4,      // block row luma std; flatter blocks are skipped
@@ -177,7 +185,127 @@ function offRow(img, ys, x0, x1) {
   return ys.length - best;
 }
 
-export function repeatedOverlays(img, tiles, { zone = null, region = null, blocks = T.repeatBlocks, fixedBoxes = null } = {}) {
+// Small overlays. A floating button (a round "back to top", a call button)
+// is narrower than a column block, so over a background that changes from
+// tile to tile its rows never match as a whole block, and an icon on it has
+// fewer than T.repeatMin textured rows (www.louvre.fr's 52px button, six
+// copies, passed). Looked at pixel by pixel instead: the grid pixels that
+// are the same in two consecutive tiles at the same offset (one tile step
+// apart) form a small island amid pixels that changed, with marks of its
+// own inside it (an arrow on the button), and the island is there again,
+// in the same place, between the next tiles. One pair alone can be chance,
+// and so can two: on the a6c3f84 sweep, mona.net.au's letter headings (a
+// pink ornament that every letter shares) and two faint blueprint
+// backgrounds on roofingbymidsouth.com lined up at the tile step twice
+// running. Four copies of the same marks at the same place in the window,
+// three pairs in a row, are what something that followed the scroll leaves
+// (louvre's button 5-6 times, shiftelectricco.com's chat button on every
+// tile).
+function stableMask(img, a, b, oMin, oMax) {
+  const { luma, W } = img;
+  const n = oMax - oMin;
+  const m = new Uint8Array(n * W);
+  for (let o = oMin; o < oMax; o++) {
+    for (let x = 0; x < W; x++) {
+      const v = luma[(a + o) * W + x];
+      if (Math.abs(v - luma[(b + o) * W + x]) <= T.smallMatch) m[(o - oMin) * W + x] = 1;
+    }
+  }
+  return m;
+}
+
+function smallIslands(img, a, b, oMin, oMax, vh) {
+  const { luma, W } = img;
+  const n = oMax - oMin;
+  if (n <= 0) return [];
+  const m = stableMask(img, a, b, oMin, oMax);
+  const seen = new Uint8Array(n * W);
+  const maxW = Math.round(W * T.smallMaxW), maxH = Math.round(vh * T.smallMaxH);
+  const out = [];
+  const stack = [];
+  for (let i = 0; i < m.length; i++) {
+    if (!m[i] || seen[i]) continue;
+    // Flood the island, giving up once it is too big to be one.
+    const px = [];
+    let big = false, x0 = W, x1 = 0, y0 = n, y1 = 0;
+    stack.push(i); seen[i] = 1;
+    while (stack.length) {
+      const p = stack.pop();
+      const y = (p / W) | 0, x = p - y * W;
+      if (!big) {
+        px.push(p);
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+        if (x1 - x0 >= maxW || y1 - y0 >= maxH) big = true;
+      }
+      if (x > 0 && m[p - 1] && !seen[p - 1]) { seen[p - 1] = 1; stack.push(p - 1); }
+      if (x + 1 < W && m[p + 1] && !seen[p + 1]) { seen[p + 1] = 1; stack.push(p + 1); }
+      if (y > 0 && m[p - W] && !seen[p - W]) { seen[p - W] = 1; stack.push(p - W); }
+      if (y + 1 < n && m[p + W] && !seen[p + W]) { seen[p + W] = 1; stack.push(p + W); }
+    }
+    if (big || px.length < T.smallMinPx || y1 - y0 + 1 < T.smallMinRows || x1 - x0 + 1 < 3) continue;
+    // Marks of its own: pixels well apart from the island's commonest grey.
+    const hist = new Uint32Array(256);
+    for (const p of px) hist[luma[(b + oMin) * W + p]]++;
+    let mode = 0;
+    for (let v = 1; v < 256; v++) if (hist[v] > hist[mode]) mode = v;
+    let ink = 0;
+    for (let v = 0; v < 256; v++) if (Math.abs(v - mode) > 40) ink += hist[v];
+    if (ink < T.smallMinInk || ink > px.length * 0.9) continue;
+    // Amid change: around the island, most pixels differ between the tiles.
+    let around = 0, changed = 0;
+    const ax0 = Math.max(0, x0 - 4), ax1 = Math.min(W - 1, x1 + 4), ay0 = Math.max(0, y0 - 16), ay1 = Math.min(n - 1, y1 + 16);
+    for (let y = ay0; y <= ay1; y++) for (let x = ax0; x <= ax1; x++) {
+      if (x >= x0 && x <= x1 && y >= y0 && y <= y1) continue;
+      around++;
+      if (!m[y * W + x]) changed++;
+    }
+    if (!around || changed / around < 0.5) continue;
+    out.push({ x0, x1: x1 + 1, o0: oMin + y0, o1: oMin + y1 + 1 });
+  }
+  return out;
+}
+
+function smallRepeats(img, tiles, vh) {
+  const pairs = [];
+  for (let k = 0; k + 1 < tiles.length; k++) {
+    const a = tiles[k].y, b = tiles[k + 1].y;
+    if (b - a <= 0) { pairs.push(null); continue; }
+    const h = Math.min(tiles[k].h, tiles[k + 1].h, img.H - b);
+    const oMin = tiles[k + 1].drawY != null ? Math.max(0, tiles[k + 1].drawY - b) : 0;
+    pairs.push({ k, a, b, d: b - a, islands: smallIslands(img, a, b, oMin, h, vh) });
+  }
+  const same = (p, q) => {
+    const w = Math.min(p.x1, q.x1) - Math.max(p.x0, q.x0), h = Math.min(p.o1, q.o1) - Math.max(p.o0, q.o0);
+    return w > 0 && h > 0 && w * h >= 0.5 * Math.min((p.x1 - p.x0) * (p.o1 - p.o0), (q.x1 - q.x0) * (q.o1 - q.o0));
+  };
+  // How many consecutive pairs, this one included, have the island there.
+  const chain = (i, s) => {
+    let n = 1;
+    for (let j = i - 1, t = s; j >= 0; j--) {
+      const u = pairs[j] && pairs[j].islands.find((v) => same(t, v));
+      if (!u) break;
+      n++; t = u;
+    }
+    for (let j = i + 1, t = s; j < pairs.length; j++) {
+      const u = pairs[j] && pairs[j].islands.find((v) => same(t, v));
+      if (!u) break;
+      n++; t = u;
+    }
+    return n;
+  };
+  const out = [];
+  for (let i = 0; i < pairs.length; i++) {
+    const p = pairs[i];
+    if (!p) continue;
+    for (const s of p.islands) {
+      if (chain(i, s) < T.smallMinPairs) continue;
+      out.push({ k: p.k, d: p.d, x0: s.x0, x1: s.x1, y0: p.b + s.o0, y1: p.b + s.o1 });
+    }
+  }
+  return out;
+}
+
+export function repeatedOverlays(img, tiles, { zone = null, region = null, blocks = T.repeatBlocks, fixedBoxes = null, vh = 868 } = {}) {
   const raw = [];
   let uniform = 0;
   const [rx0, rx1] = region && region.x != null ? cols(img, region.x, region.w) : [0, img.W];
@@ -225,6 +353,16 @@ export function repeatedOverlays(img, tiles, { zone = null, region = null, block
     if (f) { f.y0 = Math.min(f.y0, r.y0); f.y1 = Math.max(f.y1, r.y1); f.blocks.add(r.bi); f.n = Math.max(f.n, r.n); f.off = Math.min(f.off, r.off); }
     else flags.push({ k: r.k, d: r.d, y0: r.y0, y1: r.y1, blocks: new Set([r.bi]), n: r.n, off: r.off });
   }
+  // Small overlays, over the whole capture only (site checks that look in a
+  // region or a zone ask about something else). One a block hit already
+  // covers adds nothing.
+  if (!region && !zone) {
+    const scale = img.cssWidth / img.W;
+    for (const s of smallRepeats(img, tiles, vh)) {
+      if (flags.some((f) => f.k === s.k && s.y0 < f.y1 && s.y1 > f.y0)) continue;
+      flags.push({ k: s.k, d: s.d, y0: s.y0, y1: s.y1, small: true, cx0: s.x0 * scale, cx1: s.x1 * scale });
+    }
+  }
   // With the page's account of what is fixed to the window (before and
   // after the capture), a repeat only counts where something is: a fixed
   // or sticky box covering the strip's place in the window. A repeat with
@@ -233,9 +371,13 @@ export function repeatedOverlays(img, tiles, { zone = null, region = null, block
   let cleared = 0;
   const kept = fixedBoxes == null ? flags : flags.filter((f) => {
     const scale = img.cssWidth / img.W;
-    const bs = [...f.blocks];
-    const x0 = (rx0 + Math.floor((rx1 - rx0) * Math.min(...bs) / blocks)) * scale;
-    const x1 = (rx0 + Math.floor((rx1 - rx0) * (Math.max(...bs) + 1) / blocks)) * scale;
+    let x0, x1;
+    if (f.small) [x0, x1] = [f.cx0, f.cx1];
+    else {
+      const bs = [...f.blocks];
+      x0 = (rx0 + Math.floor((rx1 - rx0) * Math.min(...bs) / blocks)) * scale;
+      x1 = (rx0 + Math.floor((rx1 - rx0) * (Math.max(...bs) + 1) / blocks)) * scale;
+    }
     const o0 = f.y0 - tiles[f.k + 1].y, o1 = f.y1 - tiles[f.k + 1].y;
     const hit = fixedBoxes.some(([bx, by, bw, bh]) => {
       const iw = Math.min(x1, bx + bw) - Math.max(x0, bx), ih = Math.min(o1, by + bh) - Math.max(o0, by);
@@ -248,7 +390,9 @@ export function repeatedOverlays(img, tiles, { zone = null, region = null, block
   return {
     pass: kept.length === 0, value: total,
     detail: `${kept.length} strip(s), ${total}px in all, repeated at the tile step${cleared ? `; ${cleared} more cleared: nothing fixed to the window there` : ''}${uniform ? `; ${uniform} block match(es) dropped: mostly one row repeated` : ''}`,
-    flags: kept.map((f) => ({ y0: f.y0, y1: f.y1, note: `${f.y1 - f.y0}px strip (${f.blocks.size}/${blocks} column blocks) identical to ${f.d}px above, tiles ${f.k + 1}/${f.k + 2}` }))
+    flags: kept.map((f) => ({ y0: f.y0, y1: f.y1, note: f.small
+      ? `${Math.round(f.cx1 - f.cx0)}x${f.y1 - f.y0}px floating element (x ${Math.round(f.cx0)}-${Math.round(f.cx1)}) identical to ${f.d}px above amid content that changed, tiles ${f.k + 1}/${f.k + 2}, and between the tiles next to them`
+      : `${f.y1 - f.y0}px strip (${f.blocks.size}/${blocks} column blocks) identical to ${f.d}px above, tiles ${f.k + 1}/${f.k + 2}` }))
   };
 }
 
@@ -428,7 +572,7 @@ export async function runGeneric(img, cap) {
   const fixedBoxes = dom ? [...(dom.fixed || []), ...((cap.gate && cap.gate.fixed) || [])].map((f) => f.box) : null;
   return {
     'blank-band': blankBands(img, { vh, dom }),
-    'repeated-overlay': repeatedOverlays(img, tiles, { fixedBoxes }),
+    'repeated-overlay': repeatedOverlays(img, tiles, { fixedBoxes, vh }),
     'seam': seams(img, tiles, { placements: cap.placements }),
     'truncation': truncation(img, cap),
     'unpainted-rows': unpaintedRows(img),

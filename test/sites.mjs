@@ -812,8 +812,56 @@ export const SITES = [
           missing.map((l) => ({ y0: l.p.top, y1: l.p.top + l.p.h, note: `"${l.p.what}" not in the capture` })));
       }
     }
+  },
+  {
+    // A round "back to top" button the page adds once it has scrolled: a
+    // zero-height `position: sticky; bottom: 24px` box at the end of the
+    // content, its button hanging out of it. It rode along in every tile,
+    // six copies down the right edge. No site check: the generic
+    // repeated-overlay detector's small-overlay rule is what sees it (the
+    // column-block rule passed it).
+    host: 'www.louvre.fr',
+    url: 'https://www.louvre.fr'
+  },
+  {
+    host: 'www.guggenheim.org',
+    url: 'https://www.guggenheim.org',
+    collect: () => {
+      const a = document.querySelector('header a[href="/"], nav a[href="/"], a[class*="logo" i]');
+      if (!a) return { logo: null };
+      const r = a.getBoundingClientRect();
+      return { logo: { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) } };
+    },
+    checks: {
+      // The header turns fixed once the page scrolls and fades a compact
+      // "G" in over its wordmark. The fade was held at its most visible, so
+      // the top of the capture showed the G over GUGGENHEIM NEW YORK. The
+      // logo's box must look as it does on the first screen at scroll 0.
+      'header-as-at-scroll-0'({ img, shot, facts }) {
+        const l = facts.logo;
+        if (!l) return result(false, null, 'logo link not found on the page');
+        if (!shot) return result(false, null, 'no first-screen screenshot');
+        const s = sameAs(img, shot, l);
+        return result(s >= 0.9, +s.toFixed(2), `${Math.round(s * 100)}% of the logo box as on the first screen (fail under 90%)`,
+          s >= 0.9 ? [] : [{ y0: l.top, y1: l.top + l.h, note: 'logo differs from the first screen' }]);
+      }
+    }
   }
 ];
+
+// Share of a box's grid pixels the capture shows as the first-screen
+// screenshot does (within 24 grey levels, a row either way).
+function sameAs(img, shot, rect) {
+  const [x0, x1] = cols(img, rect.left, rect.w);
+  const y0 = Math.max(0, Math.round(rect.top)), y1 = Math.min(shot.H, img.H, Math.round(rect.top + rect.h));
+  let n = 0, same = 0;
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+    n++;
+    const v = shot.luma[y * shot.W + x];
+    if ([-1, 0, 1].some((dy) => y + dy >= 0 && y + dy < img.H && Math.abs(img.luma[(y + dy) * img.W + x] - v) < 24)) same++;
+  }
+  return n ? same / n : 0;
+}
 
 // Ceiling on agcsf.com's capture time, with room for a busy machine. On one
 // (another harness running alongside): c539d2d took 175s for 53 shots and
@@ -855,6 +903,7 @@ export const KNOWN = {
   'fixed-background-seam': 'Fixed-attachment background showed a different part of the picture in each tile',
   'clock-released': "Page left frozen after the capture: its slider didn't move again",
   'slider-in-one-shot': 'Slider on a timer set at page load cut by a tile edge (two moments, or right only by luck)',
-  'sticky-column-whole': 'Column a script makes sticky hidden as a floating extra: its text lost below a tile edge'
+  'sticky-column-whole': 'Column a script makes sticky hidden as a floating extra: its text lost below a tile edge',
+  'header-as-at-scroll-0': "Header's scrolled-state logo held visible over its wordmark at the top of the capture"
 };
 
