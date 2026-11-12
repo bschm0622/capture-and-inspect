@@ -1,0 +1,38 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: floating widgets inside a see-through full-window layer</title>
+<!-- A chat widget's root is a `position: fixed` layer over the whole window,
+     transparent, stacked high (z-index 10000), inside a shadow root, with
+     its launcher pill (magenta) placed in a corner of it, as Voiceflow's is
+     (www.bloomdentist.com). One is there at load, another is added once the
+     page has scrolled past 300px. Neither launcher belongs in the capture.
+     The site's header (cyan, 100px) sits in a layer of the same kind at the
+     top of the window: it belongs at the top of the capture, once. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  body{padding-top:100px}
+  #hl{position:fixed;inset:0;z-index:9000;pointer-events:none}
+  #hl header{height:100px;background:rgb(0,200,200);font:18px/100px sans-serif;pointer-events:auto}
+  #hl nav{margin-left:400px}
+</style>
+<script src="bands.js"></script>
+<div id="hl"><header><nav><a href="#a">About</a> <a href="#b">Services</a> <a href="#c">Contact</a></nav></header></div>
+<main id="m"></main>
+<script>
+  addBands(document.getElementById('m'), 0, 25);
+  const widget = (side) => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    host.attachShadow({ mode: 'open' }).innerHTML =
+      '<style>.layer{position:fixed;inset:0;z-index:10000;pointer-events:none}' +
+      '.launcher{position:absolute;bottom:50px;' + side + ':20px;width:140px;height:40px;border-radius:20px;background:rgb(255,0,255);pointer-events:auto}</style>' +
+      '<div class="layer"><div class="launcher"><button type="button" aria-label="Chat with us">Chat with us</button></div></div>';
+  };
+  widget('right');
+  let added = false;
+  addEventListener('scroll', () => {
+    if (added || scrollY < 300) return;
+    added = true;
+    widget('left');
+  });
+</script>
