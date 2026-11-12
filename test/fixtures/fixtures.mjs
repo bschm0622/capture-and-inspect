@@ -503,6 +503,27 @@ export const FIXTURES = [
         return result(flags.length === 0, flags.length, `${rows.length - flags.length} of ${rows.length} numbers at their final value`, flags);
       }
     }
+  },
+  {
+    name: 'loop-reveal', file: 'loop-reveal.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { until: 1400 }),
+      // The two blocks the page's frame loop fades in once the capture's
+      // tiles bring them on screen: black in the capture, top to bottom.
+      'fades-played': ({ img }) => {
+        const flags = [];
+        let rows = 0;
+        for (const [top, h] of [[1484, 100], [3060, 200]]) {
+          const bad = [];
+          for (let y = top + 4; y < top + h - 4; y++) {
+            rows++;
+            if (Math.max(...meanBox(img, 200, 800, y, y + 1)) > 40) bad.push(y);
+          }
+          if (bad.length) flags.push({ y0: bad[0], y1: bad[bad.length - 1] + 1, note: `block at y ${top} faded or missing` });
+        }
+        return result(flags.length === 0, flags.length, flags.length ? `${flags.length} of 2 blocks not opaque` : `both blocks opaque (${rows} rows)`, flags);
+      }
+    }
   }
 ];
 

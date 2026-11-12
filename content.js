@@ -211,19 +211,19 @@
     });
   }
 
-  // Numbers counting up to their value (background.js pageClock): resolves
-  // once none on screen is still counting.
-  function waitForCounts() {
+  // Numbers counting up to their value and fades answering the scroll
+  // (background.js pageClock): resolves once none on screen is still going.
+  function waitForSettle() {
     return new Promise((resolve) => {
       let t = null;
       const done = () => {
         clearTimeout(t);
-        document.removeEventListener('cleanshot-counts-done', done);
+        document.removeEventListener('cleanshot-settle-done', done);
         resolve();
       };
       t = setTimeout(done, 11000);
-      document.addEventListener('cleanshot-counts-done', done);
-      document.dispatchEvent(new CustomEvent('cleanshot-counts'));
+      document.addEventListener('cleanshot-settle-done', done);
+      document.dispatchEvent(new CustomEvent('cleanshot-settle'));
     });
   }
 
@@ -2453,7 +2453,7 @@
           await freezeVideos();
           let dirty = [];
           if (clockHeld) {
-            await waitForCounts();
+            await waitForSettle();
             pauseClockAnimations();
             pausePlayers();
             // (A page that plays its videos again when they come into view

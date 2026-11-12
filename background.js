@@ -1150,15 +1150,27 @@ function stopCarousels() {
 // those were held), so it runs for HOLD_AFTER_MS from its own start before
 // it is kept back too. A slider's next step is asked for from inside its
 // last one, so it belongs to the old chain and stays held.
+// Except that a frame loop the page keeps going from before the hold (or
+// a short timer chain) may answer the capture's scroll too: Webflow runs
+// every interaction from one frame loop started at load, so a section
+// that fades in as it comes into view, and that the pre-scroll's quick
+// stops didn't set off, stayed at opacity 0 in its tile, a blank band
+// (www.calldad.com's "Find a location near you", one capture in four).
+// For ANSWER_MS after each of the capture's scrolls, such a loop runs; what
+// it changes in what was already shot is put back as ever (below), but for
+// a fade in on screen, which is let through as an answer to the scroll is.
+// And the page side asks before each shot ('cleanshot-settle') and waits
+// while something on screen is still being faded in, up to the end of that
+// window.
 // A chain that writes numbers into the page's text is the exception: a
 // statistic counting up to its value as it comes into view. Held, it shows
 // a number it was only passing through (www.calldad.com's "75,000+
 // customers" came out as 66,875+, rodanbuilders.com's 1,585 projects as
 // 227: both start counting at the pre-scroll's stop and were held at the
 // end of the grace). It runs on until it stops, up to COUNT_MS from its
-// start, so a live ticker is still held in the end, and the page side asks
-// with 'cleanshot-counts' before each shot, and waits, while one on screen
-// is still counting.
+// start, so a live ticker is still held in the end, and the page side's
+// 'cleanshot-settle' before each shot waits while one on screen is still
+// counting.
 // 'release' puts the page's functions back and runs what was held, so the
 // page carries on as if it had only been paused.
 //
@@ -1195,6 +1207,9 @@ function pageClock(cmd, graceMs, afterMs) {
   const KEY = '__cleanShotClock';
   const LONG_MS = 1000;
   const COUNT_MS = 10000;
+  const ANSWER_MS = 1600;
+  // A fade in on screen that hasn't moved on for this long is done.
+  const RISE_IDLE_MS = 150;
   // A counting chain that hasn't written a number for this long has stopped.
   const COUNT_IDLE_MS = 300;
   let S = window[KEY];
@@ -1218,7 +1233,21 @@ function pageClock(cmd, graceMs, afterMs) {
     // (Only the browser's own events: the stills below send the page a
     // scroll event of their own.)
     const mark = (k) => (e) => { if (e.isTrusted) S[k] = now(); };
-    S.listeners = [['scroll', mark('lastScroll')], ['load', mark('lastLoad')], ['error', mark('lastLoad')],
+    // Work from before the hold that was kept back, to be let go again for
+    // the window after the capture's next scroll: frames, and timers asked
+    // for less than LONG_MS ahead.
+    S.parkedFrames = new Map();
+    S.parkedTimeouts = new Map();
+    const answer = (e) => {
+      if (!e.isTrusted) return;
+      S.lastScroll = now();
+      if (!S.holding) return;
+      for (const [id, again] of S.parkedFrames) if (S.heldFrames.delete(id)) again();
+      for (const [id, again] of S.parkedTimeouts) if (S.heldTimeouts.delete(id)) again();
+      S.parkedFrames.clear();
+      S.parkedTimeouts.clear();
+    };
+    S.listeners = [['scroll', answer], ['load', mark('lastLoad')], ['error', mark('lastLoad')],
       ['transitionend', mark('lastSettle')], ['animationend', mark('lastSettle')]];
     for (const [type, f] of S.listeners) window.addEventListener(type, f, { capture: true, passive: true });
     const cause = () => {
@@ -1239,6 +1268,7 @@ function pageClock(cmd, graceMs, afterMs) {
           try {
             const records = S.mo.takeRecords();
             counts(records, c);
+            rises(records);
             S.freeze(records, c);
           } catch (e) {}
         }
@@ -1273,11 +1303,27 @@ function pageClock(cmd, graceMs, afterMs) {
       }
     };
     const counting = (c) => c.counting && now() - c.start < COUNT_MS;
+    // Something on screen having its inline opacity raised: a fade in,
+    // answering the scroll.
+    S.lastRise = -1e9;
+    const opacityIn = (v) => {
+      const x = parseFloat(decls(v).get('opacity'));
+      return Number.isFinite(x) ? x : null;
+    };
+    const rises = (records) => {
+      for (const m of records) {
+        if (m.type !== 'attributes' || m.attributeName !== 'style' || !(m.target instanceof HTMLElement)) continue;
+        const was = opacityIn(m.oldValue), is = opacityIn(m.target.getAttribute('style'));
+        if (was == null || is == null || is <= was) continue;
+        const r = m.target.getBoundingClientRect();
+        if (r.height > 0 && r.bottom > 0 && r.top < innerHeight) { S.lastRise = now(); return; }
+      }
+    };
     // Whether a callback of chain `c` (asked for `delay` ms ahead) is held now.
     const held = (c, delay) => {
       if (!S.holding) return false;
       if (counting(c)) return false;
-      if (c.start < S.holdAt) return delay >= LONG_MS || now() - S.holdAt >= S.grace;
+      if (c.start < S.holdAt) return delay >= LONG_MS || (now() - S.holdAt >= S.grace && now() - S.lastScroll >= ANSWER_MS);
       return now() - c.start >= S.after;
     };
     window.setTimeout = function (cb, ms, ...args) {
@@ -1288,6 +1334,7 @@ function pageClock(cmd, graceMs, afterMs) {
       const fire = function () {
         if (held(c, delay)) {
           S.heldTimeouts.set(id, () => run(c, cb, window, args));
+          if (c.start < S.holdAt && delay < LONG_MS) S.parkedTimeouts.set(id, () => o.setTimeout.call(window, fire, 0));
           return;
         }
         // (Counted like frames: an animation stepped by timeouts, as older
@@ -1316,14 +1363,16 @@ function pageClock(cmd, graceMs, afterMs) {
       if (typeof cb !== 'function') return o.requestAnimationFrame.call(window, cb);
       const c = chain();
       let id;
-      id = o.requestAnimationFrame.call(window, function (t) {
+      const fire = function (t) {
         if (held(c, 0)) {
           S.heldFrames.set(id, (t2) => run(c, cb, window, [t2]));
+          if (c.start < S.holdAt) S.parkedFrames.set(id, () => o.requestAnimationFrame.call(window, fire));
           return;
         }
         c.frames = (c.frames || 0) + 1;
         return run(c, cb, this, [t]);
-      });
+      };
+      id = o.requestAnimationFrame.call(window, fire);
       return id;
     };
     window.cancelAnimationFrame = function (id) {
@@ -1358,6 +1407,15 @@ function pageClock(cmd, graceMs, afterMs) {
         changed++;
       }
       return changed > 0;
+    };
+    // Whether two inline styles differ only in opacity, and maybe where the
+    // element is placed (a fade that moves up as it comes in).
+    const onlyFade = (a, b) => {
+      const x = decls(a), z = decls(b);
+      for (const k of new Set([...x.keys(), ...z.keys()])) {
+        if (x.get(k) !== z.get(k) && k !== 'opacity' && !PLACE.test(k)) return false;
+      }
+      return true;
     };
     // Whether a batch of changes hid an element that was shot and on show.
     // Each element changed is looked at as it was (its attributes put back
@@ -1547,6 +1605,13 @@ function pageClock(cmd, graceMs, afterMs) {
       };
       let done = false;
       const restored = new Map();
+      // A loop from before the hold answering the capture's scroll (see
+      // ANSWER_MS) that fades in something on screen which the tile above
+      // shot still faded out: the page's trigger line was below it then
+      // (loop-reveal fixture). Let through, like a reveal, and the tile
+      // above shot again where the seam goes through it.
+      const answering = c && c.start < S.holdAt && now() - S.lastScroll < ANSWER_MS;
+      const reveal = new Map();
       for (let i = records.length - 1; i >= 0; i--) {
         const m = records[i], t = m.target;
         if (t === document.documentElement || t === document.body || (document.head && document.head.contains(t))) continue;
@@ -1557,6 +1622,17 @@ function pageClock(cmd, graceMs, afterMs) {
           const cur = t.getAttribute(name);
           if (cur === m.oldValue || (name === 'style' && pageStyle(cur) === pageStyle(m.oldValue))) continue;
           if (!shot(t) || fighting(t)) continue;
+          if (answering && name === 'style' && !reveal.has(t)) {
+            const was = opacityIn(m.oldValue), is = opacityIn(cur);
+            const r = t.getBoundingClientRect();
+            reveal.set(t, was != null && is != null && is > was && r.bottom > 0 && r.top < innerHeight && onlyFade(m.oldValue, cur));
+          }
+          if (reveal.get(t)) {
+            const r = t.getBoundingClientRect();
+            S.dirty.push([Math.floor(r.top + y), Math.ceil(r.bottom + y), { done: false }]);
+            if (S.dirty.length > 200) S.dirty.shift();
+            continue;
+          }
           // A change let through as an answer to the scroll that the page
           // then keeps animating is a passing effect, not a new state: a
           // sway with the scroll's speed (r-o.com's footer crane leans one
@@ -1727,8 +1803,9 @@ function pageClock(cmd, graceMs, afterMs) {
       });
     };
     document.addEventListener('cleanshot-stills', S.onStills);
-    // Counts: answered once no number on screen is still counting.
-    S.onCounts = () => {
+    // Settle: answered once no number on screen is still counting and
+    // nothing on screen is still fading in after the capture's scroll.
+    S.onSettle = () => {
       const t0 = now();
       const check = () => {
         const vh = innerHeight;
@@ -1740,12 +1817,13 @@ function pageClock(cmd, graceMs, afterMs) {
             return r.bottom > 0 && r.top < vh && r.width > 0;
           });
         });
-        if (busy && now() - t0 < COUNT_MS) { o.setTimeout.call(window, check, 50); return; }
-        document.dispatchEvent(new CustomEvent('cleanshot-counts-done', { detail: String(Math.round(now() - t0)) }));
+        const fading = now() - S.lastRise < RISE_IDLE_MS && now() - S.lastScroll < ANSWER_MS;
+        if ((busy || fading) && now() - t0 < COUNT_MS) { o.setTimeout.call(window, check, 50); return; }
+        document.dispatchEvent(new CustomEvent('cleanshot-settle-done', { detail: String(Math.round(now() - t0)) }));
       };
       check();
     };
-    document.addEventListener('cleanshot-counts', S.onCounts);
+    document.addEventListener('cleanshot-settle', S.onSettle);
     return 'watching';
   }
   if (!S) return 'not watching';
@@ -1767,7 +1845,7 @@ function pageClock(cmd, graceMs, afterMs) {
     S.mo = null;
     for (const [type, f] of S.listeners) window.removeEventListener(type, f, { capture: true });
     document.removeEventListener('cleanshot-stills', S.onStills);
-    document.removeEventListener('cleanshot-counts', S.onCounts);
+    document.removeEventListener('cleanshot-settle', S.onSettle);
     for (const { el, c, style } of S.stills.reverse()) {
       c.remove();
       el.removeAttribute('data-cleanshot-stilled');
