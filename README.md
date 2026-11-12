@@ -99,8 +99,9 @@ declared color values, so photos and gradients-as-images won't muddy the result.
    before they're painted, canvases and paused videos are swapped for a
    still of one frame, frames from other sites (maps, players) are shot
    again until they stop changing, and an image whose request failed is
-   asked for once more. A reveal the pre-scroll missed is held at how it
-   looks once revealed from the tile that first shows it on.
+   asked for once more. A reveal the pre-scroll missed (a fade in, or a
+   small mark that grows to its full size) is held at how it looks once
+   revealed from the tile that first shows it on.
 4. After the first tile, hides `fixed` overlays and sticky top-navs so they
    appear once at the top instead of repeating. Sticky *content* sections
    (pinned scroll-storytelling) are detected by position and left intact.
