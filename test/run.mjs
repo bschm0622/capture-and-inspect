@@ -124,19 +124,33 @@ function runChild(payload, hardMs) {
   });
 }
 
-// The fixture pages, served on 127.0.0.1 for as long as the run lasts.
-// Plain files only, from test/fixtures.
+// The fixture pages, served on 127.0.0.1 for as long as the run lasts, and
+// on [::1] at the same port: another origin, for a frame from another site.
+// Plain files only, from test/fixtures. A file whose name starts with
+// `flaky-` fails (500) the first time it is asked for, like a request lost
+// to a network hiccup.
 async function serveFixtures() {
   const http = await import('node:http');
   const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml' };
-  const server = http.createServer((req, res) => {
+  const asked = new Set();
+  const handler = (req, res) => {
     const name = path.basename(decodeURIComponent(new URL(req.url, 'http://x').pathname));
     const file = path.join(FIXTURE_DIR, name);
     if (!name || !fs.existsSync(file) || !types[path.extname(name)]) { res.writeHead(404); res.end('not found'); return; }
+    if (name.startsWith('flaky-') && !asked.has(name)) {
+      asked.add(name);
+      res.writeHead(500, { 'cache-control': 'no-store' });
+      res.end('try again');
+      return;
+    }
     res.writeHead(200, { 'content-type': types[path.extname(name)], 'cache-control': 'no-store' });
     fs.createReadStream(file).pipe(res);
-  });
+  };
+  const server = http.createServer(handler);
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const other = http.createServer(handler);
+  await new Promise((r) => other.listen(server.address().port, '::1', r));
+  server.on('close', () => other.close());
   return server;
 }
 

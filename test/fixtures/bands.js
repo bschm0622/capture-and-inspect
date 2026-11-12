@@ -20,6 +20,21 @@ window.makeBand = (i) => {
   el.innerHTML = lines.join('');
   return el;
 };
+// Lines of text over the left part of `el` (x < 1200), for texture: a flat
+// region that tall would read as a blank band.
+window.addLines = (el, n, color = '#fff') => {
+  const box = document.createElement('div');
+  box.style.cssText = `position:relative;padding:8px 16px;font:15px/22px sans-serif;color:${color}`;
+  for (let l = 0; l < n; l++) {
+    let s = `Line ${l}:`;
+    for (let k = 0; k < 18; k++) s += ' ' + WORDS[(l * 5 + k * 3) % WORDS.length];
+    const d = document.createElement('div');
+    d.style.cssText = 'width:1200px;white-space:nowrap;overflow:hidden';
+    d.textContent = s;
+    box.appendChild(d);
+  }
+  el.appendChild(box);
+};
 window.addBands = (parent, from, count) => {
   const frag = document.createDocumentFragment();
   for (let i = from; i < from + count; i++) frag.appendChild(makeBand(i));

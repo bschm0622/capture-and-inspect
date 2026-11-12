@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: a WebGL canvas taller than the window</title>
+<!-- A 1200px WebGL canvas (no preserveDrawingBuffer, so it reads back empty
+     outside the frame that drew it) painted a new colour every frame by a
+     loop that keeps its own reference to the browser's
+     requestAnimationFrame, out of reach of the capture's timer wrappers.
+     It is cut by the first tile edge; both parts must show one frame. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  canvas{display:block;width:100%;height:1200px}
+</style>
+<script src="bands.js"></script>
+<canvas id="g" width="1388" height="1200"></canvas>
+<main id="m"></main>
+<script>
+  addBands(document.getElementById('m'), 6, 20);
+  const gl = document.getElementById('g').getContext('webgl', { preserveDrawingBuffer: false });
+  const raf = window.requestAnimationFrame.bind(window);
+  let f = 0;
+  const draw = () => {
+    f++;
+    const c = [((f * 37) % 256) / 255, ((f * 91) % 256) / 255, ((f * 53) % 256) / 255];
+    gl.disable(gl.SCISSOR_TEST);
+    gl.clearColor(c[0], c[1], c[2], 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    // Stripes over the left part, for texture (the canvas is 1:1 with CSS px).
+    gl.enable(gl.SCISSOR_TEST);
+    gl.clearColor(1 - c[0], 1 - c[1], 1 - c[2], 1);
+    for (let y = 10; y < 1200; y += 22) {
+      for (let x = 20; x < 1150; x += 90) {
+        gl.scissor(x, y, 40 + (x * 7 + y) % 40, 8);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      }
+    }
+    raf(draw);
+  };
+  raf(draw);
+</script>
