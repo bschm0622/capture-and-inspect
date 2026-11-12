@@ -1632,13 +1632,21 @@
   // top of every tile, its edge showing below each overlap. Only an inline
   // !important beats that, so where the rule lost, the same declarations
   // are written inline too, and taken off again before the next look.
+  // Taken off only where they are still what the capture wrote: a script
+  // that writes the place inline itself (arnettcustomhomes.com's Divi
+  // sticky row, `position: fixed !important` inline while stuck) clears
+  // it again once the page scrolls back up, and the stuck values put back
+  // over that kept the row fixed at the top with its spacer gone, the
+  // page under it moved up by its height.
   const INFLOW_PROPS = ['position', 'top', 'left', 'right', 'bottom', 'width', 'margin'];
+  const INFLOW_SET = { position: 'absolute', top: 'var(--cleanshot-top)', left: 'var(--cleanshot-left)', right: 'auto', bottom: 'auto', width: 'var(--cleanshot-width)', margin: '0' };
   let inflow = new Set();
-  let inflowInline = new Map(); // element -> [[property, value, priority]] as the page had them
+  let inflowInline = new Map(); // element -> [[property, value, priority, as written]] as the page had them
   function dropInflowInline(el) {
     const prev = inflowInline.get(el);
     if (!prev) return;
-    for (const [p, v, pr] of prev) {
+    for (const [p, v, pr, ours] of prev) {
+      if (el.style.getPropertyValue(p) !== ours || el.style.getPropertyPriority(p) !== 'important') continue;
       if (v) el.style.setProperty(p, v, pr);
       else el.style.removeProperty(p);
     }
@@ -1657,9 +1665,9 @@
       el.style.setProperty('--cleanshot-width', `${box.width}px`);
       el.setAttribute('data-cleanshot-inflow', '');
       if (getComputedStyle(el).position !== 'absolute') {
-        inflowInline.set(el, INFLOW_PROPS.map((p) => [p, el.style.getPropertyValue(p), el.style.getPropertyPriority(p)]));
-        const set = { position: 'absolute', top: 'var(--cleanshot-top)', left: 'var(--cleanshot-left)', right: 'auto', bottom: 'auto', width: 'var(--cleanshot-width)', margin: '0' };
-        for (const p of INFLOW_PROPS) el.style.setProperty(p, set[p], 'important');
+        const prev = INFLOW_PROPS.map((p) => [p, el.style.getPropertyValue(p), el.style.getPropertyPriority(p)]);
+        for (const p of INFLOW_PROPS) el.style.setProperty(p, INFLOW_SET[p], 'important');
+        inflowInline.set(el, prev.map(([p, v, pr]) => [p, v, pr, el.style.getPropertyValue(p)]));
       }
       const r = el.getBoundingClientRect();
       el.style.setProperty('--cleanshot-top', `${box.top - (r.top + scroller.scrollTop)}px`);
