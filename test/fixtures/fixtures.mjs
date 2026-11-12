@@ -421,6 +421,23 @@ export const FIXTURES = [
     }
   },
   {
+    name: 'slow-fade', file: 'slow-fade.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { until: 2200 }),
+      // The heading block the page fades in late, shot half faded in one
+      // tile and opaque in the next: black in the capture, top to bottom.
+      'fade-opaque-whole': ({ img }) => {
+        const bad = [];
+        for (let y = 2288; y < 2380; y++) {
+          const c = meanBox(img, 200, 800, y, y + 1);
+          if (Math.max(...c) > 40) bad.push(y);
+        }
+        return result(bad.length === 0, bad.length, `${92 - bad.length} of 92 rows of the block are opaque`,
+          bad.length ? [{ y0: bad[0], y1: bad[bad.length - 1] + 1, note: 'block faded or missing' }] : []);
+      }
+    }
+  },
+  {
     name: 'lazy-clone', file: 'lazy-clone.html', settleMs: 500,
     checks: {
       'bands-in-place': ({ img }) => bandsInPlace(img, { until: 1600 }),
