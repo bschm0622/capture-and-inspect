@@ -1538,18 +1538,42 @@
   // itself (at the top again, for a header), it is left alone. The script
   // usually leaves a spacer where it was, so it goes back over that, out of
   // the flow: put back in the flow it would take the space twice.
+  //
+  // A page rule that is more specific and !important wins over the
+  // capture's (hermansplumbing.com's Divi header: `#main-header.et-fixed-header
+  // { position: fixed !important }`), and the header stayed fixed at the
+  // top of every tile, its edge showing below each overlap. Only an inline
+  // !important beats that, so where the rule lost, the same declarations
+  // are written inline too, and taken off again before the next look.
+  const INFLOW_PROPS = ['position', 'top', 'left', 'right', 'bottom', 'width', 'margin'];
   let inflow = new Set();
+  let inflowInline = new Map(); // element -> [[property, value, priority]] as the page had them
+  function dropInflowInline(el) {
+    const prev = inflowInline.get(el);
+    if (!prev) return;
+    for (const [p, v, pr] of prev) {
+      if (v) el.style.setProperty(p, v, pr);
+      else el.style.removeProperty(p);
+    }
+    inflowInline.delete(el);
+  }
   function placeInFlow(el) {
     // (Transitions off meanwhile, or the box read back is where a 1ms
     // transition from the old place starts.)
     const box = flowBoxes.get(el);
     el.setAttribute('data-cleanshot-probe', '');
     el.removeAttribute('data-cleanshot-inflow');
+    dropInflowInline(el);
     if (box && el.isConnected && getComputedStyle(el).position === 'fixed') {
       el.style.setProperty('--cleanshot-top', '0px');
       el.style.setProperty('--cleanshot-left', '0px');
       el.style.setProperty('--cleanshot-width', `${box.width}px`);
       el.setAttribute('data-cleanshot-inflow', '');
+      if (getComputedStyle(el).position !== 'absolute') {
+        inflowInline.set(el, INFLOW_PROPS.map((p) => [p, el.style.getPropertyValue(p), el.style.getPropertyPriority(p)]));
+        const set = { position: 'absolute', top: 'var(--cleanshot-top)', left: 'var(--cleanshot-left)', right: 'auto', bottom: 'auto', width: 'var(--cleanshot-width)', margin: '0' };
+        for (const p of INFLOW_PROPS) el.style.setProperty(p, set[p], 'important');
+      }
       const r = el.getBoundingClientRect();
       el.style.setProperty('--cleanshot-top', `${box.top - (r.top + scroller.scrollTop)}px`);
       el.style.setProperty('--cleanshot-left', `${box.left - r.left}px`);
@@ -1716,14 +1740,18 @@
 
   // What a panel shows, for telling its stages apart: each visible part
   // that paints something (text, a picture, a canvas, a background), with
-  // where it sits in the panel and how much of the panel it covers.
+  // where it sits in the panel and how much of the panel it covers. The
+  // panel's own opacity doesn't count: a panel that fades or slides in as
+  // a whole (newmanroofing.com's, an AOS fade-right that the page plays
+  // again on the way back up) shows the same thing at every stage, only
+  // arriving, and the parts' places are read against the panel's own box.
   function shownParts(frame) {
     const fr = frame.getBoundingClientRect();
     const out = new Map();
     const walk = (el, op) => {
       const cs = getComputedStyle(el);
       if (cs.display === 'none') return;
-      const o = op * Number(cs.opacity);
+      const o = el === frame ? 1 : op * Number(cs.opacity);
       if (o < 0.5) return;
       const r = el.getBoundingClientRect();
       if (cs.visibility === 'visible' && r.width > 0 && r.height > 0) {
@@ -1780,6 +1808,20 @@
         await sleep(150);
         await waitForVisibleImages(800);
         const stage = { at: off + travel * k / (n - 1), node: frame.cloneNode(true) };
+        // The panel's own look and place at this stage, for the copies (see
+        // below).
+        // (Its place is read with its own transform off: the copies carry
+        // that transform themselves.)
+        const fcs = getComputedStyle(frame);
+        const look = { opacity: Number(fcs.opacity), transform: fcs.transform, translate: fcs.translate };
+        const saved = ['transform', 'translate'].map((p) => [p, frame.style.getPropertyValue(p), frame.style.getPropertyPriority(p)]);
+        frame.setAttribute('data-cleanshot-probe', '');
+        frame.style.setProperty('transform', 'none', 'important');
+        frame.style.setProperty('translate', 'none', 'important');
+        const fr = frame.getBoundingClientRect();
+        for (const [p, v, pr] of saved) { if (v) frame.style.setProperty(p, v, pr); else frame.style.removeProperty(p); }
+        frame.removeAttribute('data-cleanshot-probe');
+        stage.frameLook = { ...look, left: fr.left, width: fr.width };
         if (panel) {
           stage.parts = shownParts(frame);
           // How each part looks here, for the copy to keep: a script that
@@ -1807,13 +1849,21 @@
       frame.style.setProperty('visibility', 'hidden', 'important');
       frame.style.setProperty('opacity', '0', 'important');
       frame.setAttribute('data-cleanshot-filmed', '');
-      const left = r.left - pr.left - parseFloat(ps.borderLeftWidth);
+      // A panel that slides or fades in as a whole was measured, and may
+      // have been copied, partway in (newmanroofing.com's sat 100px to the
+      // left and transparent until the page played its entrance, and every
+      // copy came out cut off at the left edge). Every copy takes the
+      // panel's look and place from the stage where it showed most, the
+      // way it rests once arrived.
+      const rest = stages.reduce((a, s) => (s.frameLook.opacity >= a.frameLook.opacity ? s : a), stages[0]).frameLook;
+      const left = rest.left - pr.left - parseFloat(ps.borderLeftWidth);
       let after = frame;
       for (const { at, node, looks } of stages) {
         node.setAttribute('data-cleanshot-clone', '');
         node.setAttribute('aria-hidden', 'true');
         for (const [p, v] of [['position', 'absolute'], ['top', `${at - parseFloat(ps.borderTopWidth)}px`], ['left', `${left}px`],
-          ['bottom', 'auto'], ['right', 'auto'], ['width', `${r.width}px`], ['height', `${h}px`], ['margin', '0']]) {
+          ['bottom', 'auto'], ['right', 'auto'], ['width', `${rest.width}px`], ['height', `${h}px`], ['margin', '0'],
+          ['opacity', String(rest.opacity)], ['transform', rest.transform], ['translate', rest.translate]]) {
           node.style.setProperty(p, v, 'important');
         }
         // The page's script finds the copies too and moves them on with the
@@ -2151,6 +2201,7 @@
     hiddenEls = [];
     for (const el of inflow) {
       el.removeAttribute('data-cleanshot-inflow');
+      dropInflowInline(el);
       ['--cleanshot-top', '--cleanshot-left', '--cleanshot-width'].forEach((p) => el.style.removeProperty(p));
     }
     inflow = new Set();
