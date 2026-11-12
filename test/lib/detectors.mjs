@@ -647,9 +647,15 @@ export function stagedCopies(img, cap) {
     const x0 = Math.floor(img.W * k / NB), x1 = Math.floor(img.W * (k + 1) / NB);
     const ds = [];
     for (let y = y0; y + P < y1; y += 2) {
-      let ma = 0, mb = 0, lo = 255, hi = 0;
-      for (let x = x0; x < x1; x++) { const a = L(x, y), b = L(x, y + P); ma += a; mb += b; lo = Math.min(lo, a, b); hi = Math.max(hi, a, b); }
-      if (hi - lo < 40) continue;
+      // Each row textured on its own: two flat rows of different colours
+      // are alike once their levels are taken out.
+      let ma = 0, mb = 0, loA = 255, hiA = 0, loB = 255, hiB = 0;
+      for (let x = x0; x < x1; x++) {
+        const a = L(x, y), b = L(x, y + P);
+        ma += a; mb += b;
+        loA = Math.min(loA, a); hiA = Math.max(hiA, a); loB = Math.min(loB, b); hiB = Math.max(hiB, b);
+      }
+      if (hiA - loA < 40 || hiB - loB < 40) continue;
       ma /= x1 - x0; mb /= x1 - x0;
       let d = 0;
       for (let x = x0; x < x1; x++) d += Math.abs((L(x, y) - ma) - (L(x, y + P) - mb));
