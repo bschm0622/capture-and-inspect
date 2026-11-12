@@ -1160,8 +1160,8 @@ function stopCarousels() {
 // it changes in what was already shot is put back as ever (below), but for
 // a fade in on screen, which is let through as an answer to the scroll is.
 // And the page side asks before each shot ('cleanshot-settle') and waits
-// while something on screen is still being faded in, up to the end of that
-// window.
+// while something on screen is still being faded in, up to RISE_MS after
+// the scroll.
 // A chain that writes numbers into the page's text is the exception: a
 // statistic counting up to its value as it comes into view. Held, it shows
 // a number it was only passing through (www.calldad.com's "75,000+
@@ -1208,8 +1208,12 @@ function pageClock(cmd, graceMs, afterMs) {
   const LONG_MS = 1000;
   const COUNT_MS = 10000;
   const ANSWER_MS = 1600;
-  // A fade in on screen that hasn't moved on for this long is done.
+  // A fade in on screen that hasn't moved on for this long is done, and one
+  // still going this long after the scroll is waited for no longer (a
+  // Webflow fade ends about 1050ms after the scroll; an opacity that pulses
+  // on a loop never does).
   const RISE_IDLE_MS = 150;
+  const RISE_MS = 1200;
   // A counting chain that hasn't written a number for this long has stopped.
   const COUNT_IDLE_MS = 300;
   let S = window[KEY];
@@ -1817,7 +1821,7 @@ function pageClock(cmd, graceMs, afterMs) {
             return r.bottom > 0 && r.top < vh && r.width > 0;
           });
         });
-        const fading = now() - S.lastRise < RISE_IDLE_MS && now() - S.lastScroll < ANSWER_MS;
+        const fading = now() - S.lastRise < RISE_IDLE_MS && now() - S.lastScroll < RISE_MS;
         if ((busy || fading) && now() - t0 < COUNT_MS) { o.setTimeout.call(window, check, 50); return; }
         document.dispatchEvent(new CustomEvent('cleanshot-settle-done', { detail: String(Math.round(now() - t0)) }));
       };

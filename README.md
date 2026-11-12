@@ -100,7 +100,10 @@ declared color values, so photos and gradients-as-images won't muddy the result.
    still of one frame, frames from other sites (maps, players) are shot
    again until they stop changing, and an image whose request failed is
    asked for once more. A reveal the pre-scroll missed is held at how it
-   looks once revealed from the tile that first shows it on.
+   looks once revealed from the tile that first shows it on. Fades a page
+   plays from its own animation loop still play when a tile scrolls them
+   into view, and a number counting up to its value (a "75,000+
+   customers" statistic) is shot once it has stopped, not part-way.
 4. After the first tile, hides `fixed` overlays and sticky top-navs so they
    appear once at the top instead of repeating. Sticky *content* sections
    (pinned scroll-storytelling) are detected by position and left intact.

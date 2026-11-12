@@ -963,6 +963,40 @@ export const SITES = [
           ink != null && ink <= 110 ? [] : [{ y0: h.top, y1: h.top + h.h, note: 'heading faded' }]);
       }
     }
+  },
+  {
+    // Webflow plays every interaction from one frame loop started at load.
+    // Held with the page's clock, a section the pre-scroll's quick stops
+    // didn't set off never faded in at its tile: the service-area heading
+    // and paragraph came out as white space, and once the whole
+    // "D.A.D. University" card (one capture in four). Its statistics count
+    // up as they come into view (see the count-up fixture for their
+    // values).
+    host: 'www.calldad.com',
+    url: 'https://www.calldad.com',
+    collect: () => {
+      const R = (el) => { const r = el.getBoundingClientRect(); return { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) }; };
+      const head = (re) => [...document.querySelectorAll('h1, h2, h3')].find((e) => re.test(e.textContent) && e.getBoundingClientRect().width > 0);
+      const loc = head(/Find a location near you/i);
+      let card = head(/Training for future/i);
+      while (card && card.parentElement && card.getBoundingClientRect().height < 300) card = card.parentElement;
+      return { loc: loc ? R(loc) : null, card: card ? R(card) : null };
+    },
+    checks: {
+      'loop-reveal-shown'({ img, facts }) {
+        const flags = [];
+        const notes = [];
+        if (!facts.loc || !facts.card) return result(false, null, 'service-area heading or training card not found on the page');
+        const ink = inkLevel(img, facts.loc);
+        notes.push(`heading's darkest marks ${ink} (fail at 128 or lighter)`);
+        if (ink == null || ink >= 128) flags.push({ y0: facts.loc.top, y1: facts.loc.top + facts.loc.h, note: 'service-area heading missing' });
+        const c = facts.card;
+        const f = flatShare(img, { y0: c.top, y1: c.top + c.h, x: c.left, w: c.w });
+        notes.push(`${Math.round((f || 0) * 100)}% of the training card's rows flat (fail at 60%)`);
+        if (f == null || f >= 0.6) flags.push({ y0: c.top, y1: c.top + c.h, note: 'training card missing' });
+        return result(flags.length === 0, ink, notes.join('; '), flags);
+      }
+    }
   }
 ];
 
@@ -1025,6 +1059,7 @@ export const KNOWN = {
   'late-header-once': 'Header fixed by a stronger page rule rode along in every tile: its bottom rows a stripe at each tile edge',
   'sticky-panel-once': 'Sticky panel with an entrance slide shown as copies down its column, each cut off at the left',
   'reveal-whole': 'Reveal the pre-scroll missed, cut by the seam between a shot without it and one with it',
+  'loop-reveal-shown': "Fade-ins played by the page's own frame loop held: a section left blank",
   'late-fade-opaque': 'Scroll-linked fade too late for the pre-scroll caught part-way in a tile shot again: heading pale'
 };
 
