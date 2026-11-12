@@ -551,7 +551,7 @@
           let m = 0, m2 = 0;
           for (let i = 0; i < a.length; i += 4) { const l = (a[i] * 77 + a[i + 1] * 150 + a[i + 2] * 29) >> 8; m += l; m2 += l * l; }
           const n = a.length / 4;
-          if (Math.sqrt(Math.max(0, m2 / n - (m / n) ** 2)) < 12) continue;
+          if (Math.sqrt(Math.max(0, m2 / n - (m / n) ** 2)) < 12 || m / n < 16 || m / n > 240) continue;
           let s = 0;
           for (let i = 0; i < a.length; i += 4) s += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
           const change = s / (a.length / 4) / 3;

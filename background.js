@@ -632,7 +632,13 @@ async function stitchTiles(tab, info) {
     // change as the page scrolls, came out cut where they had been whole).
     const dirtyAbove = i > 0 && last && (res.dirty || []).some(([a, b]) =>
       a + off < seam - 1 && a + off >= last.from / scale - 1);
-    if (((agree && agree.blocks > 0) || dirtyAbove) && last && seamReshoots < RESHOOTS_PER_SEAM && reshoots < MAX_RESHOOTS && affords(2, res)) {
+    // A new shot of the tile above repaints its rows from where it began
+    // painting; something the page changed that reaches above that row was
+    // painted there by an older tile, and would be cut there instead
+    // (www.pvhvac.com's hero panel, which the page changes as it scrolls).
+    const straddles = i > 0 && last && (res.dirty || []).some(([a, b]) =>
+      a + off < last.from / scale - 1 && b + off > last.from / scale + 1);
+    if (((agree && agree.blocks > 0) || dirtyAbove) && !straddles && last && seamReshoots < RESHOOTS_PER_SEAM && reshoots < MAX_RESHOOTS && affords(2, res)) {
       seamReshoots++;
       reshoots++;
       placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, match, agree, retake: true });
@@ -1298,6 +1304,43 @@ function pageClock(cmd, graceMs, afterMs) {
       }
       return changed > 0;
     };
+    // Whether a batch of changes hid an element that was shot and on show.
+    // Each element changed is looked at as it was (its attributes put back
+    // for a moment) and as it is.
+    const shows = (el) => el.checkVisibility({ opacityProperty: true, visibilityProperty: true, checkOpacity: true, checkVisibilityCSS: true });
+    const swapsShown = (records, bottom, y) => {
+      const olds = new Map();
+      for (const m of records) {
+        if (m.type !== 'attributes' || !/^(class|style|hidden)$/.test(m.attributeName) || m.target.nodeType !== 1) continue;
+        if (!olds.has(m.target)) olds.set(m.target, new Map());
+        const o = olds.get(m.target);
+        if (!o.has(m.attributeName)) o.set(m.attributeName, m.oldValue);
+      }
+      for (const [el, o] of olds) {
+        if (el === document.body || el === document.documentElement || el instanceof SVGElement) continue;
+        // (Or changed the picture it shows: a background slideshow.)
+        if (o.has('style') && shows(el) && !pinned(el)) {
+          const bg = (v) => decls(v).get('background-image') || decls(v).get('background') || '';
+          // (A lazy loader putting the first picture in isn't one.)
+          const was = bg(o.get('style'));
+          if (was && !/^none$|data:/i.test(was) && was !== bg(el.getAttribute('style'))) {
+            const r = el.getBoundingClientRect();
+            if (r.top + y < bottom && r.bottom + y > 0 && r.width > 0 && r.height > 0) return true;
+          }
+        }
+        if (shows(el)) continue;
+        const now = new Map([...o.keys()].map((k) => [k, el.getAttribute(k)]));
+        const set = (vals) => vals.forEach((v, k) => (v == null ? el.removeAttribute(k) : el.setAttribute(k, v)));
+        set(o);
+        const r = el.getBoundingClientRect();
+        const was = shows(el) && r.width > 0 && r.height > 0 && r.top + y < bottom && r.bottom + y > 0 && !pinned(el);
+        set(now);
+        if (was) { S.mo.takeRecords(); return true; }
+      }
+      // (The look's own writes are no change of the page's.)
+      if (olds.size) S.mo.takeRecords();
+      return false;
+    };
     const FIGHT = 150;
     const PROVISIONAL_MS = 1500;
     const fighting = (t) => {
@@ -1323,6 +1366,21 @@ function pageClock(cmd, graceMs, afterMs) {
       // shot: saybriefly.com plays its hero again on every scroll.
       if (why === 'scroll' && !(c && c.frames >= 2)) {
         const back = [];
+        // A reveal only shows things. One that hides something already shot
+        // and on show is the page turning a slide or a panel
+        // (www.pvhvac.com's hero panel swapped pictures as the capture
+        // scrolled, and a tile edge cut the two): all of it is put back.
+        if (swapsShown(records, bottom, y)) {
+          for (let i = records.length - 1; i >= 0; i--) {
+            const m = records[i];
+            if (m.type !== 'attributes' || !/^(class|style|hidden)$/.test(m.attributeName) || pinned(m.target) || fighting(m.target)) continue;
+            if (m.oldValue == null) m.target.removeAttribute(m.attributeName);
+            else m.target.setAttribute(m.attributeName, m.oldValue);
+          }
+          S.reverted++;
+          S.mo.takeRecords();
+          return;
+        }
         for (const m of records) {
           // (Only what can change how it looks; and not the inline style of
           // an element the capture holds through its stylesheet, whose
