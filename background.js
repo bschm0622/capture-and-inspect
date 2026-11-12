@@ -1243,6 +1243,9 @@ function pageClock(cmd, graceMs, afterMs) {
           S.heldTimeouts.set(id, () => run(c, cb, window, args));
           return;
         }
+        // (Counted like frames: an animation stepped by timeouts, as older
+        // jQuery does, is a chain of them; a debounce is one.)
+        c.frames = (c.frames || 0) + 1;
         return run(c, cb, this, args);
       };
       id = o.setTimeout.call(window, fire, ms);
@@ -1254,6 +1257,7 @@ function pageClock(cmd, graceMs, afterMs) {
       const delay = Number(ms) || 0;
       return o.setInterval.call(window, function () {
         if (held(c, delay)) { S.skipped++; return; }
+        c.frames = (c.frames || 0) + 1;
         return run(c, cb, this, args);
       }, ms);
     };
@@ -1345,6 +1349,40 @@ function pageClock(cmd, graceMs, afterMs) {
       if (olds.size) S.mo.takeRecords();
       return false;
     };
+    // Put an attribute back as the page had it. For a style, the capture's
+    // own declarations in it now (its !important ones and --cleanshot
+    // variables, written since) stay: put back without them, an element
+    // the capture holds through its stylesheet lost its hold
+    // (arnettcustomhomes.com's hero picture dropped its parallax place).
+    // (Split at the semicolons between declarations, not those inside a
+    // url() or a string.)
+    const splitDecls = (v) => {
+      const out = [];
+      let depth = 0, q = '', cur = '';
+      for (const ch of v || '') {
+        if (q) { if (ch === q) q = ''; }
+        else if (ch === '"' || ch === "'") q = ch;
+        else if (ch === '(') depth++;
+        else if (ch === ')') depth--;
+        else if (ch === ';' && depth <= 0) { out.push(cur.trim()); cur = ''; continue; }
+        cur += ch;
+      }
+      out.push(cur.trim());
+      return out.filter(Boolean);
+    };
+    const putBack = (el, name, value) => {
+      if (name === 'style') {
+        const cur = el.getAttribute('style') || '';
+        const ours = splitDecls(cur).filter((d) => /!\s*important$/i.test(d) || d.startsWith('--cleanshot'));
+        const page = splitDecls(value).filter((d) => !/!\s*important$/i.test(d) && !d.startsWith('--cleanshot'));
+        if (!ours.length && value == null) { el.removeAttribute('style'); return; }
+        const next = page.concat(ours).join('; ');
+        if (next !== cur) el.setAttribute('style', next);
+        return;
+      }
+      if (value == null) el.removeAttribute(name);
+      else el.setAttribute(name, value);
+    };
     const FIGHT = 150;
     const PROVISIONAL_MS = 1500;
     const fighting = (t) => {
@@ -1378,12 +1416,30 @@ function pageClock(cmd, graceMs, afterMs) {
           for (let i = records.length - 1; i >= 0; i--) {
             const m = records[i];
             if (m.type !== 'attributes' || !/^(class|style|hidden)$/.test(m.attributeName) || pinned(m.target) || fighting(m.target)) continue;
-            if (m.oldValue == null) m.target.removeAttribute(m.attributeName);
-            else m.target.setAttribute(m.attributeName, m.oldValue);
+            putBack(m.target, m.attributeName, m.oldValue);
           }
           S.reverted++;
           S.mo.takeRecords();
           return;
+        }
+        // What every attribute of what was shot was before this answer to
+        // the scroll, kept together, in case the page goes on to animate
+        // it: see the put-back below.
+        const batch = { at: now(), entries: [], done: false };
+        for (const m of records) {
+          if (m.type !== 'attributes' || m.target.nodeType !== 1 || LOADING.test(m.attributeName) || MEDIA.test(m.target.nodeName)) continue;
+          const t = m.target;
+          if (t === document.body || t === document.documentElement || pinned(t)) continue;
+          let e = t;
+          while (e.ownerSVGElement) e = e.ownerSVGElement;
+          let r = e.getBoundingClientRect();
+          for (let a = e, k = 0; r.width === 0 && r.height === 0 && a.parentElement && k < 4; k++) { a = a.parentElement; r = a.getBoundingClientRect(); }
+          if (!(r.height > 0 && r.top + y < bottom && r.bottom + y > 0)) continue;
+          if (!S.provisional.has(t)) S.provisional.set(t, new Map());
+          const p = S.provisional.get(t);
+          if (p.get(m.attributeName) === batch) continue;
+          p.set(m.attributeName, batch);
+          batch.entries.push([t, m.attributeName, m.oldValue]);
         }
         for (const m of records) {
           // (Only what can change how it looks; and not the inline style of
@@ -1413,23 +1469,15 @@ function pageClock(cmd, graceMs, afterMs) {
                 back.push(m);
                 continue;
               }
-              S.dirty.push([Math.floor(r.top + y), Math.ceil(r.bottom + y)]);
+              S.dirty.push([Math.floor(r.top + y), Math.ceil(r.bottom + y), batch]);
               if (S.dirty.length > 200) S.dirty.shift();
-              // What it was before, in case the page goes on to animate it:
-              // see the put-back below.
-              if (m.type === 'attributes') {
-                if (!S.provisional.has(m.target)) S.provisional.set(m.target, new Map());
-                const p = S.provisional.get(m.target);
-                if (!p.has(m.attributeName)) p.set(m.attributeName, { old: m.oldValue, at: now() });
-              }
             }
           }
         }
         for (let i = back.length - 1; i >= 0; i--) {
           const m = back[i];
           if (fighting(m.target)) continue;
-          if (m.oldValue == null) m.target.removeAttribute('style');
-          else m.target.setAttribute('style', m.oldValue);
+          putBack(m.target, 'style', m.oldValue);
         }
         if (back.length) { S.reverted++; S.mo.takeRecords(); }
         return;
@@ -1470,21 +1518,27 @@ function pageClock(cmd, graceMs, afterMs) {
           // again. It goes back to how it was before that scroll, as the
           // tile above shot it. (Within PROVISIONAL_MS of the scroll only;
           // a reveal that stays put is left.)
-          const prov = S.provisional.get(t) && S.provisional.get(t).get(name);
-          let old = m.oldValue;
           // (Records are taken newest first: once put back that far, the
           // older ones of the same batch are not to undo it.)
           if (restored.get(t) && restored.get(t).has(name)) continue;
-          if (prov) {
-            S.provisional.get(t).delete(name);
-            if (now() - prov.at < PROVISIONAL_MS) {
-              old = prov.old;
-              if (!restored.has(t)) restored.set(t, new Set());
-              restored.get(t).add(name);
+          const prov = S.provisional.get(t) && S.provisional.get(t).get(name);
+          if (prov && !prov.done && now() - prov.at < PROVISIONAL_MS) {
+            // All of that answer goes back, not just this attribute: a
+            // slider's turn sets the next slide's class and the counter as
+            // well as starting the fade (arnettcustomhomes.com's hero).
+            prov.done = true;
+            for (const [el, n, v] of prov.entries) {
+              if (S.provisional.get(el)) S.provisional.get(el).delete(n);
+              if (!restored.has(el)) restored.set(el, new Set());
+              restored.get(el).add(n);
+              if (el.getAttribute(n) === v) continue;
+              putBack(el, n, v);
             }
+            done = true;
+            continue;
           }
-          if (old == null) t.removeAttribute(name);
-          else t.setAttribute(name, old);
+          if (prov) S.provisional.get(t).delete(name);
+          putBack(t, name, m.oldValue);
           done = true;
         } else if (m.type === 'characterData') {
           if (t.data === m.oldValue || !shot(t) || fighting(t)) continue;
@@ -1614,7 +1668,9 @@ function pageClock(cmd, graceMs, afterMs) {
         // the last ask, merged.)
         if (S.mo) { try { S.freeze(S.mo.takeRecords(), null); } catch (e) {} }
         const runs = [];
-        for (const [a, b] of S.dirty.sort((p, q) => p[0] - q[0])) {
+        // (Not what was put back since: an answer the page went on to
+        // animate, rolled back to how the tile above shot it.)
+        for (const [a, b] of S.dirty.filter((d) => !d[2].done).sort((p, q) => p[0] - q[0])) {
           const last = runs[runs.length - 1];
           if (last && a <= last[1]) last[1] = Math.max(last[1], b); else runs.push([a, b]);
         }

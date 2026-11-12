@@ -1539,48 +1539,20 @@
   // usually leaves a spacer where it was, so it goes back over that, out of
   // the flow: put back in the flow it would take the space twice.
   let inflow = new Set();
-  let inflowInline = new Set(); // ones placed by inline style (see below)
   function placeInFlow(el) {
     // (Transitions off meanwhile, or the box read back is where a 1ms
     // transition from the old place starts.)
     const box = flowBoxes.get(el);
     el.setAttribute('data-cleanshot-probe', '');
     el.removeAttribute('data-cleanshot-inflow');
-    // (Let go of the inline placing too, so what the page does with it now
-    // shows: back at the top of the page, a header is in the flow again.)
-    if (inflowInline.has(el)) {
-      for (const p of ['position', 'top', 'left', 'right', 'bottom', 'width', 'margin']) {
-        if (el.style.getPropertyPriority(p) === 'important') el.style.removeProperty(p);
-      }
-    }
     if (box && el.isConnected && getComputedStyle(el).position === 'fixed') {
       el.style.setProperty('--cleanshot-top', '0px');
       el.style.setProperty('--cleanshot-left', '0px');
       el.style.setProperty('--cleanshot-width', `${box.width}px`);
       el.setAttribute('data-cleanshot-inflow', '');
-      // A page rule that pins it with !important of its own and an id
-      // (Divi's `#main-header.et-fixed-header`, on hermansplumbing.com)
-      // outranks the stylesheet's: then the same goes inline, where
-      // nothing outranks it. The page's script may write the inline style
-      // again; this runs before every tile.
-      const inline = getComputedStyle(el).position === 'fixed';
-      if (inline) {
-        if (!inflowInline.has(el)) {
-          inflowInline.add(el);
-          unwrapped.push({ el, style: el.getAttribute('style') });
-        }
-        for (const [p, v] of [['position', 'absolute'], ['top', '0px'], ['left', '0px'], ['right', 'auto'], ['bottom', 'auto'], ['width', `${box.width}px`], ['margin', '0px']]) {
-          el.style.setProperty(p, v, 'important');
-        }
-      }
       const r = el.getBoundingClientRect();
-      const top = `${box.top - (r.top + scroller.scrollTop)}px`, left = `${box.left - r.left}px`;
-      el.style.setProperty('--cleanshot-top', top);
-      el.style.setProperty('--cleanshot-left', left);
-      if (inline) {
-        el.style.setProperty('top', top, 'important');
-        el.style.setProperty('left', left, 'important');
-      }
+      el.style.setProperty('--cleanshot-top', `${box.top - (r.top + scroller.scrollTop)}px`);
+      el.style.setProperty('--cleanshot-left', `${box.left - r.left}px`);
       getComputedStyle(el).top;
       inflow.add(el);
     }
@@ -2182,7 +2154,6 @@
       ['--cleanshot-top', '--cleanshot-left', '--cleanshot-width'].forEach((p) => el.style.removeProperty(p));
     }
     inflow = new Set();
-    inflowInline = new Set();
     flowBoxes = new Map();
     for (const [v, { wasPlaying }] of frozenVideos) {
       if (wasPlaying) v.play().catch(() => {});
