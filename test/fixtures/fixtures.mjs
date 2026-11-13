@@ -508,12 +508,13 @@ export const FIXTURES = [
     name: 'loop-reveal', file: 'loop-reveal.html', settleMs: 500,
     checks: {
       'bands-in-place': ({ img }) => bandsInPlace(img, { until: 1400 }),
-      // The two blocks the page's frame loop fades in once the capture's
-      // tiles bring them on screen: black in the capture, top to bottom.
+      // The blocks the page's frame loop fades in, two of them only once
+      // the capture's tiles bring them on screen: black in the capture,
+      // top to bottom.
       'fades-played': ({ img }) => {
         const flags = [];
         let rows = 0;
-        for (const [top, h] of [[1484, 100], [3060, 200]]) {
+        for (const [top, h] of [[1484, 100], [3060, 200], [5584, 100]]) {
           const bad = [];
           for (let y = top + 4; y < top + h - 4; y++) {
             rows++;
@@ -521,7 +522,47 @@ export const FIXTURES = [
           }
           if (bad.length) flags.push({ y0: bad[0], y1: bad[bad.length - 1] + 1, note: `block at y ${top} faded or missing` });
         }
-        return result(flags.length === 0, flags.length, flags.length ? `${flags.length} of 2 blocks not opaque` : `both blocks opaque (${rows} rows)`, flags);
+        return result(flags.length === 0, flags.length, flags.length ? `${flags.length} of 3 blocks not opaque` : `all three blocks opaque (${rows} rows)`, flags);
+      }
+    }
+  },
+  {
+    name: 'still-loops', file: 'still-loops.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { until: 1200 }),
+      // A background the page recolours every frame: one moment.
+      'background-one-moment': ({ img }) => oneMoment(img, 1200, 2400),
+      // A word roll the page starts again as it comes into view: at rest,
+      // its first word (magenta) filling the window.
+      'word-at-rest': ({ img }) => {
+        const bad = [];
+        for (let y = 3604; y < 3796; y++) if (!near(meanBox(img, 200, 800, y, y + 1), [255, 0, 255])) bad.push(y);
+        return result(bad.length === 0, bad.length, `${192 - bad.length} of 192 rows of the window show the first word`,
+          bad.length ? [{ y0: bad[0], y1: bad[bad.length - 1] + 1, note: 'word caught mid-roll' }] : []);
+      }
+    }
+  },
+  {
+    name: 'late-font', file: 'late-font.html', settleMs: 500,
+    // Where the first band sits once the font is in (the page after the
+    // capture).
+    collect: () => ({ top: Math.round(document.querySelector('.band').getBoundingClientRect().top + scrollY), font: document.fonts.status }),
+    checks: {
+      // Every band where the page has it with the font in: none shot
+      // where the fallback font left it.
+      'bands-in-place': ({ img, facts }) => facts.top == null
+        ? result(false, null, 'first band not found on the page')
+        : bandsInPlace(img, { top: facts.top }),
+      // The rows just above the first band are the page's white beside the
+      // heading, as with the font in, not the first band moved up under a
+      // heading still in the fallback font (the stitcher places the later
+      // tiles by what they show, so the bands alone can look right).
+      'font-in-first-tile': ({ img, facts }) => {
+        if (facts.top == null) return result(false, null, 'first band not found on the page');
+        const got = meanRgb(img, facts.top - 40, facts.top - 4);
+        const ok = got.every((v) => v > 240);
+        return result(ok, +Math.min(...got).toFixed(0), `rows ${facts.top - 40}-${facts.top - 4} show ${rgbText(got)} (page white once the font is in)`,
+          ok ? [] : [{ y0: facts.top - 48, y1: facts.top, note: 'first tile shot with the fallback font' }]);
       }
     }
   }

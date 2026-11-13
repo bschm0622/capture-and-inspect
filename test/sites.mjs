@@ -1030,6 +1030,32 @@ export const SITES = [
         return result(flags.length === 0, ink, notes.join('; '), flags);
       }
     }
+  },
+  {
+    // A page loop the capture let answer its scrolls (to play the fades
+    // in a held loop couldn't) changed the photo behind "Elevate Your
+    // Landscape Today", and the section came out plain navy. Its left
+    // side must show the photo, not a flat fill.
+    host: 'www.boulderlanddesign.com',
+    url: 'https://www.boulderlanddesign.com',
+    collect: () => {
+      const h = [...document.querySelectorAll('h1, h2, h3')].find((e) => /Elevate Your Landscape Today/i.test(e.textContent) && e.getBoundingClientRect().width > 0);
+      let box = h;
+      while (box && box.parentElement && box.getBoundingClientRect().height < 350) box = box.parentElement;
+      if (!box) return { section: null };
+      const r = box.getBoundingClientRect();
+      return { section: { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) } };
+    },
+    checks: {
+      'section-photo-shown'({ img, facts }) {
+        const b = facts.section;
+        if (!b) return result(false, null, '"Elevate Your Landscape Today" section not found on the page');
+        const f = flatShare(img, { y0: b.top, y1: b.top + b.h, x: b.left, w: Math.round(b.w * 0.2) });
+        const ok = f != null && f < 0.5;
+        return result(ok, f == null ? null : +f.toFixed(2), `${Math.round((f || 0) * 100)}% of rows flat down the left of the section (fail at 50%)`,
+          ok ? [] : [{ y0: b.top, y1: b.top + b.h, note: 'photo behind the section missing' }]);
+      }
+    }
   }
 ];
 
@@ -1094,6 +1120,7 @@ export const KNOWN = {
   'reveal-whole': 'Reveal the pre-scroll missed, cut by the seam between a shot without it and one with it',
   'late-fade-opaque': 'Scroll-linked fade too late for the pre-scroll caught part-way in a tile shot again: heading pale',
   'header-whole': "Header a script fixes inline kept fixed after it unstuck: the bar and logo lost, the hero cut at the first seam",
+  'section-photo-shown': "A page loop let answer the capture's scroll changed a section's photo: plain fill behind the text",
   'loop-reveal-shown': "Fade-ins played by the page's own frame loop held: a section left blank"
 };
 

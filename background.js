@@ -1156,9 +1156,12 @@ function stopCarousels() {
 // that fades in as it comes into view, and that the pre-scroll's quick
 // stops didn't set off, stayed at opacity 0 in its tile, a blank band
 // (www.calldad.com's "Find a location near you", one capture in four).
-// For ANSWER_MS after each of the capture's scrolls, such a loop runs; what
-// it changes in what was already shot is put back as ever (below), but for
-// a fade in on screen, which is let through as an answer to the scroll is.
+// After each of the capture's scrolls such a loop runs for PROBE_MS, and on
+// while it is fading something in (up to ANSWER_MS), but only a fade in
+// gets through: anything else it changes is put back at once, so a loop
+// that only animates (www.newmuseum.org's rolling footer word,
+// www.boulderlanddesign.com's background photo) stays as still as when it
+// was held. A fade in on rows already shot has the tile above shot again.
 // And the page side asks before each shot ('cleanshot-settle') and waits
 // while something on screen is still being faded in, up to RISE_MS after
 // the scroll.
@@ -1208,6 +1211,8 @@ function pageClock(cmd, graceMs, afterMs) {
   const LONG_MS = 1000;
   const COUNT_MS = 10000;
   const ANSWER_MS = 1600;
+  const PROBE_MS = 900;
+  const FADE_ON_MS = 300;
   // A fade in on screen that hasn't moved on for this long is done, and one
   // still going this long after the scroll is waited for no longer (a
   // Webflow fade ends about 1050ms after the scroll; an opacity that pulses
@@ -1246,14 +1251,19 @@ function pageClock(cmd, graceMs, afterMs) {
       if (!e.isTrusted) return;
       S.lastScroll = now();
       if (!S.holding) return;
-      for (const [id, again] of S.parkedFrames) if (S.heldFrames.delete(id)) again();
-      for (const [id, again] of S.parkedTimeouts) if (S.heldTimeouts.delete(id)) again();
+      for (const [id, [c, again]] of S.parkedFrames) if (S.heldFrames.delete(id)) { c.resumed = true; again(); }
+      for (const [id, [c, again]] of S.parkedTimeouts) if (S.heldTimeouts.delete(id)) { c.resumed = true; again(); }
       S.parkedFrames.clear();
       S.parkedTimeouts.clear();
     };
     S.listeners = [['scroll', answer], ['load', mark('lastLoad')], ['error', mark('lastLoad')],
       ['transitionend', mark('lastSettle')], ['animationend', mark('lastSettle')]];
     for (const [type, f] of S.listeners) window.addEventListener(type, f, { capture: true, passive: true });
+    // Inline styles changed from here on, to tell which of the page's
+    // chains fade things in (see answers): only those are let answer the
+    // capture's scrolls after the hold.
+    S.fadeMo = new MutationObserver(() => {});
+    S.fadeMo.observe(document.documentElement, { subtree: true, attributes: true, attributeFilter: ['style'], attributeOldValue: true });
     const cause = () => {
       const t = now();
       return t - S.lastLoad < 30 ? 'load' : t - S.lastSettle < 30 ? 'settle' : t - S.lastScroll < 60 ? 'scroll' : null;
@@ -1261,13 +1271,31 @@ function pageClock(cmd, graceMs, afterMs) {
     // Each callback carries the time its chain started, and what started
     // it: a timer or frame asked for from inside another one continues that
     // one's chain.
-    const chain = () => (S.ctx ? S.ctx : { start: now(), cause: cause() });
+    // A callback of a chain the capture has let answer its scrolls (see
+    // answers), asked for again from outside it, is that chain started
+    // again: a loop that went to sleep while it ran and that the page wakes
+    // later (GSAP's ticker wakes with the same function). As new work it
+    // would run free in answer to the scroll.
+    S.callbackChain = new WeakMap();
+    const chain = (cb) => {
+      if (S.ctx) return S.ctx;
+      const was = cb && S.callbackChain.get(cb);
+      return was && was.resumed ? was : { start: now(), cause: cause() };
+    };
     const run = (c, cb, self, args) => {
       const prev = S.ctx;
       S.ctx = c;
       try { return cb.apply(self, args); } finally {
         // (The observer's records are taken here, while it is still known
         // which chain made the changes.)
+        // (Whether this chain fades something in, watched from the start.)
+        if (S.fadeMo && !prev && !c.fader) {
+          try {
+            for (const m of S.fadeMo.takeRecords()) {
+              if (m.target instanceof HTMLElement && fadeIn(m.oldValue, m.target.getAttribute('style'))) { c.fader = true; break; }
+            }
+          } catch (e) {}
+        }
         if (S.mo && !prev) {
           try {
             const records = S.mo.takeRecords();
@@ -1307,6 +1335,18 @@ function pageClock(cmd, graceMs, afterMs) {
       }
     };
     const counting = (c) => c.counting && now() - c.start < COUNT_MS;
+    // Whether a chain from before the hold may run now, in answer to the
+    // capture's last scroll: only one seen fading something in since the
+    // capture began (Webflow's loop, during the pre-scroll), for PROBE_MS
+    // after the scroll, and on (up to ANSWER_MS) while it still is. Any
+    // other loop stays held: let run, one that only animates can finish
+    // and go to sleep, and the page then starts it again as new work in
+    // answer to the next scroll, free to run (www.newmuseum.org's GSAP
+    // ticker, woken by the footer's word roll restarting).
+    const answers = (c) => {
+      const since = now() - S.lastScroll;
+      return !!c.fader && since < ANSWER_MS && (since < PROBE_MS || now() - (c.lastFade || -1e9) < FADE_ON_MS);
+    };
     // Something on screen having its inline opacity raised: a fade in,
     // answering the scroll.
     S.lastRise = -1e9;
@@ -1327,18 +1367,21 @@ function pageClock(cmd, graceMs, afterMs) {
     const held = (c, delay) => {
       if (!S.holding) return false;
       if (counting(c)) return false;
-      if (c.start < S.holdAt) return delay >= LONG_MS || (now() - S.holdAt >= S.grace && now() - S.lastScroll >= ANSWER_MS);
+      if (c.start < S.holdAt) return delay >= LONG_MS || (now() - S.holdAt >= S.grace && !answers(c));
       return now() - c.start >= S.after;
     };
     window.setTimeout = function (cb, ms, ...args) {
       if (typeof cb !== 'function') return o.setTimeout.call(window, cb, ms, ...args);
-      const c = chain();
+      const c = chain(cb);
       const delay = Number(ms) || 0;
       let id;
       const fire = function () {
         if (held(c, delay)) {
           S.heldTimeouts.set(id, () => run(c, cb, window, args));
-          if (c.start < S.holdAt && delay < LONG_MS) S.parkedTimeouts.set(id, () => o.setTimeout.call(window, fire, 0));
+          if (c.start < S.holdAt && c.fader && delay < LONG_MS) {
+            S.parkedTimeouts.set(id, [c, () => o.setTimeout.call(window, fire, 0)]);
+            S.callbackChain.set(cb, c);
+          }
           return;
         }
         // (Counted like frames: an animation stepped by timeouts, as older
@@ -1365,12 +1408,15 @@ function pageClock(cmd, graceMs, afterMs) {
     };
     window.requestAnimationFrame = function (cb) {
       if (typeof cb !== 'function') return o.requestAnimationFrame.call(window, cb);
-      const c = chain();
+      const c = chain(cb);
       let id;
       const fire = function (t) {
         if (held(c, 0)) {
           S.heldFrames.set(id, (t2) => run(c, cb, window, [t2]));
-          if (c.start < S.holdAt) S.parkedFrames.set(id, () => o.requestAnimationFrame.call(window, fire));
+          if (c.start < S.holdAt && c.fader) {
+            S.parkedFrames.set(id, [c, () => o.requestAnimationFrame.call(window, fire)]);
+            S.callbackChain.set(cb, c);
+          }
           return;
         }
         c.frames = (c.frames || 0) + 1;
@@ -1501,8 +1547,68 @@ function pageClock(cmd, graceMs, afterMs) {
       S.fights.set(t, f);
       return f.n > FIGHT;
     };
+    // What a chain from before the hold changes while it answers the
+    // capture's scroll: only a fade in is let through (and, where it was
+    // shot, the worker told, so the tile above is shot again where the seam
+    // goes through it); anything else it changes, shot or not, is put back
+    // at once, so a loop that only animates (a word roll, a parallax, a
+    // background slideshow) stays as still as when it was held.
+    const fadeIn = (a, b) => {
+      const was = opacityIn(a), is = opacityIn(b);
+      return was != null && is != null && is > was && onlyFade(a, b);
+    };
+    const onlyFades = (records, c) => {
+      const bottom = Number(document.documentElement.getAttribute('data-cleanshot-shot')) || 0;
+      const y = window.scrollY;
+      const fades = new Map();
+      let done = false;
+      for (let i = records.length - 1; i >= 0; i--) {
+        const m = records[i], t = m.target;
+        if (t === document.documentElement || t === document.body || (document.head && document.head.contains(t))) continue;
+        if (t.nodeType === 1 && t.closest('[data-cleanshot-still]')) continue;
+        if (m.type === 'attributes') {
+          const name = m.attributeName;
+          if (LOADING.test(name) || MEDIA.test(t.nodeName)) continue;
+          const cur = t.getAttribute(name);
+          if (cur === m.oldValue) continue;
+          if (name === 'style' && t instanceof HTMLElement) {
+            if (!fades.has(t)) fades.set(t, fadeIn(m.oldValue, cur));
+            if (fades.get(t)) {
+              c.lastFade = now();
+              const r = t.getBoundingClientRect();
+              if (r.height > 0 && r.top + y < bottom) {
+                S.dirty.push([Math.floor(r.top + y), Math.ceil(r.bottom + y), { done: false }]);
+                if (S.dirty.length > 200) S.dirty.shift();
+              }
+              continue;
+            }
+          }
+          if (fighting(t)) continue;
+          putBack(t, name, m.oldValue);
+          done = true;
+        } else if (m.type === 'characterData') {
+          if (t.data === m.oldValue || fighting(t)) continue;
+          t.data = m.oldValue;
+          done = true;
+        } else if (m.type === 'childList') {
+          const nodes = [...m.addedNodes, ...m.removedNodes];
+          if (!nodes.length || nodes.some((n) => n.nodeType === 1 && (SKIP_NODES.test(n.nodeName) || n.hasAttribute('data-cleanshot-still')))) continue;
+          if (fighting(t)) continue;
+          for (const n of m.addedNodes) if (n.parentNode === t) t.removeChild(n);
+          const before = m.nextSibling && m.nextSibling.parentNode === t ? m.nextSibling
+            : m.previousSibling && m.previousSibling.parentNode === t ? m.previousSibling.nextSibling : null;
+          for (const n of m.removedNodes) if (!n.parentNode) t.insertBefore(n, before);
+          done = true;
+        }
+      }
+      if (done) {
+        S.reverted++;
+        S.mo.takeRecords();
+      }
+    };
     S.freeze = (records, c) => {
       if (!records.length || !S.holding || now() - S.holdAt < S.grace) return;
+      if (c && c.start < S.holdAt && c.fader && !counting(c)) { onlyFades(records, c); return; }
       const bottom = Number(document.documentElement.getAttribute('data-cleanshot-shot')) || 0;
       if (!bottom) return;
       const why = c ? c.cause : cause();
@@ -1609,13 +1715,6 @@ function pageClock(cmd, graceMs, afterMs) {
       };
       let done = false;
       const restored = new Map();
-      // A loop from before the hold answering the capture's scroll (see
-      // ANSWER_MS) that fades in something on screen which the tile above
-      // shot still faded out: the page's trigger line was below it then
-      // (loop-reveal fixture). Let through, like a reveal, and the tile
-      // above shot again where the seam goes through it.
-      const answering = c && c.start < S.holdAt && now() - S.lastScroll < ANSWER_MS;
-      const reveal = new Map();
       for (let i = records.length - 1; i >= 0; i--) {
         const m = records[i], t = m.target;
         if (t === document.documentElement || t === document.body || (document.head && document.head.contains(t))) continue;
@@ -1626,17 +1725,6 @@ function pageClock(cmd, graceMs, afterMs) {
           const cur = t.getAttribute(name);
           if (cur === m.oldValue || (name === 'style' && pageStyle(cur) === pageStyle(m.oldValue))) continue;
           if (!shot(t) || fighting(t)) continue;
-          if (answering && name === 'style' && !reveal.has(t)) {
-            const was = opacityIn(m.oldValue), is = opacityIn(cur);
-            const r = t.getBoundingClientRect();
-            reveal.set(t, was != null && is != null && is > was && r.bottom > 0 && r.top < innerHeight && onlyFade(m.oldValue, cur));
-          }
-          if (reveal.get(t)) {
-            const r = t.getBoundingClientRect();
-            S.dirty.push([Math.floor(r.top + y), Math.ceil(r.bottom + y), { done: false }]);
-            if (S.dirty.length > 200) S.dirty.shift();
-            continue;
-          }
           // A change let through as an answer to the scroll that the page
           // then keeps animating is a passing effect, not a new state: a
           // sway with the scroll's speed (r-o.com's footer crane leans one
@@ -1846,6 +1934,7 @@ function pageClock(cmd, graceMs, afterMs) {
     const o = S.orig;
     S.holding = false;
     if (S.mo) S.mo.disconnect();
+    if (S.fadeMo) S.fadeMo.disconnect();
     S.mo = null;
     for (const [type, f] of S.listeners) window.removeEventListener(type, f, { capture: true });
     document.removeEventListener('cleanshot-stills', S.onStills);

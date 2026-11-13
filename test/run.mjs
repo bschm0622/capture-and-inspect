@@ -128,10 +128,12 @@ function runChild(payload, hardMs) {
 // on [::1] at the same port: another origin, for a frame from another site.
 // Plain files only, from test/fixtures. A file whose name starts with
 // `flaky-` fails (500) the first time it is asked for, like a request lost
-// to a network hiccup.
+// to a network hiccup; one whose name starts with `slow-` is answered
+// SLOW_MS late, like a web font on a slow connection.
 async function serveFixtures() {
+  const SLOW_MS = 4500;
   const http = await import('node:http');
-  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml' };
+  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.woff2': 'font/woff2' };
   const asked = new Set();
   const handler = (req, res) => {
     const name = path.basename(decodeURIComponent(new URL(req.url, 'http://x').pathname));
@@ -143,8 +145,11 @@ async function serveFixtures() {
       res.end('try again');
       return;
     }
-    res.writeHead(200, { 'content-type': types[path.extname(name)], 'cache-control': 'no-store' });
-    fs.createReadStream(file).pipe(res);
+    const send = () => {
+      res.writeHead(200, { 'content-type': types[path.extname(name)], 'cache-control': 'no-store' });
+      fs.createReadStream(file).pipe(res);
+    };
+    if (name.startsWith('slow-')) setTimeout(send, SLOW_MS); else send();
   };
   const server = http.createServer(handler);
   await new Promise((r) => server.listen(0, '127.0.0.1', r));

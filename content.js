@@ -211,6 +211,19 @@
     });
   }
 
+  // Web fonts still loading once the pre-scroll has asked for everything
+  // on the page: shot before one arrives, part of the page is in the
+  // fallback font and the rest, moved by the swap, in the real one, cut at
+  // a seam (hemmatlaw.com, on a busy connection). Waited for, up to
+  // FONTS_MS, so a font that never comes can't hold the capture.
+  const FONTS_MS = 4000;
+  async function waitForFonts() {
+    const fonts = document.fonts;
+    if (!fonts || fonts.status === 'loaded') return;
+    await Promise.race([fonts.ready, sleep(FONTS_MS)]);
+    await raf();
+  }
+
   // Numbers counting up to their value and fades answering the scroll
   // (background.js pageClock): resolves once none on screen is still going.
   // (A page whose clock never answers is asked once, not at every tile.)
@@ -2436,6 +2449,7 @@
           injectStyle();
           unwrapInnerScroller();
           await preScroll();
+          await waitForFonts();
           await paintBackdrop();
           unpinScrollMagic();
           await filmPinnedSections();
