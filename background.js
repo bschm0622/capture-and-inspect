@@ -26,6 +26,19 @@ let lastCaptureTs = 0;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// The worker's own timers can't be trusted to keep time: Chrome runs the
+// extension's worker as a background process, and its timeouts come late,
+// by seconds at a time (a 100 ms timeout measured at up to 13 s; the 800 ms
+// hold grace took 8 s, and the 600 ms capture quota 7 s a shot). The page's
+// timers keep time, so while a capture runs its waits are timed by the page
+// side, with the worker's own timer as the fallback should the page not
+// answer.
+let waitTab = null;
+function wait(ms) {
+  if (waitTab == null) return sleep(ms);
+  return Promise.race([sleep(ms), sendToTab(waitTab, { cmd: 'sleep', ms }).catch(() => sleep(ms))]);
+}
+
 // Where the time goes, for the test record (runCapture's `timings`): ms
 // per step, and per tile the worker's own steps with the page side's.
 let perf = null;
@@ -56,8 +69,8 @@ function sendToTab(tabId, msg) {
 
 // Wait until Chrome's quota allows the next shot.
 async function captureReady() {
-  const wait = CAPTURE_MIN_INTERVAL_MS - (Date.now() - lastCaptureTs);
-  if (wait > 0) await sleep(wait);
+  const left = CAPTURE_MIN_INTERVAL_MS - (Date.now() - lastCaptureTs);
+  if (left > 0) await wait(left);
 }
 
 async function throttledCapture(windowId) {
@@ -604,7 +617,7 @@ async function stitchTiles(tab, info) {
         retakes++;
         placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, stale: true, retake: true });
         bmp.close();
-        await sleep(STALE_WAIT_MS);
+        await wait(STALE_WAIT_MS);
         continue;
       }
       stale = true;
@@ -910,6 +923,7 @@ async function runCapture(tab) {
       target: { tabId: tab.id },
       files: ['content.js']
     });
+    waitTab = tab.id;
     step('inject');
     await sendToTab(tab.id, { cmd: 'wake' }).catch(() => {});
     step('wake');
@@ -949,7 +963,7 @@ async function runCapture(tab) {
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'MAIN', func: stopCarousels }).catch(() => {});
     await sendToTab(tab.id, { cmd: 'hold' }).catch(() => {});
     step('hold');
-    await sleep(HOLD_GRACE_MS);
+    await wait(HOLD_GRACE_MS);
     step('holdGrace');
 
     const t0 = Date.now();
@@ -1015,6 +1029,7 @@ async function runCapture(tab) {
     return { error: String(err && err.message || err) };
   } finally {
     capturing = false;
+    waitTab = null;
     perf = null;
   }
 }

@@ -2590,6 +2590,10 @@
             maxScroll: Math.max(0, scroller.scrollHeight - window.innerHeight),
             times: lapTimes()
           });
+        } else if (msg.cmd === 'sleep') {
+          // A wait timed for the worker, whose own timers run late.
+          await sleep(msg.ms);
+          sendResponse({ ok: true });
         } else if (msg.cmd === 'finish') {
           restore();
           sendResponse({ ok: true });
