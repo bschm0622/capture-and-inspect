@@ -1,0 +1,57 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: fades in played by one frame loop started at load</title>
+<!-- Two black blocks on white sections, at opacity 0 until they come
+     into view, the way Webflow's interactions work (www.calldad.com): one
+     frame loop runs from page load and plays every fade, 250ms after its
+     trigger, over 750ms. A block is set off only once the scroll has
+     rested 300ms with its top above the bottom 15% of the screen, so the
+     pre-scroll's short stops never set it off; the capture's own tiles
+     do. The first (y 1484-1584) is set off by the tile that first shows
+     it; the second (y 3060-3260) is at the foot of a tile, below that
+     line, and set off by the next, which shoots it from its seam down.
+     The capture must show both blocks opaque. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  .white{height:400px;background:#fff;position:relative}
+  .white.tall{height:500px}
+  .block{position:absolute;left:100px;top:84px;width:1000px;height:100px;background:#000}
+  .tall .block{top:60px;height:200px}
+</style>
+<script src="bands.js"></script>
+<main id="m"></main>
+<script>
+  const m = document.getElementById('m');
+  const white = (tall) => {
+    const w = document.createElement('section');
+    w.className = tall ? 'white tall' : 'white';
+    w.innerHTML = '<div class="block" style="opacity: 0;"></div>';
+    m.appendChild(w);
+  };
+  addBands(m, 0, 7);
+  white();
+  addBands(m, 7, 6);
+  white(true);
+  addBands(m, 13, 10);
+
+  const blocks = [...document.querySelectorAll('.block')].map((el) => ({ el, at: null }));
+  let rest = null;
+  addEventListener('scroll', () => {
+    clearTimeout(rest);
+    rest = setTimeout(() => {
+      for (const b of blocks) {
+        const r = b.el.getBoundingClientRect();
+        if (b.at == null && r.top < innerHeight * 0.85 && r.bottom > 0) b.at = performance.now();
+      }
+    }, 300);
+  }, { passive: true });
+  const loop = (t) => {
+    for (const b of blocks) {
+      if (b.at == null) continue;
+      const p = Math.max(0, Math.min(1, (t - b.at - 250) / 750));
+      b.el.style.opacity = String(1 - Math.pow(1 - p, 3));
+    }
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+</script>

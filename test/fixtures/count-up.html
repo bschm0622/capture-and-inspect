@@ -1,0 +1,102 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: numbers that count up as they come into view</title>
+<!-- Statistics that count from 0 up to their value once they come into
+     view, driven the common ways: a chain of timeouts (jQuery counterUp,
+     www.calldad.com), frames eased over a set time (CountUp.js, jQuery
+     animate on rodanbuilders.com), and an interval cleared at the end.
+     These three start when the pre-scroll brings them on screen. A fourth
+     starts only once the scroll has rested 300ms with it on screen, so it
+     counts while its own tile waits to be shot. Beside each number, its
+     final value as plain text in the same type: the capture must show the
+     two alike. A fifth number ticks up for ever; the capture must not wait
+     on it without end. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  .stats{height:400px;background:#fff;position:relative;font:bold 56px/70px sans-serif;color:#111}
+  .stats div{position:absolute;width:320px;height:70px;white-space:nowrap}
+</style>
+<script src="bands.js"></script>
+<main id="m"></main>
+<script>
+  const m = document.getElementById('m');
+  // A section of numbers, one under another: [id, final value] pairs, each
+  // with its final value written out beside it, 640px to the right.
+  const stats = (rows) => {
+    const s = document.createElement('section');
+    s.className = 'stats';
+    rows.forEach(([id, to], k) => {
+      s.insertAdjacentHTML('beforeend',
+        `<div id="${id}" data-to="${to}" style="left:40px;top:${30 + k * 120}px">0</div>` +
+        (to ? `<div style="left:680px;top:${30 + k * 120}px">${to.toLocaleString('en')}</div>` : ''));
+    });
+    m.appendChild(s);
+  };
+  addBands(m, 0, 10);
+  stats([['timeouts', 75000], ['frames', 1585], ['interval', 640]]);   // y 2000-2400
+  addBands(m, 10, 7);
+  stats([['rested', 20000], ['ticker', 0]]);                           // y 3800-4200
+  addBands(m, 17, 13);
+
+  const el = (id) => document.getElementById(id);
+  const to = (e) => Number(e.dataset.to);
+  const show = (e, v) => { e.textContent = Math.round(v).toLocaleString('en'); };
+  const whenSeen = (e, f) => {
+    const io = new IntersectionObserver((es) => {
+      if (es.some((x) => x.isIntersecting)) { io.disconnect(); f(); }
+    });
+    io.observe(e);
+  };
+
+  // counterUp: the list of values worked out first, one every 25ms.
+  whenSeen(el('timeouts'), () => {
+    const e = el('timeouts'), n = 120, steps = [];
+    for (let i = 1; i <= n; i++) steps.push(to(e) * i / n);
+    const step = () => { show(e, steps.shift()); if (steps.length) setTimeout(step, 25); };
+    setTimeout(step, 25);
+  });
+  // CountUp.js: eased over 2.5s by the frame clock.
+  whenSeen(el('frames'), () => {
+    const e = el('frames'), t0 = performance.now(), d = 2500;
+    const frame = (t) => {
+      const p = Math.min(1, (t - t0) / d);
+      show(e, to(e) * (1 - Math.pow(2, -10 * p)) * 1024 / 1023);
+      if (p < 1) requestAnimationFrame(frame); else show(e, to(e));
+    };
+    requestAnimationFrame(frame);
+  });
+  // An interval stepping by 8, cleared at the value.
+  whenSeen(el('interval'), () => {
+    const e = el('interval');
+    let v = 0;
+    const id = setInterval(() => {
+      v = Math.min(to(e), v + 8);
+      show(e, v);
+      if (v >= to(e)) clearInterval(id);
+    }, 30);
+  });
+  // Once the scroll has rested with it on screen: frames over 4.5s.
+  let rest = null, started = false;
+  addEventListener('scroll', () => {
+    clearTimeout(rest);
+    rest = setTimeout(() => {
+      const e = el('rested'), r = e.getBoundingClientRect();
+      if (started || r.top > innerHeight || r.bottom < 0) return;
+      started = true;
+      const t0 = performance.now(), d = 4500;
+      const frame = (t) => {
+        const p = Math.min(1, (t - t0) / d);
+        show(e, to(e) * p);
+        if (p < 1) requestAnimationFrame(frame);
+      };
+      requestAnimationFrame(frame);
+    }, 300);
+  }, { passive: true });
+  // A live figure: never done.
+  whenSeen(el('ticker'), () => {
+    const e = el('ticker');
+    let v = 0;
+    const tick = () => { show(e, ++v); setTimeout(tick, 40); };
+    tick();
+  });
+</script>

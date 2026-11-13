@@ -211,6 +211,25 @@
     });
   }
 
+  // Numbers counting up to their value and fades answering the scroll
+  // (background.js pageClock): resolves once none on screen is still going.
+  // (A page whose clock never answers is asked once, not at every tile.)
+  let settleSilent = false;
+  function waitForSettle() {
+    if (settleSilent) return Promise.resolve();
+    return new Promise((resolve) => {
+      let t = null;
+      const done = () => {
+        clearTimeout(t);
+        document.removeEventListener('cleanshot-settle-done', done);
+        resolve();
+      };
+      t = setTimeout(() => { settleSilent = true; done(); }, 11000);
+      document.addEventListener('cleanshot-settle-done', done);
+      document.dispatchEvent(new CustomEvent('cleanshot-settle'));
+    });
+  }
+
   // Elements the page changes on its own clock: a slider whose timer was set
   // when the page loaded, before the capture could reach it, or a loop the
   // page drives with its own reference to the browser's frame timer. They
@@ -2337,6 +2356,7 @@
     pausedAnimations.forEach((anim) => anim.play());
     pausedAnimations = [];
     clockHeld = false;
+    settleSilent = false;
     document.documentElement.removeAttribute('data-cleanshot-shot');
     retried = new WeakSet();
     failedImages = new Set();
@@ -2474,6 +2494,7 @@
           await freezeVideos();
           let dirty = [];
           if (clockHeld) {
+            await waitForSettle();
             pauseClockAnimations();
             pausePlayers();
             // (A page that plays its videos again when they come into view

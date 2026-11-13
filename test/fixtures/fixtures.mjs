@@ -170,6 +170,17 @@ function meanBox(img, x, w, y0, y1) {
   }
   return n ? s.map((v) => v / n) : [NaN, NaN, NaN];
 }
+// Mean difference (0-255) between two boxes of the capture at full
+// resolution, CSS x `xa` and `xb`, rows [y, y + h), `w` wide.
+async function boxDiff(img, xa, xb, w, y, h) {
+  const box = (x) => sharp(img.png, { limitInputPixels: false }).removeAlpha()
+    .extract({ left: Math.round(x * img.dpr), top: Math.round(y * img.dpr), width: Math.round(w * img.dpr), height: Math.round(h * img.dpr) })
+    .raw().toBuffer();
+  const [a, b] = await Promise.all([box(xa), box(xb)]);
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
+  return s / a.length;
+}
 const near = (got, want, slack = 40) => got.every((v, k) => Math.abs(v - want[k]) <= slack);
 const rgbText = (c) => `rgb(${c.map(Math.round).join(',')})`;
 
@@ -473,6 +484,44 @@ export const FIXTURES = [
           if (!near(got, [255, 0, 255])) flags.push({ y0: 1728, y1: 1776, note: `slide ${k + 1}: ${rgbText(got)} where its stars should be` });
         });
         return result(flags.length === 0, flags.length, `${3 - flags.length} of 3 slides show their stars`, flags);
+      }
+    }
+  },
+  {
+    name: 'count-up', file: 'count-up.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { until: 2000 }),
+      // Each number that counts up shows its final value: its box looks
+      // like the final value written out beside it.
+      'numbers-at-final-value': async ({ img }) => {
+        const rows = [['timeouts', 2030], ['frames', 2150], ['interval', 2270], ['rested', 3830]];
+        const flags = [];
+        for (const [what, y] of rows) {
+          const d = await boxDiff(img, 40, 680, 320, y, 70);
+          if (d > 2) flags.push({ y0: y, y1: y + 70, note: `the number counted by ${what} differs from its final value (mean difference ${d.toFixed(1)})` });
+        }
+        return result(flags.length === 0, flags.length, `${rows.length - flags.length} of ${rows.length} numbers at their final value`, flags);
+      }
+    }
+  },
+  {
+    name: 'loop-reveal', file: 'loop-reveal.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { until: 1400 }),
+      // The two blocks the page's frame loop fades in once the capture's
+      // tiles bring them on screen: black in the capture, top to bottom.
+      'fades-played': ({ img }) => {
+        const flags = [];
+        let rows = 0;
+        for (const [top, h] of [[1484, 100], [3060, 200]]) {
+          const bad = [];
+          for (let y = top + 4; y < top + h - 4; y++) {
+            rows++;
+            if (Math.max(...meanBox(img, 200, 800, y, y + 1)) > 40) bad.push(y);
+          }
+          if (bad.length) flags.push({ y0: bad[0], y1: bad[bad.length - 1] + 1, note: `block at y ${top} faded or missing` });
+        }
+        return result(flags.length === 0, flags.length, flags.length ? `${flags.length} of 2 blocks not opaque` : `both blocks opaque (${rows} rows)`, flags);
       }
     }
   }
