@@ -63,6 +63,8 @@
     times[k] = (times[k] || 0) + n - lapAt;
     lapAt = n;
   };
+  // (A part of a step, timed on its own: `since` is when it began.)
+  const spentOn = (k, since) => { times[k] = (times[k] || 0) + performance.now() - since; };
   const lapTimes = () => {
     const out = {};
     for (const k in times) out[k] = Math.round(times[k]);
@@ -875,6 +877,7 @@
     const NEAR = 60, VISITS = 40, WAIT_MS = 2500;
     // Go to y and read the group's properties once they hold still.
     const settled = async (y, group) => {
+      times.linkedVisits = (times.linkedVisits || 0) + 1;
       scroller.scrollTo(0, y);
       await raf();
       await raf();
@@ -1353,8 +1356,13 @@
     for (let y = 0; y < h; y += vh) {
       scroller.scrollTo(0, y);
       await sleep(60);
+      let t = performance.now();
       await waitForVisibleImages(PRESCROLL_IMAGES_MS);
+      spentOn('preScrollImages', t);
+      t = performance.now();
       sampleScrollEffects();
+      spentOn('preScrollSample', t);
+      times.preScrollStops = (times.preScrollStops || 0) + 1;
     }
     // One extra stop at the very bottom, looked at twice: fades started by
     // the last few stops are still running when the first look comes. The
@@ -1976,10 +1984,12 @@
 
   async function filmPinnedSections() {
     const vh = window.innerHeight;
+    const tf = performance.now();
     const frames = allElements().filter((el) => {
       if (!(el instanceof HTMLElement) || getComputedStyle(el).position !== 'sticky') return false;
       return !inHeaderZone(el) && (isPinnedSection(el) || stickyPanel(el));
     });
+    spentOn('filmFind', tf);
     for (const frame of frames) {
       if (frames.some((f) => f !== frame && f.contains(frame))) continue;
       const panel = !isPinnedSection(frame);
@@ -1997,10 +2007,16 @@
       const stages = [];
       for (let k = 0; k < n; k++) {
         scroller.scrollTo(0, Math.max(0, pageTop + travel * k / (n - 1) - stick));
+        const tw = performance.now();
         await raf();
         await raf();
         await sleep(150);
+        spentOn('filmWait', tw);
+        const t = performance.now();
         await waitForVisibleImages(800);
+        spentOn('filmImages', t);
+        times.filmStages = (times.filmStages || 0) + 1;
+        const tc = performance.now();
         const stage = { at: off + travel * k / (n - 1), node: frame.cloneNode(true) };
         // The panel's own look and place at this stage, for the copies (see
         // below).
@@ -2026,10 +2042,14 @@
           });
         }
         stages.push(stage);
+        spentOn('filmCopy', tc);
       }
+      const tq = performance.now();
       if (panel
         ? stages.every((s) => partsChanged(stages[0].parts, s.parts, r.width * h) < 0.25)
-        : stages.every((s) => s.node.outerHTML === stages[0].node.outerHTML)) continue;
+        : stages.every((s) => s.node.outerHTML === stages[0].node.outerHTML)) { spentOn('filmCompare', tq); continue; }
+      spentOn('filmCompare', tq);
+      const ti = performance.now();
       // The page's script may size the container by how many frames it
       // holds (agcsf.com's grew a screen per copy), so it keeps its height.
       parent.style.setProperty('--cleanshot-height', `${pr.height}px`);
@@ -2051,11 +2071,15 @@
       // way it rests once arrived.
       const rest = stages.reduce((a, s) => (s.frameLook.opacity >= a.frameLook.opacity ? s : a), stages[0]).frameLook;
       const left = rest.left - pr.left - parseFloat(ps.borderLeftWidth);
+      // (Read once: read again after each copy went in, with the stylesheet
+      // just rewritten, it made the browser restyle the whole page, 200 ms a
+      // copy on agcsf.com.)
+      const borderTop = parseFloat(ps.borderTopWidth);
       let after = frame;
       for (const { at, node, looks } of stages) {
         node.setAttribute('data-cleanshot-clone', '');
         node.setAttribute('aria-hidden', 'true');
-        for (const [p, v] of [['position', 'absolute'], ['top', `${at - parseFloat(ps.borderTopWidth)}px`], ['left', `${left}px`],
+        for (const [p, v] of [['position', 'absolute'], ['top', `${at - borderTop}px`], ['left', `${left}px`],
           ['bottom', 'auto'], ['right', 'auto'], ['width', `${rest.width}px`], ['height', `${h}px`], ['margin', '0'],
           ['opacity', String(rest.opacity)], ['transform', rest.transform], ['translate', rest.translate]]) {
           node.style.setProperty(p, v, 'important');
@@ -2084,6 +2108,7 @@
         parent.insertBefore(node, after.nextSibling);
         after = node;
       }
+      spentOn('filmInsert', ti);
       const top = Math.round(pr.top + y);
       notes.push({ kind: 'pinned-stages', y0: top, y1: Math.round(top + pr.height), note: `${panel ? 'a panel' : 'a section'} that stays on screen while the page scrolls past it, changing as it goes (y ${top}-${Math.round(top + pr.height)}), is shown as ${n} ${panel ? 'copies down its column' : 'screens'}, one for each stage` });
     }
