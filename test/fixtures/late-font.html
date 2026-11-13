@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: a web font that arrives late</title>
+<!-- A heading block whose web font (Instrument Sans, OFL, see
+     slow-instrument-sans-OFL.txt) is asked for only once the page first
+     scrolls (so after the harness has waited for the network to go
+     quiet: the capture's own pre-scroll sets it off) and served 4.5s late,
+     like a font on a slow connection (hemmatlaw.com, captured beside two
+     heavy sites). The font is drawn
+     half as large again as the fallback, so the block wraps to more lines
+     and everything below it moves down when it arrives. Shot part before
+     and part after, the bands below come out out of place at a seam. The
+     capture must show the page as it is once the font is in. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  #head{width:900px;padding:20px 16px;font:40px/48px LateSans, sans-serif;background:#fff;color:#111}
+</style>
+<script src="bands.js"></script>
+<main id="m"></main>
+<script>
+  const m = document.getElementById('m');
+  const head = document.createElement('section');
+  head.id = 'head';
+  head.textContent = 'A heading set in a web font that arrives late, long enough to wrap across several lines of the block at the top of the page, so the lines it takes depend on the font.';
+  m.appendChild(head);
+  addBands(m, 0, 30);
+  addEventListener('scroll', () => {
+    const st = document.createElement('style');
+    st.textContent = "@font-face{font-family:LateSans;src:url(slow-instrument-sans.woff2) format('woff2');font-display:swap;size-adjust:150%}";
+    document.head.appendChild(st);
+  }, { once: true });
+</script>

@@ -541,6 +541,30 @@ export const FIXTURES = [
           bad.length ? [{ y0: bad[0], y1: bad[bad.length - 1] + 1, note: 'word caught mid-roll' }] : []);
       }
     }
+  },
+  {
+    name: 'late-font', file: 'late-font.html', settleMs: 500,
+    // Where the first band sits once the font is in (the page after the
+    // capture).
+    collect: () => ({ top: Math.round(document.querySelector('.band').getBoundingClientRect().top + scrollY), font: document.fonts.status }),
+    checks: {
+      // Every band where the page has it with the font in: none shot
+      // where the fallback font left it.
+      'bands-in-place': ({ img, facts }) => facts.top == null
+        ? result(false, null, 'first band not found on the page')
+        : bandsInPlace(img, { top: facts.top }),
+      // The rows just above the first band are the page's white beside the
+      // heading, as with the font in, not the first band moved up under a
+      // heading still in the fallback font (the stitcher places the later
+      // tiles by what they show, so the bands alone can look right).
+      'font-in-first-tile': ({ img, facts }) => {
+        if (facts.top == null) return result(false, null, 'first band not found on the page');
+        const got = meanRgb(img, facts.top - 40, facts.top - 4);
+        const ok = got.every((v) => v > 240);
+        return result(ok, +Math.min(...got).toFixed(0), `rows ${facts.top - 40}-${facts.top - 4} show ${rgbText(got)} (page white once the font is in)`,
+          ok ? [] : [{ y0: facts.top - 48, y1: facts.top, note: 'first tile shot with the fallback font' }]);
+      }
+    }
   }
 ];
 
