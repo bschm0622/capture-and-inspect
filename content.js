@@ -1409,14 +1409,33 @@
     }
     : (el) => el.shadowRoot;
 
+  //
+  // The walk is costly on a big page (www.britishmuseum.org's 45,000
+  // elements: 110 ms, nearly all of it asking each one for a closed shadow
+  // root), and a tile asked for it seven times. So only an element that may
+  // host a shadow root is asked (a custom element, or one of the tags the
+  // DOM lets attachShadow use), and the list is kept until an element is
+  // added or removed anywhere it covers (the page and every shadow root
+  // found). It is walked afresh at the start of every tile all the same, to
+  // find a shadow root attached since to an element already in the page (a
+  // custom element whose definition loaded late).
+  const SHADOW_HOSTS = /^(ARTICLE|ASIDE|BLOCKQUOTE|BODY|DIV|FOOTER|H[1-6]|HEADER|MAIN|NAV|P|SECTION|SPAN)$|-/;
+  let walked = null;
+  const walkWatch = new MutationObserver(() => { walked = null; });
   function allElements() {
+    if (walked && !walkWatch.takeRecords().length) return walked;
+    walkWatch.disconnect();
     const out = [];
-    const walk = (root) => root.querySelectorAll('*').forEach((el) => {
-      out.push(el);
-      const shadow = shadowOf(el);
-      if (shadow) walk(shadow);
-    });
+    const walk = (root) => {
+      walkWatch.observe(root, { childList: true, subtree: true });
+      root.querySelectorAll('*').forEach((el) => {
+        out.push(el);
+        const shadow = SHADOW_HOSTS.test(el.tagName) ? shadowOf(el) : null;
+        if (shadow) walk(shadow);
+      });
+    };
     if (document.body) walk(document.body);
+    walked = out;
     return out;
   }
 
@@ -2512,6 +2531,7 @@
           });
         } else if (msg.cmd === 'tile') {
           lapStart();
+          walked = null;
           covered = [];
           unlockScroll();
           if (msg.from != null && msg.from < msg.y) {
@@ -2596,6 +2616,8 @@
           sendResponse({ ok: true });
         } else if (msg.cmd === 'finish') {
           restore();
+          walkWatch.disconnect();
+          walked = null;
           sendResponse({ ok: true });
         }
       } catch (err) {
