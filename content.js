@@ -53,6 +53,23 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
 
+  // Where the time goes, for the test record: ms per step of a command,
+  // sent back with its answer. `scan` is what the image wait spends looking
+  // the page over before it waits.
+  let times = {}, lapAt = 0, scanMs = 0;
+  const lapStart = () => { times = {}; scanMs = 0; lapAt = performance.now(); };
+  const lap = (k) => {
+    const n = performance.now();
+    times[k] = (times[k] || 0) + n - lapAt;
+    lapAt = n;
+  };
+  const lapTimes = () => {
+    const out = {};
+    for (const k in times) out[k] = Math.round(times[k]);
+    if (scanMs) out.imageScan = Math.round(scanMs);
+    return out;
+  };
+
   // The properties a script (or a CSS scroll-driven animation) uses to place
   // something by the scroll position: computed-style name, CSS name. Each
   // can be held at one value through the stylesheet, where an !important
@@ -381,6 +398,7 @@
   // the timeout. A background is looked up through an Image with the same
   // URL, which is complete at once when the browser already has it.
   async function waitForVisibleImages(timeoutMs = 1500) {
+    const scanAt = performance.now();
     const vh = window.innerHeight;
     const vw = document.documentElement.clientWidth;
     // Across as well as down: a slider's off-screen slides sit beside the
@@ -418,6 +436,7 @@
       probe.src = url;
       if (!probe.complete) pending.push(loaded(probe));
     }
+    scanMs += performance.now() - scanAt;
     if (!pending.length) return;
     await Promise.race([Promise.all(pending), sleep(timeoutMs)]);
   }
@@ -2442,27 +2461,39 @@
           pausePlayers();
           sendResponse({ ok: true });
         } else if (msg.cmd === 'prepare') {
+          lapStart();
           watchRestless();
           originalScrollY = scroller.scrollTop || window.scrollY || 0;
           unlockScroll();
           pauseLoopingAnimations();
           injectStyle();
           unwrapInnerScroller();
+          lap('setup');
           await preScroll();
+          lap('preScroll');
           await waitForFonts();
+          lap('fonts');
           await paintBackdrop();
           unpinScrollMagic();
+          lap('backdrop');
           await filmPinnedSections();
+          lap('filmPinned');
           await settleFixedBackgrounds();
+          lap('fixedBackgrounds');
           settleOverlays();
           holdFades();
           placeRevealedBackdrop();
           findStickyHeaders(); // measured at scroll 0, after preScroll settles
           sortOverlays(true);
+          lap('overlays');
           await extendBackdrops();
+          lap('extendBackdrops');
           await settleAtTop();
+          lap('settleAtTop');
           recordFirstScreen();
+          lap('firstScreen');
           await holdScrollLinked();
+          lap('scrollLinked');
           const rawH = pageHeight();
           const capped = Math.min(rawH, MAX_PAGE_HEIGHT);
           if (rawH > MAX_PAGE_HEIGHT) {
@@ -2476,9 +2507,11 @@
             viewportHeight: window.innerHeight,
             pageWidth: document.documentElement.clientWidth,
             dpr: window.devicePixelRatio || 1,
-            notes
+            notes,
+            times: lapTimes()
           });
         } else if (msg.cmd === 'tile') {
+          lapStart();
           covered = [];
           unlockScroll();
           if (msg.from != null && msg.from < msg.y) {
@@ -2489,7 +2522,9 @@
           scrollPage(msg.y);
           await raf();
           await raf();
+          lap('scroll');
           await waitForVisibleImages();
+          lap('images');
           // Hide once before the settle wait and again after it. Headers
           // that turn fixed on scroll appear within a frame or two, and
           // hiding them only at the last moment isn't always painted by the
@@ -2497,28 +2532,39 @@
           hideOverlays(msg.index);
           if (msg.index > 0) pinFirstScreen();
           applyFades();
+          lap('overlays');
           await sleep(SETTLE_GRACE_MS);
+          lap('grace');
           // Lazy loaders that wait for the scroll to stop (a debounced
           // handler) only swap their images in during the settle wait.
           await waitForVisibleImages();
+          lap('images');
           hideOverlays(msg.index);
           if (msg.index > 0) pinFirstScreen();
           applyFades();
+          lap('overlays');
           noteEntrances();
+          lap('entrances');
           await freezeVideos();
+          lap('videos');
           let dirty = [];
           if (clockHeld) {
             await waitForSettle();
+            lap('settle');
             pauseClockAnimations();
             pausePlayers();
+            lap('pause');
             // (A page that plays its videos again when they come into view
             // has had the settle wait to do it: back on their frame first.)
             await freezeVideos();
+            lap('videos');
             const st = await requestStills();
             if (st && st.dirty) dirty = st.dirty;
+            lap('stills');
           }
           await raf();
           await raf();
+          lap('frames');
           // Report where we actually landed (bottom tile clamps short), how
           // far the page moved since the last tile, and how far it scrolls
           // now, measured as late as possible before the shot. A tile shot
@@ -2536,10 +2582,13 @@
             const r = img.getBoundingClientRect();
             return { y0: Math.round(r.top + actualY), y1: Math.round(r.bottom + actualY) };
           }).filter((b) => b.y1 - b.y0 >= 24);
+          const live = liveRegions();
+          lap('report');
           sendResponse({
-            ok: true, actualY, drift, covered, live: liveRegions(), broken, dirty,
+            ok: true, actualY, drift, covered, live, broken, dirty,
             pageHeight: pageHeight(),
-            maxScroll: Math.max(0, scroller.scrollHeight - window.innerHeight)
+            maxScroll: Math.max(0, scroller.scrollHeight - window.innerHeight),
+            times: lapTimes()
           });
         } else if (msg.cmd === 'finish') {
           restore();
