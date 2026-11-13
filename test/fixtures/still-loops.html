@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: loops that only animate</title>
+<!-- Two things a page animates on its own frame loops, started at load,
+     neither a fade in. A background of twelve 100px stripes (y 1200-2400)
+     recoloured together every frame, drifting through colours: it must be
+     one colour top to bottom in the capture. And a word roll (y 3600-3800)
+     like www.newmuseum.org's footer: a 200px window that rests on its
+     magenta word for 300ms, then rolls to the cyan one below over 1200ms,
+     every two seconds, and that the page starts again from rest whenever
+     it comes into view: it must show the magenta word whole. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  .stripe{height:100px;background:rgb(200,60,60)}
+  #window{height:200px;overflow:hidden;background:#fff;position:relative}
+  #roll{position:absolute;left:0;top:0;width:100%}
+  #roll div{height:200px}
+</style>
+<script src="bands.js"></script>
+<main id="m"></main>
+<script>
+  const m = document.getElementById('m');
+  addBands(m, 0, 6);
+  const stripes = [];
+  for (let i = 0; i < 12; i++) {
+    const s = document.createElement('div');
+    s.className = 'stripe';
+    addLines(s, 4);
+    m.appendChild(s);
+    stripes.push(s);
+  }
+  addBands(m, 12, 6);
+  m.insertAdjacentHTML('beforeend', '<section id="window"><div id="roll"><div style="background:#f0f"></div><div style="background:#0ff"></div></div></section>');
+  addBands(m, 19, 8);
+
+  // The background: every frame, from load.
+  const drift = (t) => {
+    const k = (t / 40) % 120;
+    const c = `rgb(${120 + k},${60 + k / 2},${200 - k})`;
+    for (const s of stripes) s.style.background = c;
+    requestAnimationFrame(drift);
+  };
+  requestAnimationFrame(drift);
+
+  // The word roll: one loop, from load; every two seconds rolls the
+  // window from the first word to the second, then back to rest.
+  const roll = document.getElementById('roll');
+  let from = performance.now();
+  const tick = (t) => {
+    const p = (((t - from) % 2000) - 300) / 1200;
+    const y = p <= 0 || p >= 1 ? 0 : -200 * (1 - Math.pow(1 - p, 3));
+    roll.style.transform = `translateY(${y}px)`;
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+  new IntersectionObserver((es) => {
+    if (!es.some((e) => e.isIntersecting)) return;
+    from = performance.now();
+    roll.style.transform = 'translateY(0px)';
+  }).observe(document.getElementById('window'));
+</script>

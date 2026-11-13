@@ -508,12 +508,13 @@ export const FIXTURES = [
     name: 'loop-reveal', file: 'loop-reveal.html', settleMs: 500,
     checks: {
       'bands-in-place': ({ img }) => bandsInPlace(img, { until: 1400 }),
-      // The two blocks the page's frame loop fades in once the capture's
-      // tiles bring them on screen: black in the capture, top to bottom.
+      // The blocks the page's frame loop fades in, two of them only once
+      // the capture's tiles bring them on screen: black in the capture,
+      // top to bottom.
       'fades-played': ({ img }) => {
         const flags = [];
         let rows = 0;
-        for (const [top, h] of [[1484, 100], [3060, 200]]) {
+        for (const [top, h] of [[1484, 100], [3060, 200], [5584, 100]]) {
           const bad = [];
           for (let y = top + 4; y < top + h - 4; y++) {
             rows++;
@@ -521,7 +522,23 @@ export const FIXTURES = [
           }
           if (bad.length) flags.push({ y0: bad[0], y1: bad[bad.length - 1] + 1, note: `block at y ${top} faded or missing` });
         }
-        return result(flags.length === 0, flags.length, flags.length ? `${flags.length} of 2 blocks not opaque` : `both blocks opaque (${rows} rows)`, flags);
+        return result(flags.length === 0, flags.length, flags.length ? `${flags.length} of 3 blocks not opaque` : `all three blocks opaque (${rows} rows)`, flags);
+      }
+    }
+  },
+  {
+    name: 'still-loops', file: 'still-loops.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { until: 1200 }),
+      // A background the page recolours every frame: one moment.
+      'background-one-moment': ({ img }) => oneMoment(img, 1200, 2400),
+      // A word roll the page starts again as it comes into view: at rest,
+      // its first word (magenta) filling the window.
+      'word-at-rest': ({ img }) => {
+        const bad = [];
+        for (let y = 3604; y < 3796; y++) if (!near(meanBox(img, 200, 800, y, y + 1), [255, 0, 255])) bad.push(y);
+        return result(bad.length === 0, bad.length, `${192 - bad.length} of 192 rows of the window show the first word`,
+          bad.length ? [{ y0: bad[0], y1: bad[bad.length - 1] + 1, note: 'word caught mid-roll' }] : []);
       }
     }
   }
