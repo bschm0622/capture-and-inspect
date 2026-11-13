@@ -219,25 +219,48 @@ function texturedBlocks(sig, w, stripTop, K, edges, use) {
 // scored on the better half of the blocks, so something that differs
 // between the two shots in part of the width (a sticky sidebar, an image
 // that finished loading) doesn't hide an otherwise clean match.
-function overlapScores(sig, w, stripTop, K, blocks, edges, use, tile, tileH) {
+// Every decision placeTile makes compares scores under SCORE_CAP (a match
+// is under MATCH_OK; one that is distinctive has nothing else under twice
+// that), so a row is given up (Infinity) as soon as its score can't come
+// under it: the sums only grow row by row, and the better half of the
+// blocks' sums so far is already as much. Only row `exact` (where position
+// puts the tile) is always scored in full, for the report. The same
+// decisions, at a fraction of the work: this ran 0.1-0.35 s a tile.
+const SCORE_CAP = 2 * MATCH_OK;
+function overlapScores(sig, w, stripTop, K, blocks, edges, use, tile, tileH, exact) {
   const keep = Math.max(2, Math.ceil(blocks.length / 2));
   const scores = new Float32Array(tileH - K + 1);
-  const per = new Float64Array(blocks.length);
+  const nb = blocks.length;
+  const per = new Float64Array(nb);
+  const means = new Float64Array(nb);
+  const lo = blocks.map(({ b }) => edges[b]), hi = blocks.map(({ b }) => edges[b + 1]);
+  const ns = blocks.map(({ n }) => n);
+  const masked = use.indexOf(0) >= 0;
+  // The mean of the `keep` smallest of the blocks' sums so far.
+  const bestHalf = () => {
+    for (let k = 0; k < nb; k++) means[k] = per[k] / ns[k];
+    means.sort();
+    let sum = 0;
+    for (let k = 0; k < keep; k++) sum += means[k];
+    return sum / keep;
+  };
   for (let r = 0; r <= tileH - K; r++) {
     per.fill(0);
+    let gaveUp = false;
     for (let j = 0; j < K; j++) {
       const a = (stripTop + j) * w, t = (r + j) * w, u = j * w;
-      for (let k = 0; k < blocks.length; k++) {
-        const b = blocks[k].b;
+      for (let k = 0; k < nb; k++) {
         let s = 0;
-        for (let x = edges[b]; x < edges[b + 1]; x++) if (use[u + x]) s += Math.abs(sig[a + x] - tile[t + x]);
+        if (masked) {
+          for (let x = lo[k]; x < hi[k]; x++) if (use[u + x]) s += Math.abs(sig[a + x] - tile[t + x]);
+        } else {
+          for (let x = lo[k]; x < hi[k]; x++) s += Math.abs(sig[a + x] - tile[t + x]);
+        }
         per[k] += s;
       }
+      if ((j & 3) === 3 && r !== exact && bestHalf() >= SCORE_CAP) { gaveUp = true; break; }
     }
-    const sorted = Array.from(per, (s, k) => s / blocks[k].n).sort((p, q) => p - q);
-    let sum = 0;
-    for (let k = 0; k < keep; k++) sum += sorted[k];
-    scores[r] = sum / keep;
+    scores[r] = gaveUp ? Infinity : bestHalf();
   }
   return scores;
 }
@@ -265,8 +288,8 @@ function placeTile(sig, w, seam, predicted, tile, tileH, hidden, reach) {
   const edges = Array.from({ length: 9 }, (_, b) => Math.floor(w * b / 8));
   const blocks = texturedBlocks(sig, w, stripTop, K, edges, use);
   if (blocks.length < 2) return { top: predicted, match: 'flat' };
-  const scores = overlapScores(sig, w, stripTop, K, blocks, edges, use, tile, tileH);
   const r0 = Math.round(stripTop - predicted);
+  const scores = overlapScores(sig, w, stripTop, K, blocks, edges, use, tile, tileH, r0);
   // Best match within reach of the prediction, and best anywhere.
   let best = -1, any = 0;
   for (let r = 0; r < scores.length; r++) {
