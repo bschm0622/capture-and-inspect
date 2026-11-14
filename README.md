@@ -1,6 +1,6 @@
 # Capture & Inspect
 
-A Chrome extension with two tools for working with the design of other sites:
+A Chrome extension with three tools for working with the design of other sites:
 
 1. **Full-page screenshot** — scrolls through a page, settles each section, and
    stitches the tiles into one clean PNG. Built for capturing marketing sites as
@@ -34,7 +34,7 @@ extension fixes:
 
 1. Open `chrome://extensions`
 2. Turn on **Developer mode** (top-right)
-3. Click **Load unpacked** and select this `extension/` folder
+3. Click **Load unpacked** and select this folder (the one with `manifest.json` in it)
 4. The camera icon appears in your toolbar — pin it if you like
 
 ## Use — Full-page screenshot
@@ -46,9 +46,17 @@ never flickers. When it finishes, an **editor tab** opens with the screenshot.
 Keep the popup open while it works; if you click away and it closes, the
 capture still finishes and the editor still opens.
 
-Capture takes roughly one second per screenful — a very tall page can take
-10–15 seconds. The page scrolls while capturing, so **don't switch tabs**
+Capture takes about two seconds per screenful: 20–45 seconds for a typical
+marketing page, a few minutes for a very long one. Most of that is waiting
+for the page to settle at each stop, and Chrome allows only about two
+shots a second. The page scrolls while capturing, so **don't switch tabs**
 mid-capture (the capture always shoots the active tab).
+
+If the capture couldn't make part of the page look exactly as it does in
+the browser, the editor says so in a notice above the image, in plain
+words: the page changed while it was being shot, a video or animation shows
+a single moment, a section that changes as you scroll is shown as a series
+of screens, or the page was too long for one image.
 
 ## Use — Inspect element
 
@@ -108,13 +116,14 @@ declared color values, so photos and gradients-as-images won't muddy the result.
 4. After the first tile, hides `fixed` overlays and sticky top-navs so they
    appear once at the top instead of repeating. Sticky *content* sections
    (pinned scroll-storytelling) are detected by position and left intact.
-5. Stitches every tile onto one canvas at your display's native resolution
+5. Stitches every tile into one image at your display's native resolution
    and opens it in the editor for crop / format / copy / download.
 
 ## Known limitations
 
-- Captures the whole `document`. Pages whose content scrolls inside an inner
-  container (rare for marketing pages) aren't handled in this version.
+- Captures the whole `document`. A page that scrolls one inner container
+  instead of the document is unwrapped and captured whole; an app with
+  several panes that scroll separately is captured as those panes stand.
 - If a cookie banner covers the hero, dismiss it before capturing for the
   cleanest first screen (it's hidden automatically after the first tile).
 - Captures are always at your display's full resolution, however tall. A page
@@ -124,3 +133,24 @@ declared color values, so photos and gradients-as-images won't muddy the result.
   longer to save (13 s for a 76,000px text page, up to about 50 s for one
   full of photos) and can't be copied to the clipboard whole past 32,767 CSS px
   (copy a selection, or download).
+- A part of the page that never stops moving (a word that rolls on a timer,
+  a marker that fills in only while its section is mid-screen, a video) is
+  shown as it was at the moment its tile was shot. Once in a while that
+  moment is part-way through the motion.
+- A video or map served by another site can refuse to load for some
+  visitors; the capture shows what the page showed.
+
+## Permissions and privacy
+
+The extension asks for `activeTab` and `scripting` (to read and scroll the
+tab you click it on, and only that tab), `storage` and `unlimitedStorage`
+(to hand a large capture to the editor tab and remember your format
+choice), and `clipboardWrite` (for Copy). It has no access to other tabs or
+sites, contacts no server of its own, and sends nothing anywhere:
+captures stay in your browser until you download or copy them.
+
+## Tests
+
+`test/` holds a harness that drives the extension in a real Chrome over a
+set of live sites and synthetic pages and checks the stitched image. See
+`test/README.md`.
