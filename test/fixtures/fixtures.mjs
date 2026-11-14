@@ -544,8 +544,10 @@ export const FIXTURES = [
   },
   {
     name: 'video-poster-blank', file: 'video-poster-blank.html', settleMs: 500,
+    // The video whose file never comes is an empty box in the capture.
+    expectGenericFail: ['blank-band'],
     checks: {
-      'bands-in-place': ({ img }) => bandsInPlace(img, { first: 4, top: 780 }),
+      'bands-in-place': ({ img }) => bandsInPlace(img, { first: 4, top: 780, until: 1980 }),
       // The hero shows the video (green under the tint) from top to
       // bottom, not the section's dark ground: its poster, a transparent
       // placeholder, must not stand for it.
@@ -557,6 +559,15 @@ export const FIXTURES = [
         }
         return result(bad.length === 0, bad.length, `${772 - bad.length} of 772 rows of the hero show the video`,
           bad.length ? [{ y0: bad[0], y1: bad[bad.length - 1] + 1, note: 'video missing from the hero' }] : []);
+      },
+      // The video whose file never comes (y 1980-2280) is said to be
+      // empty, and the hero isn't.
+      'missing-video-warned': ({ cap }) => {
+        const w = warned(cap, 'video-no-frame');
+        const at = w.filter((x) => x.y0 < 2280 && x.y1 > 1980);
+        const ok = at.length === 1 && w.length === 1;
+        return result(ok, w.length, `${w.length} video-no-frame warning(s): ${w.map((x) => `y ${x.y0}-${x.y1}`).join(', ') || 'none'}`,
+          ok ? [] : [{ y0: 1980, y1: 2280, note: 'missing video not reported, or the hero reported' }]);
       }
     }
   },

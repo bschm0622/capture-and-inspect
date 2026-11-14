@@ -6,12 +6,15 @@
      heading over it. Its poster is a 1x1 transparent GIF, a lazy loader's
      placeholder, as on www.thetaylordocs.com: a poster that shows nothing
      stands for nothing, and the hero must show a frame of the video, not
-     the section's dark ground. -->
+     the section's dark ground. Further down, a video whose file never
+     comes (same placeholder poster) has nothing to show: the capture
+     must say so. -->
 <style>
   html,body{margin:0;overflow-anchor:none}
   #hero{position:relative;height:780px;overflow:hidden;background:#222}
   #hero video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
   #hero .tint{position:absolute;inset:0;background:rgba(0,0,0,.4)}
+  #gone{display:block;width:600px;height:300px;margin:0 0 0 300px;background:transparent}
   #hero h1{position:relative;margin:0;padding:300px 0 0 110px;font:600 56px/1.1 sans-serif;color:#fff}
 </style>
 <script src="bands.js"></script>
@@ -22,5 +25,8 @@
 </section>
 <main id="m"></main>
 <script>
-  addBands(document.getElementById('m'), 4, 12);
+  const m = document.getElementById('m');
+  addBands(m, 4, 6);
+  m.insertAdjacentHTML('beforeend', '<video id="gone" autoplay loop muted playsinline poster="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" src="missing-clip.webm"></video>');
+  addBands(m, 10, 6);
 </script>

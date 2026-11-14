@@ -631,6 +631,11 @@ async function stitchTiles(tab, info) {
       brokenSeen.add(`${b.y0} ${b.y1}`);
       warnings.push({ kind: 'image-failed', y0: b.y0, y1: b.y1, note: `an image (y ${b.y0}-${b.y1}) failed to load, and again when asked for once more; its place is empty` });
     }
+    for (const b of res.noFrame || []) {
+      if (brokenSeen.has(`video ${b.y0} ${b.y1}`)) continue;
+      brokenSeen.add(`video ${b.y0} ${b.y1}`);
+      warnings.push({ kind: 'video-no-frame', y0: b.y0, y1: b.y1, note: `a video (y ${b.y0}-${b.y1}) had no frame to show when it was shot (it hadn't loaded); its place shows what was behind it` });
+    }
 
     // The page scrolled but the shot didn't change: shoot it again.
     let stale = false;

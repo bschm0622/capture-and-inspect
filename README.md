@@ -56,7 +56,7 @@ If the capture couldn't make part of the page look exactly as it does in
 the browser, the editor says so in a notice above the image, in plain
 words: the page changed while it was being shot, a video or animation shows
 a single moment, a section that changes as you scroll is shown as a series
-of screens, or the page was too long for one image.
+of screens, a video hadn't loaded, or the page was too long for one image.
 
 ## Use — Inspect element
 
@@ -105,7 +105,8 @@ declared color values, so photos and gradients-as-images won't muddy the result.
    Holds the page still while it shoots: sliders, animations and other
    changes the page makes on its own to anything already shot are put back
    before they're painted, canvases and paused videos are swapped for a
-   still of one frame, frames from other sites (maps, players) are shot
+   still of one frame (a video's own poster picture where it has one,
+   not a blank placeholder), frames from other sites (maps, players) are shot
    again until they stop changing, and an image whose request failed is
    asked for once more. A reveal the pre-scroll missed (a fade in, or a
    small mark that grows to its full size) is held at how it looks once

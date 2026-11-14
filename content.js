@@ -2627,10 +2627,18 @@
             const r = img.getBoundingClientRect();
             return { y0: Math.round(r.top + actualY), y1: Math.round(r.bottom + actualY) };
           }).filter((b) => b.y1 - b.y0 >= 24);
+          // A video on screen with no frame to show and nothing standing in
+          // for it (its file still loading, or never coming) is an empty
+          // box in the capture: said, not left silent.
+          const noFrame = [...frozenVideos.keys()].filter((v) => v.isConnected && v.readyState < 2 &&
+            !v.hasAttribute('data-cleanshot-stilled') && v.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })).map((v) => {
+            const r = v.getBoundingClientRect();
+            return r.width >= 100 && r.height >= 60 && r.bottom > 0 && r.top < window.innerHeight ? { y0: Math.round(r.top + actualY), y1: Math.round(r.bottom + actualY) } : null;
+          }).filter(Boolean);
           const live = liveRegions();
           lap('report');
           sendResponse({
-            ok: true, actualY, drift, covered, live, broken, dirty,
+            ok: true, actualY, drift, covered, live, broken, noFrame, dirty,
             pageHeight: pageHeight(),
             maxScroll: Math.max(0, scroller.scrollHeight - window.innerHeight),
             times: lapTimes()
