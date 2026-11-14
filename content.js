@@ -2632,11 +2632,44 @@
           // or never coming), is an empty box in the capture: said, not
           // left silent. (One that waits for a click and never loaded is
           // the page's choice, and its picture is often drawn over it by
-          // something else: www.chrisdriscollplumbing.com's players.)
-          const noFrame = [...frozenVideos].filter(([v, f]) => (v.autoplay || f.wasPlaying) && v.isConnected && v.readyState < 2 &&
+          // something else: www.chrisdriscollplumbing.com's players.) Nor
+          // is it empty when a picture stands in for it: the video's own
+          // background, or a thumbnail the player lays over it
+          // or a second video that did load (www.clcroofing.com's Wistia
+          // player plays a preview over the video it hasn't fetched).
+          // A video that has played keeps its last frame on screen while
+          // it waits for more of its file, whatever its readyState says.
+          const shown = (v) => v.played.length > 0 || v.currentTime > 0;
+          const pictured = (el) => el.tagName === 'IMG' || el.tagName === 'CANVAS' ||
+            (el.tagName === 'VIDEO' && (el.readyState >= 2 || shown(el) || el.hasAttribute('data-cleanshot-stilled'))) ||
+            getComputedStyle(el).backgroundImage.includes('url(');
+          const stoodFor = (v, r) => {
+            if (pictured(v)) return true;
+            const root = v.getRootNode();
+            for (const [fx, fy] of [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]]) {
+              const x = r.left + r.width * fx, y = r.top + r.height * fy;
+              if (y < 0 || y >= window.innerHeight) continue;
+              // Over it or under it: a video with no frame is see-through.
+              // (A player keeps its thumbnail in a shadow root of its own.)
+              const seen = new Set();
+              const look = (scope) => {
+                for (const el of scope.elementsFromPoint(x, y)) {
+                  if (el === v || seen.has(el)) continue;
+                  seen.add(el);
+                  const b = el.getBoundingClientRect(), part = b.width * b.height / (r.width * r.height);
+                  if (part >= 0.5 && part <= 1.5 && pictured(el)) return true;
+                  if (el.shadowRoot && el.shadowRoot !== scope && look(el.shadowRoot)) return true;
+                }
+                return false;
+              };
+              if (look(root.elementsFromPoint ? root : document)) return true;
+            }
+            return false;
+          };
+          const noFrame = [...frozenVideos].filter(([v, f]) => (v.autoplay || f.wasPlaying) && v.isConnected && v.readyState < 2 && !shown(v) &&
             !v.hasAttribute('data-cleanshot-stilled') && v.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })).map(([v]) => {
             const r = v.getBoundingClientRect();
-            return r.width >= 100 && r.height >= 60 && r.bottom > 0 && r.top < window.innerHeight ? { y0: Math.round(r.top + actualY), y1: Math.round(r.bottom + actualY) } : null;
+            return r.width >= 100 && r.height >= 60 && r.bottom > 0 && r.top < window.innerHeight && !stoodFor(v, r) ? { y0: Math.round(r.top + actualY), y1: Math.round(r.bottom + actualY) } : null;
           }).filter(Boolean);
           const live = liveRegions();
           lap('report');
