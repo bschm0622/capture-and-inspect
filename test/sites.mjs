@@ -1056,6 +1056,34 @@ export const SITES = [
           ok ? [] : [{ y0: b.top, y1: b.top + b.h, note: 'photo behind the section missing' }]);
       }
     }
+  },
+  {
+    // The hero's background video has a lazy loader's 1x1 transparent GIF
+    // as its poster. The still taken for the video drew that poster, and
+    // the hero came out as its dark tint, no street or building. Its right
+    // side (clear of the heading) must show the video, not a flat fill.
+    // On load a modal, a floating video widget and a reviews badge cover
+    // the page; none belongs in the capture.
+    host: 'thetaylordocs.com',
+    url: 'https://thetaylordocs.com/',
+    collect: () => {
+      const v = [...document.querySelectorAll('video')].find((e) => e.getBoundingClientRect().width >= innerWidth * 0.8);
+      const box = v && v.parentElement;
+      if (!box) return { hero: null };
+      const r = box.getBoundingClientRect();
+      return { hero: { top: Math.round(r.top + scrollY), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) } };
+    },
+    checks: {
+      'hero-video-shown'({ img, facts }) {
+        const b = facts.hero;
+        if (!b) return result(false, null, 'hero video not found on the page');
+        const y0 = Math.max(b.top, 60) + 10, y1 = b.top + b.h - 10;
+        const f = flatShare(img, { y0, y1, x: b.left + Math.round(b.w * 0.55), w: Math.round(b.w * 0.4) });
+        const ok = f != null && f < 0.5;
+        return result(ok, f == null ? null : +f.toFixed(2), `${Math.round((f || 0) * 100)}% of rows flat across the right of the hero (fail at 50%)`,
+          ok ? [] : [{ y0, y1, note: 'hero video missing' }]);
+      }
+    }
   }
 ];
 
@@ -1121,6 +1149,7 @@ export const KNOWN = {
   'late-fade-opaque': 'Scroll-linked fade too late for the pre-scroll caught part-way in a tile shot again: heading pale',
   'header-whole': "Header a script fixes inline kept fixed after it unstuck: the bar and logo lost, the hero cut at the first seam",
   'section-photo-shown': "A page loop let answer the capture's scroll changed a section's photo: plain fill behind the text",
-  'loop-reveal-shown': "Fade-ins played by the page's own frame loop held: a section left blank"
+  'loop-reveal-shown': "Fade-ins played by the page's own frame loop held: a section left blank",
+  'hero-video-shown': "A video's placeholder poster stood in for it: the hero a flat dark box"
 };
 
