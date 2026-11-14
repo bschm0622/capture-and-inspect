@@ -26,6 +26,31 @@ let lastCaptureTs = 0;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// The worker's own timers can't be trusted to keep time: Chrome runs the
+// extension's worker as a background process, and its timeouts come late,
+// by seconds at a time (a 100 ms timeout measured at up to 13 s; the 800 ms
+// hold grace took 8 s, and the 600 ms capture quota 7 s a shot). The page's
+// timers keep time, so while a capture runs its waits are timed by the page
+// side, with the worker's own timer as the fallback should the page not
+// answer.
+let waitTab = null;
+function wait(ms) {
+  if (waitTab == null) return sleep(ms);
+  return Promise.race([sleep(ms), sendToTab(waitTab, { cmd: 'sleep', ms }).catch(() => sleep(ms))]);
+}
+
+// Where the time goes, for the test record (runCapture's `timings`): ms
+// per step, and per tile the worker's own steps with the page side's.
+let perf = null;
+const now = () => performance.now();
+function spent(k, since) {
+  const t = now();
+  const into = perf && (perf.cur || perf.steps);
+  if (into) into[k] = (into[k] || 0) + t - since;
+  return t;
+}
+const rounded = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === 'number' ? Math.round(v) : v]));
+
 // Push a progress update to the popup. Ignore "no receiver" errors — the
 // popup may be closed, in which case the capture still completes fine.
 function notify(update) {
@@ -44,14 +69,18 @@ function sendToTab(tabId, msg) {
 
 // Wait until Chrome's quota allows the next shot.
 async function captureReady() {
-  const wait = CAPTURE_MIN_INTERVAL_MS - (Date.now() - lastCaptureTs);
-  if (wait > 0) await sleep(wait);
+  const left = CAPTURE_MIN_INTERVAL_MS - (Date.now() - lastCaptureTs);
+  if (left > 0) await wait(left);
 }
 
 async function throttledCapture(windowId) {
+  let t = now();
   await captureReady();
+  t = spent('throttle', t);
   const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
   lastCaptureTs = Date.now();
+  spent('capture', t);
+  if (perf && perf.cur) perf.cur.shots = (perf.cur.shots || 0) + 1;
   return dataUrl;
 }
 
@@ -69,8 +98,11 @@ function isCapturable(url) {
 }
 
 async function dataUrlToBitmap(dataUrl) {
+  const t = now();
   const blob = await (await fetch(dataUrl)).blob();
-  return createImageBitmap(blob);
+  const bmp = await createImageBitmap(blob);
+  spent('decode', t);
+  return bmp;
 }
 
 // The page can move while it is being shot: a carousel resizes, a header
@@ -187,25 +219,48 @@ function texturedBlocks(sig, w, stripTop, K, edges, use) {
 // scored on the better half of the blocks, so something that differs
 // between the two shots in part of the width (a sticky sidebar, an image
 // that finished loading) doesn't hide an otherwise clean match.
-function overlapScores(sig, w, stripTop, K, blocks, edges, use, tile, tileH) {
+// Every decision placeTile makes compares scores under SCORE_CAP (a match
+// is under MATCH_OK; one that is distinctive has nothing else under twice
+// that), so a row is given up (Infinity) as soon as its score can't come
+// under it: the sums only grow row by row, and the better half of the
+// blocks' sums so far is already as much. Only row `exact` (where position
+// puts the tile) is always scored in full, for the report. The same
+// decisions, at a fraction of the work: this ran 0.1-0.35 s a tile.
+const SCORE_CAP = 2 * MATCH_OK;
+function overlapScores(sig, w, stripTop, K, blocks, edges, use, tile, tileH, exact) {
   const keep = Math.max(2, Math.ceil(blocks.length / 2));
   const scores = new Float32Array(tileH - K + 1);
-  const per = new Float64Array(blocks.length);
+  const nb = blocks.length;
+  const per = new Float64Array(nb);
+  const means = new Float64Array(nb);
+  const lo = blocks.map(({ b }) => edges[b]), hi = blocks.map(({ b }) => edges[b + 1]);
+  const ns = blocks.map(({ n }) => n);
+  const masked = use.indexOf(0) >= 0;
+  // The mean of the `keep` smallest of the blocks' sums so far.
+  const bestHalf = () => {
+    for (let k = 0; k < nb; k++) means[k] = per[k] / ns[k];
+    means.sort();
+    let sum = 0;
+    for (let k = 0; k < keep; k++) sum += means[k];
+    return sum / keep;
+  };
   for (let r = 0; r <= tileH - K; r++) {
     per.fill(0);
+    let gaveUp = false;
     for (let j = 0; j < K; j++) {
       const a = (stripTop + j) * w, t = (r + j) * w, u = j * w;
-      for (let k = 0; k < blocks.length; k++) {
-        const b = blocks[k].b;
+      for (let k = 0; k < nb; k++) {
         let s = 0;
-        for (let x = edges[b]; x < edges[b + 1]; x++) if (use[u + x]) s += Math.abs(sig[a + x] - tile[t + x]);
+        if (masked) {
+          for (let x = lo[k]; x < hi[k]; x++) if (use[u + x]) s += Math.abs(sig[a + x] - tile[t + x]);
+        } else {
+          for (let x = lo[k]; x < hi[k]; x++) s += Math.abs(sig[a + x] - tile[t + x]);
+        }
         per[k] += s;
       }
+      if ((j & 3) === 3 && r !== exact && bestHalf() >= SCORE_CAP) { gaveUp = true; break; }
     }
-    const sorted = Array.from(per, (s, k) => s / blocks[k].n).sort((p, q) => p - q);
-    let sum = 0;
-    for (let k = 0; k < keep; k++) sum += sorted[k];
-    scores[r] = sum / keep;
+    scores[r] = gaveUp ? Infinity : bestHalf();
   }
   return scores;
 }
@@ -233,8 +288,8 @@ function placeTile(sig, w, seam, predicted, tile, tileH, hidden, reach) {
   const edges = Array.from({ length: 9 }, (_, b) => Math.floor(w * b / 8));
   const blocks = texturedBlocks(sig, w, stripTop, K, edges, use);
   if (blocks.length < 2) return { top: predicted, match: 'flat' };
-  const scores = overlapScores(sig, w, stripTop, K, blocks, edges, use, tile, tileH);
   const r0 = Math.round(stripTop - predicted);
+  const scores = overlapScores(sig, w, stripTop, K, blocks, edges, use, tile, tileH, r0);
   // Best match within reach of the prediction, and best anywhere.
   let best = -1, any = 0;
   for (let r = 0; r < scores.length; r++) {
@@ -467,6 +522,9 @@ async function stitchTiles(tab, info) {
 
   let lastRes = null;
   for (let i = 0; ;) {
+    if (perf) {
+      perf.cur = perf.tiles[i] || (perf.tiles[i] = { at: now() - perf.t0 });
+    }
     if (shots++ >= shotBudget()) {
       const y = Math.round(cursor / scale);
       const end = lastRes ? lastRes.pageHeight : pageHeight;
@@ -482,8 +540,14 @@ async function stitchTiles(tab, info) {
         wantY = Math.max(last.actualY + 1, Math.min(wantY, Math.round(from - offset)));
       }
     }
+    let tq = now();
     const res = await sendToTab(tab.id, { cmd: 'tile', y: Math.min(wantY, capScroll), index: i, total });
     if (!res || !res.ok) throw new Error(res && res.error || 'tile failed');
+    tq = spent('tileMsg', tq);
+    if (perf && res.times) {
+      const p = perf.cur.page || (perf.cur.page = {});
+      for (const k in res.times) p[k] = (p[k] || 0) + res.times[k];
+    }
     // The height cap holds for the tiles too: past it the page counts as
     // ended. (Without this the loop followed the page's real bottom past the
     // cap until the canvas was full.)
@@ -533,7 +597,9 @@ async function stitchTiles(tab, info) {
 
     let bmp = await dataUrlToBitmap(await throttledCapture(tab.windowId));
     const tileH = Math.round(bmp.height / dpr);
+    let tg = now();
     let tileGrid = lumaGrid(bmp, gw, tileH);
+    spent('grid', tg);
     // A frame from another site paints on its own time (a Google map draws
     // blurry tiles first and its controls last), out of the page's reach.
     // The first time one is on screen, shoot again until two shots in a
@@ -574,7 +640,7 @@ async function stitchTiles(tab, info) {
         retakes++;
         placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, stale: true, retake: true });
         bmp.close();
-        await sleep(STALE_WAIT_MS);
+        await wait(STALE_WAIT_MS);
         continue;
       }
       stale = true;
@@ -582,6 +648,7 @@ async function stitchTiles(tab, info) {
     prevShot = { grid: tileGrid, actualY: res.actualY, h: tileH };
 
     let match = null, agree = null;
+    const tm = now();
     if (i > 0) {
       // What this shot says can't be held still is left out as well as what
       // the last one said: a slider first seen moving now differs from the
@@ -617,6 +684,7 @@ async function stitchTiles(tab, info) {
       }
     }
 
+    spent('match', tm);
     // The page changed between this shot and the one above. Shoot that one
     // again, then this one, back to back. The repeat keeps the page's
     // anchors from this shot, so this one is still measured from here.
@@ -645,6 +713,7 @@ async function stitchTiles(tab, info) {
     if (((agree && agree.blocks > 0) || dirtyAbove) && !straddles && last && seamReshoots < RESHOOTS_PER_SEAM && reshoots < MAX_RESHOOTS && affords(2, res)) {
       seamReshoots++;
       reshoots++;
+      if (perf) perf.cur.reshoots = (perf.cur.reshoots || 0) + 1;
       placements.push({ index: i, y: wantY, actualY: res.actualY, drift: res.drift, top, match, agree, retake: true });
       bmp.close();
       // Wait out the capture quota first, so the shot follows right after
@@ -655,8 +724,10 @@ async function stitchTiles(tab, info) {
       // (Reached from above, the way it was the first time: some pages
       // set things by the direction the page last scrolled, r-o.com's
       // footer crane leaning with it.)
+      const ta = now();
       const again = await sendToTab(tab.id, { cmd: 'tile', y: last.actualY, index: last.index, total, keepAnchors: true, from: Math.max(0, last.actualY - step) });
       if (!again || !again.ok) throw new Error(again && again.error || 'tile failed');
+      spent('reshootMsg', ta);
       if (Math.abs(again.actualY - last.actualY) < 1) {
         const b2 = await dataUrlToBitmap(await throttledCapture(tab.windowId));
         const h2 = Math.round(b2.height / dpr);
@@ -722,7 +793,9 @@ async function stitchTiles(tab, info) {
     const to = Math.min(topOut + tileOut, allocated());
     if (from > cursor) holes.push([cursor, from]);
     if (to > from) {
+      const tp = now();
       paint(bmp, tileGrid, tileH, top, from, to);
+      spent('paint', tp);
       paintStarts.push(from / scale);
       cursor = to;
     }
@@ -850,6 +923,9 @@ async function runCapture(tab) {
   capturing = true;
   setBadge('…', '#555');
   notify({ phase: 'prepare' });
+  perf = { t0: now(), steps: {}, tiles: [], cur: null };
+  let ts = now();
+  const step = (k) => { perf.cur = null; ts = spent(k, ts); };
 
   const clock = (cmd) => chrome.scripting.executeScript({
     target: { tabId: tab.id },
@@ -862,6 +938,7 @@ async function runCapture(tab) {
     // Follow the page's timers from before the wake-up, so the sliders the
     // woken scripts start can be held once the page is prepared.
     await clock('watch');
+    step('watch');
     // Inject the page-side worker (activeTab grant covers this tab) and let
     // it wake the page first: scripts held back until the first mouse move
     // start carousels and scroll animations the steps below must see.
@@ -869,7 +946,10 @@ async function runCapture(tab) {
       target: { tabId: tab.id },
       files: ['content.js']
     });
+    waitTab = tab.id;
+    step('inject');
     await sendToTab(tab.id, { cmd: 'wake' }).catch(() => {});
+    step('wake');
 
     // Switch off GSAP ScrollTrigger before measuring the page. Pinned
     // scroll-storytelling sections add screens of scroll distance, so tiling
@@ -880,6 +960,7 @@ async function runCapture(tab) {
       world: 'MAIN',
       func: unpinScrollAnimations
     }).catch(() => {});
+    step('unpin');
 
     // Stop auto-advancing carousels. A hero slideshow that changes slide
     // while the tiles are being shot (the Children's Museum turns every 7s)
@@ -889,9 +970,12 @@ async function runCapture(tab) {
       world: 'MAIN',
       func: stopCarousels
     }).catch(() => {});
+    step('carousels');
 
     const info = await sendToTab(tab.id, { cmd: 'prepare' });
     if (!info || !info.ok) throw new Error(info && info.error || 'prepare failed');
+    step('prepare');
+    perf.prepare = info.times || null;
 
     // The page is prepared: stop its clock for the tiles. Carousels the
     // pre-scroll brought to life (a slider set up when it scrolls into
@@ -901,18 +985,24 @@ async function runCapture(tab) {
     await clock('hold');
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'MAIN', func: stopCarousels }).catch(() => {});
     await sendToTab(tab.id, { cmd: 'hold' }).catch(() => {});
-    await sleep(HOLD_GRACE_MS);
+    step('hold');
+    await wait(HOLD_GRACE_MS);
+    step('holdGrace');
 
     const t0 = Date.now();
     const { image, tileCount, warnings, placements } = await stitchTiles(tab, info);
     const t1 = Date.now();
+    step('tiles');
 
     await sendToTab(tab.id, { cmd: 'finish' }).catch(() => {});
+    step('finish');
     await clock('release');
+    step('release');
 
     const t2 = Date.now();
     const outBlob = await encodeCapture(image);
     const t3 = Date.now();
+    step('encode');
 
     let host = 'page';
     try { host = new URL(tab.url).hostname; } catch (_) {}
@@ -929,7 +1019,12 @@ async function runCapture(tab) {
     // in storage would not survive a file of several hundred MB), and its
     // description into storage.
     await CaptureStore.put(outBlob);
-    const timings = { tilesMs: t1 - t0, encodeMs: t3 - t2, storeMs: Date.now() - t3, bands: image.bands.length };
+    step('store');
+    const timings = {
+      tilesMs: t1 - t0, encodeMs: t3 - t2, storeMs: Date.now() - t3, bands: image.bands.length,
+      steps: rounded(perf.steps), prepare: perf.prepare,
+      tiles: perf.tiles.map((t) => ({ ...rounded(t), ...(t.page ? { page: rounded(t.page) } : {}) }))
+    };
     await chrome.storage.local.set({
       capture: {
         baseName,
@@ -957,6 +1052,8 @@ async function runCapture(tab) {
     return { error: String(err && err.message || err) };
   } finally {
     capturing = false;
+    waitTab = null;
+    perf = null;
   }
 }
 

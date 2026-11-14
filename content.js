@@ -53,6 +53,25 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
 
+  // Where the time goes, for the test record: ms per step of a command,
+  // sent back with its answer. `scan` is what the image wait spends looking
+  // the page over before it waits.
+  let times = {}, lapAt = 0, scanMs = 0;
+  const lapStart = () => { times = {}; scanMs = 0; lapAt = performance.now(); };
+  const lap = (k) => {
+    const n = performance.now();
+    times[k] = (times[k] || 0) + n - lapAt;
+    lapAt = n;
+  };
+  // (A part of a step, timed on its own: `since` is when it began.)
+  const spentOn = (k, since) => { times[k] = (times[k] || 0) + performance.now() - since; };
+  const lapTimes = () => {
+    const out = {};
+    for (const k in times) out[k] = Math.round(times[k]);
+    if (scanMs) out.imageScan = Math.round(scanMs);
+    return out;
+  };
+
   // The properties a script (or a CSS scroll-driven animation) uses to place
   // something by the scroll position: computed-style name, CSS name. Each
   // can be held at one value through the stylesheet, where an !important
@@ -381,6 +400,7 @@
   // the timeout. A background is looked up through an Image with the same
   // URL, which is complete at once when the browser already has it.
   async function waitForVisibleImages(timeoutMs = 1500) {
+    const scanAt = performance.now();
     const vh = window.innerHeight;
     const vw = document.documentElement.clientWidth;
     // Across as well as down: a slider's off-screen slides sit beside the
@@ -418,6 +438,7 @@
       probe.src = url;
       if (!probe.complete) pending.push(loaded(probe));
     }
+    scanMs += performance.now() - scanAt;
     if (!pending.length) return;
     await Promise.race([Promise.all(pending), sleep(timeoutMs)]);
   }
@@ -856,6 +877,7 @@
     const NEAR = 60, VISITS = 40, WAIT_MS = 2500;
     // Go to y and read the group's properties once they hold still.
     const settled = async (y, group) => {
+      times.linkedVisits = (times.linkedVisits || 0) + 1;
       scroller.scrollTo(0, y);
       await raf();
       await raf();
@@ -1334,8 +1356,13 @@
     for (let y = 0; y < h; y += vh) {
       scroller.scrollTo(0, y);
       await sleep(60);
+      let t = performance.now();
       await waitForVisibleImages(PRESCROLL_IMAGES_MS);
+      spentOn('preScrollImages', t);
+      t = performance.now();
       sampleScrollEffects();
+      spentOn('preScrollSample', t);
+      times.preScrollStops = (times.preScrollStops || 0) + 1;
     }
     // One extra stop at the very bottom, looked at twice: fades started by
     // the last few stops are still running when the first look comes. The
@@ -1390,14 +1417,33 @@
     }
     : (el) => el.shadowRoot;
 
+  //
+  // The walk is costly on a big page (www.britishmuseum.org's 45,000
+  // elements: 110 ms, nearly all of it asking each one for a closed shadow
+  // root), and a tile asked for it seven times. So only an element that may
+  // host a shadow root is asked (a custom element, or one of the tags the
+  // DOM lets attachShadow use), and the list is kept until an element is
+  // added or removed anywhere it covers (the page and every shadow root
+  // found). It is walked afresh at the start of every tile all the same, to
+  // find a shadow root attached since to an element already in the page (a
+  // custom element whose definition loaded late).
+  const SHADOW_HOSTS = /^(ARTICLE|ASIDE|BLOCKQUOTE|BODY|DIV|FOOTER|H[1-6]|HEADER|MAIN|NAV|P|SECTION|SPAN)$|-/;
+  let walked = null;
+  const walkWatch = new MutationObserver(() => { walked = null; });
   function allElements() {
+    if (walked && !walkWatch.takeRecords().length) return walked;
+    walkWatch.disconnect();
     const out = [];
-    const walk = (root) => root.querySelectorAll('*').forEach((el) => {
-      out.push(el);
-      const shadow = shadowOf(el);
-      if (shadow) walk(shadow);
-    });
+    const walk = (root) => {
+      walkWatch.observe(root, { childList: true, subtree: true });
+      root.querySelectorAll('*').forEach((el) => {
+        out.push(el);
+        const shadow = SHADOW_HOSTS.test(el.tagName) ? shadowOf(el) : null;
+        if (shadow) walk(shadow);
+      });
+    };
     if (document.body) walk(document.body);
+    walked = out;
     return out;
   }
 
@@ -1938,10 +1984,12 @@
 
   async function filmPinnedSections() {
     const vh = window.innerHeight;
+    const tf = performance.now();
     const frames = allElements().filter((el) => {
       if (!(el instanceof HTMLElement) || getComputedStyle(el).position !== 'sticky') return false;
       return !inHeaderZone(el) && (isPinnedSection(el) || stickyPanel(el));
     });
+    spentOn('filmFind', tf);
     for (const frame of frames) {
       if (frames.some((f) => f !== frame && f.contains(frame))) continue;
       const panel = !isPinnedSection(frame);
@@ -1959,10 +2007,16 @@
       const stages = [];
       for (let k = 0; k < n; k++) {
         scroller.scrollTo(0, Math.max(0, pageTop + travel * k / (n - 1) - stick));
+        const tw = performance.now();
         await raf();
         await raf();
         await sleep(150);
+        spentOn('filmWait', tw);
+        const t = performance.now();
         await waitForVisibleImages(800);
+        spentOn('filmImages', t);
+        times.filmStages = (times.filmStages || 0) + 1;
+        const tc = performance.now();
         const stage = { at: off + travel * k / (n - 1), node: frame.cloneNode(true) };
         // The panel's own look and place at this stage, for the copies (see
         // below).
@@ -1988,10 +2042,14 @@
           });
         }
         stages.push(stage);
+        spentOn('filmCopy', tc);
       }
+      const tq = performance.now();
       if (panel
         ? stages.every((s) => partsChanged(stages[0].parts, s.parts, r.width * h) < 0.25)
-        : stages.every((s) => s.node.outerHTML === stages[0].node.outerHTML)) continue;
+        : stages.every((s) => s.node.outerHTML === stages[0].node.outerHTML)) { spentOn('filmCompare', tq); continue; }
+      spentOn('filmCompare', tq);
+      const ti = performance.now();
       // The page's script may size the container by how many frames it
       // holds (agcsf.com's grew a screen per copy), so it keeps its height.
       parent.style.setProperty('--cleanshot-height', `${pr.height}px`);
@@ -2013,11 +2071,15 @@
       // way it rests once arrived.
       const rest = stages.reduce((a, s) => (s.frameLook.opacity >= a.frameLook.opacity ? s : a), stages[0]).frameLook;
       const left = rest.left - pr.left - parseFloat(ps.borderLeftWidth);
+      // (Read once: read again after each copy went in, with the stylesheet
+      // just rewritten, it made the browser restyle the whole page, 200 ms a
+      // copy on agcsf.com.)
+      const borderTop = parseFloat(ps.borderTopWidth);
       let after = frame;
       for (const { at, node, looks } of stages) {
         node.setAttribute('data-cleanshot-clone', '');
         node.setAttribute('aria-hidden', 'true');
-        for (const [p, v] of [['position', 'absolute'], ['top', `${at - parseFloat(ps.borderTopWidth)}px`], ['left', `${left}px`],
+        for (const [p, v] of [['position', 'absolute'], ['top', `${at - borderTop}px`], ['left', `${left}px`],
           ['bottom', 'auto'], ['right', 'auto'], ['width', `${rest.width}px`], ['height', `${h}px`], ['margin', '0'],
           ['opacity', String(rest.opacity)], ['transform', rest.transform], ['translate', rest.translate]]) {
           node.style.setProperty(p, v, 'important');
@@ -2046,6 +2108,7 @@
         parent.insertBefore(node, after.nextSibling);
         after = node;
       }
+      spentOn('filmInsert', ti);
       const top = Math.round(pr.top + y);
       notes.push({ kind: 'pinned-stages', y0: top, y1: Math.round(top + pr.height), note: `${panel ? 'a panel' : 'a section'} that stays on screen while the page scrolls past it, changing as it goes (y ${top}-${Math.round(top + pr.height)}), is shown as ${n} ${panel ? 'copies down its column' : 'screens'}, one for each stage` });
     }
@@ -2442,27 +2505,39 @@
           pausePlayers();
           sendResponse({ ok: true });
         } else if (msg.cmd === 'prepare') {
+          lapStart();
           watchRestless();
           originalScrollY = scroller.scrollTop || window.scrollY || 0;
           unlockScroll();
           pauseLoopingAnimations();
           injectStyle();
           unwrapInnerScroller();
+          lap('setup');
           await preScroll();
+          lap('preScroll');
           await waitForFonts();
+          lap('fonts');
           await paintBackdrop();
           unpinScrollMagic();
+          lap('backdrop');
           await filmPinnedSections();
+          lap('filmPinned');
           await settleFixedBackgrounds();
+          lap('fixedBackgrounds');
           settleOverlays();
           holdFades();
           placeRevealedBackdrop();
           findStickyHeaders(); // measured at scroll 0, after preScroll settles
           sortOverlays(true);
+          lap('overlays');
           await extendBackdrops();
+          lap('extendBackdrops');
           await settleAtTop();
+          lap('settleAtTop');
           recordFirstScreen();
+          lap('firstScreen');
           await holdScrollLinked();
+          lap('scrollLinked');
           const rawH = pageHeight();
           const capped = Math.min(rawH, MAX_PAGE_HEIGHT);
           if (rawH > MAX_PAGE_HEIGHT) {
@@ -2476,9 +2551,12 @@
             viewportHeight: window.innerHeight,
             pageWidth: document.documentElement.clientWidth,
             dpr: window.devicePixelRatio || 1,
-            notes
+            notes,
+            times: lapTimes()
           });
         } else if (msg.cmd === 'tile') {
+          lapStart();
+          walked = null;
           covered = [];
           unlockScroll();
           if (msg.from != null && msg.from < msg.y) {
@@ -2489,7 +2567,9 @@
           scrollPage(msg.y);
           await raf();
           await raf();
+          lap('scroll');
           await waitForVisibleImages();
+          lap('images');
           // Hide once before the settle wait and again after it. Headers
           // that turn fixed on scroll appear within a frame or two, and
           // hiding them only at the last moment isn't always painted by the
@@ -2497,28 +2577,39 @@
           hideOverlays(msg.index);
           if (msg.index > 0) pinFirstScreen();
           applyFades();
+          lap('overlays');
           await sleep(SETTLE_GRACE_MS);
+          lap('grace');
           // Lazy loaders that wait for the scroll to stop (a debounced
           // handler) only swap their images in during the settle wait.
           await waitForVisibleImages();
+          lap('images');
           hideOverlays(msg.index);
           if (msg.index > 0) pinFirstScreen();
           applyFades();
+          lap('overlays');
           noteEntrances();
+          lap('entrances');
           await freezeVideos();
+          lap('videos');
           let dirty = [];
           if (clockHeld) {
             await waitForSettle();
+            lap('settle');
             pauseClockAnimations();
             pausePlayers();
+            lap('pause');
             // (A page that plays its videos again when they come into view
             // has had the settle wait to do it: back on their frame first.)
             await freezeVideos();
+            lap('videos');
             const st = await requestStills();
             if (st && st.dirty) dirty = st.dirty;
+            lap('stills');
           }
           await raf();
           await raf();
+          lap('frames');
           // Report where we actually landed (bottom tile clamps short), how
           // far the page moved since the last tile, and how far it scrolls
           // now, measured as late as possible before the shot. A tile shot
@@ -2536,13 +2627,22 @@
             const r = img.getBoundingClientRect();
             return { y0: Math.round(r.top + actualY), y1: Math.round(r.bottom + actualY) };
           }).filter((b) => b.y1 - b.y0 >= 24);
+          const live = liveRegions();
+          lap('report');
           sendResponse({
-            ok: true, actualY, drift, covered, live: liveRegions(), broken, dirty,
+            ok: true, actualY, drift, covered, live, broken, dirty,
             pageHeight: pageHeight(),
-            maxScroll: Math.max(0, scroller.scrollHeight - window.innerHeight)
+            maxScroll: Math.max(0, scroller.scrollHeight - window.innerHeight),
+            times: lapTimes()
           });
+        } else if (msg.cmd === 'sleep') {
+          // A wait timed for the worker, whose own timers run late.
+          await sleep(msg.ms);
+          sendResponse({ ok: true });
         } else if (msg.cmd === 'finish') {
           restore();
+          walkWatch.disconnect();
+          walked = null;
           sendResponse({ ok: true });
         }
       } catch (err) {
