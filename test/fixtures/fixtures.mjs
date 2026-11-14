@@ -543,6 +543,24 @@ export const FIXTURES = [
     }
   },
   {
+    name: 'video-poster-blank', file: 'video-poster-blank.html', settleMs: 500,
+    checks: {
+      'bands-in-place': ({ img }) => bandsInPlace(img, { first: 4, top: 780 }),
+      // The hero shows the video (green under the tint) from top to
+      // bottom, not the section's dark ground: its poster, a transparent
+      // placeholder, must not stand for it.
+      'video-shown': ({ img }) => {
+        const bad = [];
+        for (let y = 4; y < 776; y++) {
+          const [r, g] = meanBox(img, 900, 400, y, y + 1);
+          if (g - r < 40) bad.push(y);
+        }
+        return result(bad.length === 0, bad.length, `${772 - bad.length} of 772 rows of the hero show the video`,
+          bad.length ? [{ y0: bad[0], y1: bad[bad.length - 1] + 1, note: 'video missing from the hero' }] : []);
+      }
+    }
+  },
+  {
     name: 'late-font', file: 'late-font.html', settleMs: 500,
     // Where the first band sits once the font is in (the page after the
     // capture).

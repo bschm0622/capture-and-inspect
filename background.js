@@ -1944,11 +1944,15 @@ function pageClock(cmd, graceMs, afterMs) {
       for (const el of list) {
         if (el.tagName === 'VIDEO') {
           // A poster is what the page chose to stand for the video; else
-          // the frame the page side put it on.
+          // the frame the page side put it on. A poster a few px across or
+          // with nothing in it is a lazy loader's placeholder, not a
+          // picture (www.thetaylordocs.com's hero: a 1x1 transparent GIF
+          // stood in for the video, and the hero came out its dark tint).
           const im = el.poster ? await loadImage(el.poster) : null;
-          const c = im ? stand(el, im, im.naturalWidth, im.naturalHeight)
-            : el.readyState >= 2 ? stand(el, el, el.videoWidth, el.videoHeight) : null;
-          if (c) { place(el, c); made++; }
+          let c = im && im.naturalWidth >= 16 && im.naturalHeight >= 16 ? stand(el, im, im.naturalWidth, im.naturalHeight) : null;
+          if (c && blank(c)) c = null;
+          if (!c && el.readyState >= 2) c = stand(el, el, el.videoWidth, el.videoHeight);
+          if (c && !blank(c)) { place(el, c); made++; }
           continue;
         }
         const c = stand(el, el, el.width, el.height);

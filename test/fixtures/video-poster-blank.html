@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Fixture: a hero video whose poster is a blank placeholder</title>
+<!-- A full-width hero with a background video (green, a white bar moving
+     over its left part) playing on its own, under a dark tint, with a
+     heading over it. Its poster is a 1x1 transparent GIF, a lazy loader's
+     placeholder, as on www.thetaylordocs.com: a poster that shows nothing
+     stands for nothing, and the hero must show a frame of the video, not
+     the section's dark ground. -->
+<style>
+  html,body{margin:0;overflow-anchor:none}
+  #hero{position:relative;height:780px;overflow:hidden;background:#222}
+  #hero video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  #hero .tint{position:absolute;inset:0;background:rgba(0,0,0,.4)}
+  #hero h1{position:relative;margin:0;padding:300px 0 0 110px;font:600 56px/1.1 sans-serif;color:#fff}
+</style>
+<script src="bands.js"></script>
+<section id="hero">
+  <video autoplay loop muted playsinline poster="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" src="hero-loop.webm"></video>
+  <div class="tint"></div>
+  <h1>Relieve your pain and<br>get back to your life.</h1>
+</section>
+<main id="m"></main>
+<script>
+  addBands(document.getElementById('m'), 4, 12);
+</script>
