@@ -386,7 +386,8 @@ const NOTICE = {
   'live-effect': () => 'Videos or animations on the page show a single moment, and may not line up where two shots meet.',
   budget: () => 'The page kept moving, so some places may be less exact than usual.',
   'page-height-changed': () => 'The page changed length while it was captured.',
-  'pinned-stages': () => 'A section that changes as you scroll is shown as a series of screens, one for each stage.'
+  'pinned-stages': () => 'A section that changes as you scroll is shown as a series of screens, one for each stage.',
+  'video-no-frame': () => "A video on the page hadn't loaded when it was captured, so its place is empty."
 };
 
 function showNotice(warnings) {

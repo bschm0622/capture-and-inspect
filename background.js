@@ -631,6 +631,11 @@ async function stitchTiles(tab, info) {
       brokenSeen.add(`${b.y0} ${b.y1}`);
       warnings.push({ kind: 'image-failed', y0: b.y0, y1: b.y1, note: `an image (y ${b.y0}-${b.y1}) failed to load, and again when asked for once more; its place is empty` });
     }
+    for (const b of res.noFrame || []) {
+      if (brokenSeen.has(`video ${b.y0} ${b.y1}`)) continue;
+      brokenSeen.add(`video ${b.y0} ${b.y1}`);
+      warnings.push({ kind: 'video-no-frame', y0: b.y0, y1: b.y1, note: `a video (y ${b.y0}-${b.y1}) had no frame to show when it was shot (it hadn't loaded); its place shows what was behind it` });
+    }
 
     // The page scrolled but the shot didn't change: shoot it again.
     let stale = false;
@@ -1944,11 +1949,15 @@ function pageClock(cmd, graceMs, afterMs) {
       for (const el of list) {
         if (el.tagName === 'VIDEO') {
           // A poster is what the page chose to stand for the video; else
-          // the frame the page side put it on.
+          // the frame the page side put it on. A poster a few px across or
+          // with nothing in it is a lazy loader's placeholder, not a
+          // picture (www.thetaylordocs.com's hero: a 1x1 transparent GIF
+          // stood in for the video, and the hero came out its dark tint).
           const im = el.poster ? await loadImage(el.poster) : null;
-          const c = im ? stand(el, im, im.naturalWidth, im.naturalHeight)
-            : el.readyState >= 2 ? stand(el, el, el.videoWidth, el.videoHeight) : null;
-          if (c) { place(el, c); made++; }
+          let c = im && im.naturalWidth >= 16 && im.naturalHeight >= 16 ? stand(el, im, im.naturalWidth, im.naturalHeight) : null;
+          if (c && blank(c)) c = null;
+          if (!c && el.readyState >= 2) c = stand(el, el, el.videoWidth, el.videoHeight);
+          if (c && !blank(c)) { place(el, c); made++; }
           continue;
         }
         const c = stand(el, el, el.width, el.height);

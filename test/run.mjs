@@ -133,7 +133,7 @@ function runChild(payload, hardMs) {
 async function serveFixtures() {
   const SLOW_MS = 4500;
   const http = await import('node:http');
-  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.woff2': 'font/woff2' };
+  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.woff2': 'font/woff2', '.webm': 'video/webm' };
   const asked = new Set();
   const handler = (req, res) => {
     const name = path.basename(decodeURIComponent(new URL(req.url, 'http://x').pathname));
