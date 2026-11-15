@@ -155,3 +155,7 @@ captures stay in your browser until you download or copy them.
 `test/` holds a harness that drives the extension in a real Chrome over a
 set of live sites and synthetic pages and checks the stitched image. See
 `test/README.md`.
+
+## License
+
+MIT. See `LICENSE`.
