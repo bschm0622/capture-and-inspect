@@ -1394,7 +1394,7 @@ function pageClock(cmd, graceMs, afterMs) {
         if (S.fadeMo && !prev && !c.fader) {
           try {
             for (const m of S.fadeMo.takeRecords()) {
-              if (m.target instanceof HTMLElement && fadeIn(m.oldValue, m.target.getAttribute('style'))) { c.fader = true; break; }
+              if (m.target instanceof HTMLElement && fadeIn(m.oldValue, m.target.getAttribute('style'), m.target)) { c.fader = true; break; }
             }
           } catch (e) {}
         }
@@ -1561,11 +1561,17 @@ function pageClock(cmd, graceMs, afterMs) {
       return changed > 0;
     };
     // Whether two inline styles differ only in opacity, and maybe where the
-    // element is placed (a fade that moves up as it comes in).
+    // element is placed (a fade that moves up as it comes in) or how an
+    // entrance dresses it on the way in: a tint that settles to the text's
+    // colour (www.tribe.ai fades each letter in from its accent cyan), a
+    // blur that clears, a shadow, or `visibility` made visible with the
+    // opacity (GSAP's autoAlpha). Not hidden: that is a fade out.
+    const ENTRANCE = /^(color|-webkit-text-fill-color|filter|-webkit-filter|text-shadow|visibility)$/;
     const onlyFade = (a, b) => {
       const x = decls(a), z = decls(b);
+      if (z.get('visibility') === 'hidden' && x.get('visibility') !== 'hidden') return false;
       for (const k of new Set([...x.keys(), ...z.keys()])) {
-        if (x.get(k) !== z.get(k) && k !== 'opacity' && !PLACE.test(k)) return false;
+        if (x.get(k) !== z.get(k) && k !== 'opacity' && !PLACE.test(k) && !ENTRANCE.test(k)) return false;
       }
       return true;
     };
@@ -1655,9 +1661,19 @@ function pageClock(cmd, graceMs, afterMs) {
     // goes through it); anything else it changes, shot or not, is put back
     // at once, so a loop that only animates (a word roll, a parallax, a
     // background slideshow) stays as still as when it was held.
-    const fadeIn = (a, b) => {
+    // Once an element has been seen rising, the rest of its entrance gets
+    // through while its opacity holds (a letter at full opacity still
+    // turning from its tint to the text's colour), for as long as a chain
+    // may answer a scroll.
+    S.entering = new WeakMap();
+    const fadeIn = (a, b, el) => {
       const was = opacityIn(a), is = opacityIn(b);
-      return was != null && is != null && is > was && onlyFade(a, b);
+      if (was == null || is == null || is < was || !onlyFade(a, b)) return false;
+      if (is > was) {
+        if (el) S.entering.set(el, now());
+        return true;
+      }
+      return !!el && now() - (S.entering.get(el) ?? -1e9) < ANSWER_MS;
     };
     const onlyFades = (records, c) => {
       const bottom = Number(document.documentElement.getAttribute('data-cleanshot-shot')) || 0;
@@ -1674,7 +1690,7 @@ function pageClock(cmd, graceMs, afterMs) {
           const cur = t.getAttribute(name);
           if (cur === m.oldValue) continue;
           if (name === 'style' && t instanceof HTMLElement) {
-            if (!fades.has(t)) fades.set(t, fadeIn(m.oldValue, cur));
+            if (!fades.has(t)) fades.set(t, fadeIn(m.oldValue, cur, t));
             if (fades.get(t)) {
               c.lastFade = now();
               const r = t.getBoundingClientRect();

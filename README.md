@@ -112,11 +112,18 @@ declared color values, so photos and gradients-as-images won't muddy the result.
    small mark that grows to its full size) is held at how it looks once
    revealed from the tile that first shows it on. Fades a page plays from
    its own animation loop still play when a tile scrolls them into view,
-   and a number counting up to its value (a "75,000+ customers"
+   along with the tint, blur or shadow that comes in with them (text
+   revealed letter by letter), and a number counting up to its value (a "75,000+ customers"
    statistic) is shot once it has stopped, not part-way.
 4. After the first tile, hides `fixed` overlays and sticky top-navs so they
    appear once at the top instead of repeating. Sticky *content* sections
    (pinned scroll-storytelling) are detected by position and left intact.
+   A bar fixed across the first screen with nothing in it to press (a
+   tagline, a row of client logos) is kept there like the header; cookie
+   boxes, popups and chat buttons, which always have something to press,
+   are hidden. A full-window layer fixed behind the page (a photo, or a
+   canvas the page draws as you scroll) is copied into each stretch of the
+   page it shows through, as it looks with that stretch on screen.
 5. Stitches every tile into one image at your display's native resolution
    and opens it in the editor for crop / format / copy / download.
 
