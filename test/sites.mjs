@@ -1084,6 +1084,41 @@ export const SITES = [
           ok ? [] : [{ y0, y1, note: 'hero video missing' }]);
       }
     }
+  },
+  {
+    // Its headline, then "We embed. We build...", then orbits behind the
+    // cards are drawn on one canvas fixed behind the page; the section for
+    // the statement holds nothing but a screen-reader heading. The tagline
+    // and client logos are bars fixed to the bottom of the first screen.
+    host: 'www.tribe.ai',
+    url: 'https://www.tribe.ai/',
+    collect: () => {
+      const R = (r, y = scrollY) => ({ top: Math.round(r.top + y), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height) });
+      const h2 = [...document.querySelectorAll('h2')].find((e) => /We embed/.test(e.textContent));
+      const section = h2 && h2.closest('section');
+      const tag = [...document.querySelectorAll('body *')].find((e) => getComputedStyle(e).position === 'fixed' && /makes ai work/i.test(e.textContent));
+      return { section: section ? R(section.getBoundingClientRect()) : null, tagline: tag ? R(tag.getBoundingClientRect(), 0) : null };
+    },
+    checks: {
+      'canvas-statement-shown'({ img, facts }) {
+        const b = facts.section;
+        if (!b) return result(false, null, 'the "We embed" section not found on the page');
+        // (Its last 300px run under the next section's heading.)
+        const box = { ...b, h: b.h - 300 };
+        const ink = inkLevel(img, box, 0.001);
+        const ok = ink != null && ink < 100;
+        return result(ok, ink, `darkest marks in the section's ${box.h}px read ${ink} (text drawn on the canvas reads under 100; an empty section about 240)`,
+          ok ? [] : [{ y0: box.top, y1: box.top + box.h, note: 'statement drawn on the fixed canvas missing' }]);
+      },
+      'first-screen-bar-kept'({ img, shot, facts }) {
+        const b = facts.tagline;
+        if (!b) return result(false, null, 'tagline bar not found on the page');
+        const s = showsIn(img, shot, b);
+        const ok = s != null && s >= 0.6;
+        return result(ok, s == null ? null : +s.toFixed(2), `${Math.round((s || 0) * 100)}% of the tagline's marks in the capture (fail under 60%)`,
+          ok ? [] : [{ y0: b.top, y1: b.top + b.h, note: 'first-screen tagline hidden as a floating extra' }]);
+      }
+    }
   }
 ];
 
@@ -1140,6 +1175,8 @@ export const KNOWN = {
   'sticky-heading-twice': 'Sticky column in a slightly taller container shown twice',
   'fixed-background-seam': 'Fixed-attachment background showed a different part of the picture in each tile',
   'clock-released': "Page left frozen after the capture: its slider didn't move again",
+  'canvas-statement-shown': 'Fixed canvas behind the page shown in the first tile only: a section drawn on it left blank',
+  'first-screen-bar-kept': 'Fixed first-screen bar with nothing to press hidden as a floating extra',
   'slider-in-one-shot': 'Slider on a timer set at page load cut by a tile edge (two moments, or right only by luck)',
   'sticky-column-whole': 'Column a script makes sticky hidden as a floating extra: its text lost below a tile edge',
   'header-as-at-scroll-0': "Header's scrolled-state logo held visible over its wordmark at the top of the capture",

@@ -127,6 +127,7 @@
       [data-cleanshot-hide] { visibility: hidden !important; opacity: 0 !important; }
       [data-cleanshot-inflow] { position: absolute !important; top: var(--cleanshot-top) !important; left: var(--cleanshot-left) !important; right: auto !important; bottom: auto !important; width: var(--cleanshot-width) !important; margin: 0 !important; }
       [data-cleanshot-probe] { transition: none !important; }
+      [data-cleanshot-hit], [data-cleanshot-hit] * { pointer-events: auto !important; }
       [data-cleanshot-parallax] { position: absolute !important; transform: none !important; }
       [data-cleanshot-parallax] > * { transform: none !important; }
       [data-cleanshot-unpin] { position: relative !important; inset: 0 auto auto 0 !important; transform: none !important; }
@@ -1210,77 +1211,40 @@
     });
   }
 
-  // A full-screen `fixed` image behind the page (the Noguchi Museum's garden
-  // photo) shows only through an empty stretch between two sections, like
-  // a window. Hidden with the overlays, that stretch comes out blank. Move
-  // the image into the widest such gap, centered, as it looks mid-scroll.
-  // A layer that also shows through above the first section is a hero
-  // backdrop, already caught by the first tile, so it stays put.
-  function placeRevealedBackdrop() {
-    const vw = document.documentElement.clientWidth;
-    const vh = window.innerHeight;
-    const y = scroller.scrollTop;
-    const layer = allElements().find((el) => {
-      const cs = getComputedStyle(el);
-      if (cs.position !== 'fixed' || !(cs.zIndex === 'auto' || Number(cs.zIndex) <= 0)) return false;
-      const r = el.getBoundingClientRect();
-      return r.width >= vw * 0.9 && r.height >= vh * 0.9 && el.parentElement;
-    });
-    if (!layer) return;
-    const boxes = Array.from(layer.parentElement.children)
-      .filter((el) => el !== layer && !/^(fixed|absolute)$/.test(getComputedStyle(el).position))
-      .map((el) => el.getBoundingClientRect())
-      .filter((r) => r.height > 0)
-      .map((r) => ({ top: r.top + y, bottom: r.bottom + y }))
-      .sort((a, b) => a.top - b.top);
-    const parentTop = layer.parentElement.getBoundingClientRect().top + y;
-    if (!boxes.length || boxes[0].top - parentTop >= 100) return;
-    let gap = null;
-    for (let i = 1; i < boxes.length; i++) {
-      const size = boxes[i].top - boxes[i - 1].bottom;
-      if (size >= 100 && (!gap || size > gap.size)) gap = { size, top: boxes[i - 1].bottom };
-    }
-    if (!gap) return;
-    unwrapped.push({ el: layer, style: layer.getAttribute('style') });
-    layer.style.setProperty('position', 'absolute', 'important');
-    layer.style.setProperty('inset', '0 auto auto 0', 'important');
-    layer.style.setProperty('width', '100%', 'important');
-    layer.style.setProperty('height', `${vh}px`, 'important');
-    const placed = layer.getBoundingClientRect().top + y;
-    layer.style.setProperty('top', `${gap.top + gap.size / 2 - vh / 2 - placed}px`, 'important');
-  }
-
-  // A full-screen backdrop behind the first screen (www.maggioroofing.com's
-  // `ul.cb-slideshow`, a fixed crossfading slideshow) is shown in the first
-  // tile and hidden after, so a section that shows it and runs on past the
-  // first screen (that hero is 901px tall in an 868px window) shows the
-  // page's background in its last rows. A visitor scrolling down sees the
-  // backdrop through every part of that section in turn, so it is laid
-  // over the section, from the top of the page to where it stops showing
-  // through, and stays there for every tile. Measured at the stack under
-  // nine points across each row below the first screen: the backdrop shows
-  // where nothing opaque (a background colour, a picture, an image or
-  // video) lies over it. One that shows through for a screen and a half or
-  // more is the whole page's background, not a section's, and is left as
-  // it is.
+  // A full-screen layer fixed behind the page shows through wherever the
+  // page's own flow leaves it bare, and a visitor sees it there, as it looks
+  // with that part of the page on screen. Shown in the first tile and
+  // hidden after, it leaves every such part below the first screen bare.
+  //
+  // Where it runs straight on from the first screen (www.maggioroofing.com's
+  // `ul.cb-slideshow`, a fixed crossfading slideshow behind a hero 901px
+  // tall in an 868px window), a visitor scrolling down sees the rest of it
+  // through the rest of the hero, so it is laid over the page from the top
+  // to where it stops showing through, and stays there for every tile.
+  //
+  // Further down, it is copied in: each stretch it shows through, split at
+  // the page's sections, gets a copy of the layer as it looks with that
+  // stretch in the middle of the screen, cut to the stretch. The way
+  // settleFixedBackgrounds paints a `background-attachment: fixed` picture
+  // with its section. That covers a photo seen through an empty stretch
+  // between two sections (the Noguchi Museum's garden), and a layer that
+  // changes with the scroll (www.tribe.ai draws its headline, then "We
+  // embed. We build." over a section with nothing of its own, then orbits
+  // behind its cards, all on one fixed canvas): each part of the page gets
+  // what was drawn behind it. A stretch where the layer shows nothing (a
+  // menu slid off screen, a canvas with nothing drawn there) gets nothing.
+  //
+  // Where it shows through is found at the stack under nine points across
+  // every 16px row: it shows where nothing opaque in the page's flow (a
+  // background colour, a picture, an image or video) lies over it, at three
+  // points or more. Measured with the layer made hit-testable for the
+  // while: a layer that lets clicks through (`pointer-events: none`, usual
+  // for a decorative one) isn't in the stack otherwise.
   async function extendBackdrops() {
     const vw = document.documentElement.clientWidth;
     const vh = window.innerHeight;
-    // (The root's background is painted under everything, and so is body's
-    // when html has none and body's is painted for it.)
-    const rootBg = getComputedStyle(document.documentElement);
-    const bodyLifted = rootBg.backgroundImage === 'none' && /rgba\(.*,\s*0\)|transparent/.test(rootBg.backgroundColor);
-    const opaque = (e) => {
-      if (e === document.documentElement || (e === document.body && bodyLifted)) return false;
-      if (/^(IMG|VIDEO|CANVAS|IFRAME|PICTURE|OBJECT|EMBED)$/.test(e.tagName)) return true;
-      const cs = getComputedStyle(e);
-      if (cs.visibility === 'hidden' || Number(cs.opacity) < 0.5) return false;
-      if (/url\(/.test(cs.backgroundImage)) return true;
-      const a = cs.backgroundColor.match(/rgba?\(([^)]*)\)/);
-      const parts = a ? a[1].split(/[,\s/]+/).filter(Boolean) : [];
-      return parts.length >= 3 && (parts.length < 4 || Number(parts[3]) >= 0.95);
-    };
-    for (const [el, role] of overlays) {
+    const copied = [];
+    for (const [el, role] of [...overlays]) {
       if (role !== 'backdrop' || !el.isConnected || !(el instanceof HTMLElement)) continue;
       const r0 = el.getBoundingClientRect();
       if (r0.width < vw * 0.9 || r0.height < vh * 0.9 || r0.top > 1) continue;
@@ -1290,21 +1254,17 @@
       await raf();
       const y0 = scroller.scrollTop;
       if (y0 < vh / 2 - 1) break;
-      const shows = (pageY) => {
-        for (let fx = 0.05; fx < 1; fx += 0.1125) {
-          const over = [];
-          for (const e of document.elementsFromPoint(vw * fx, pageY - y0)) {
-            if (e === el || el.contains(e)) { through = over; return true; }
-            if (opaque(e) && !pinnedToScreen(e)) break;
-            over.push(e);
-          }
-        }
-        return false;
-      };
+      el.setAttribute('data-cleanshot-hit', '');
       let through = [];
+      const shows = (pageY) => {
+        const over = showsAt(el, pageY - y0, 1);
+        if (over) through = over;
+        return !!over;
+      };
       const limit = Math.round(y0 + vh - 1);
       let end = vh;
       while (end < limit && shows(end)) end += 2;
+      el.removeAttribute('data-cleanshot-hit');
       // The last rows can show only in a corner narrower than the points
       // are apart (a hero cut by a diagonal): up to the bottom of the box
       // it shows through, when that is just below.
@@ -1314,22 +1274,315 @@
       }
       scroller.scrollTo(0, 0);
       await raf();
-      // Still showing a screen and a half down: the page's background.
-      if (end <= vh + 2 || end >= limit) continue;
-      unwrapped.push({ el, style: el.getAttribute('style') });
-      el.setAttribute('data-cleanshot-probe', '');
-      el.style.setProperty('position', 'absolute', 'important');
-      el.style.setProperty('inset', '0 0 auto 0', 'important');
-      el.style.setProperty('width', '100%', 'important');
-      el.style.setProperty('height', `${end}px`, 'important');
-      el.style.setProperty('transform', 'none', 'important');
-      const placed = el.getBoundingClientRect().top + scroller.scrollTop;
-      if (Math.abs(placed) > 0.5) el.style.setProperty('top', `${-placed}px`, 'important');
-      getComputedStyle(el).top;
-      el.removeAttribute('data-cleanshot-probe');
-      overlays.set(el, 'content');
+      // Still showing a screen and a half down, it is behind the rest of the
+      // page too, not one section's: copied in from the first screen on.
+      if (end >= limit) end = vh;
+      if (end > vh + 2) {
+        unwrapped.push({ el, style: el.getAttribute('style') });
+        el.setAttribute('data-cleanshot-probe', '');
+        el.style.setProperty('position', 'absolute', 'important');
+        el.style.setProperty('inset', '0 0 auto 0', 'important');
+        el.style.setProperty('width', '100%', 'important');
+        el.style.setProperty('height', `${end}px`, 'important');
+        el.style.setProperty('transform', 'none', 'important');
+        const placed = el.getBoundingClientRect().top + scroller.scrollTop;
+        if (Math.abs(placed) > 0.5) el.style.setProperty('top', `${-placed}px`, 'important');
+        getComputedStyle(el).top;
+        el.removeAttribute('data-cleanshot-probe');
+        overlays.set(el, 'content');
+        continue;
+      }
+      copied.push(el);
+    }
+    await copyLayersIn(copied);
+    scroller.scrollTo(0, 0);
+  }
+
+  // (The root's background is painted under everything, and so is body's
+  // when html has none and body's is painted for it.)
+  function opaqueBox(e) {
+    const rootBg = getComputedStyle(document.documentElement);
+    const bodyLifted = rootBg.backgroundImage === 'none' && /rgba\(.*,\s*0\)|transparent/.test(rootBg.backgroundColor);
+    if (e === document.documentElement || (e === document.body && bodyLifted)) return false;
+    if (/^(IMG|VIDEO|CANVAS|IFRAME|PICTURE|OBJECT|EMBED)$/.test(e.tagName)) return true;
+    const cs = getComputedStyle(e);
+    if (cs.visibility === 'hidden' || Number(cs.opacity) < 0.5) return false;
+    if (/url\(/.test(cs.backgroundImage)) return true;
+    const a = cs.backgroundColor.match(/rgba?\(([^)]*)\)/);
+    const parts = a ? a[1].split(/[,\s/]+/).filter(Boolean) : [];
+    return parts.length >= 3 && (parts.length < 4 || Number(parts[3]) >= 0.95);
+  }
+
+  // Whether `layer` shows at `need` or more of nine points across the screen
+  // row `y`, looking through whatever else is pinned to the screen. Returns
+  // what lies over it at the last such point, or null.
+  function showsAt(layer, y, need) {
+    const vw = document.documentElement.clientWidth;
+    let n = 0, last = null;
+    for (let fx = 0.05; fx < 1; fx += 0.1125) {
+      const over = [];
+      for (const e of document.elementsFromPoint(vw * fx, y)) {
+        if (e === layer || layer.contains(e)) { n++; last = over; break; }
+        if (opaqueBox(e) && !pinnedToScreen(e)) break;
+        over.push(e);
+      }
+      if (n >= need) return last;
+    }
+    return null;
+  }
+
+  // Copy each layer in below the first screen (see extendBackdrops). One
+  // walk down the page finds, for all of them at once, the 16px rows each
+  // shows through, and whether it shows anything at all on the way (a menu
+  // parked off the screen, a canvas with nothing drawn: no copies).
+  //
+  // A stretch is split at the page's sections, a sliver under 100px going
+  // with the piece above, and each piece gets one copy, as the layer looks
+  // with the piece in the middle of the screen. A piece taller than the
+  // screen shows the layer only behind its middle, as a section's fixed
+  // picture does (settleFixedBackgrounds).
+  //
+  // Where a copy meets something opaque (the stretch ends at a section with
+  // a background of its own) it ends sharp, a window onto the layer. Where
+  // it runs out in open page (a piece taller than the screen, or one whose
+  // neighbour showed nothing) it fades out over 64px rather than cutting
+  // across what is drawn, and where it meets the next copy, drawn at
+  // another scroll position, the two blend over those 64px.
+  async function copyLayersIn(layers) {
+    if (!layers.length) return;
+    const vh = window.innerHeight;
+    const H = pageHeight();
+    const maxScroll = Math.max(0, H - vh);
+    const ts = performance.now();
+    const found = layers.map((layer) => ({ layer, runs: [], shows: false }));
+    layers.forEach((l) => l.setAttribute('data-cleanshot-hit', ''));
+    let y0 = -Infinity;
+    for (let y = vh; y < H; y += 16) {
+      if (y + 16 > y0 + vh) {
+        scroller.scrollTo(0, Math.min(y, maxScroll));
+        await raf();
+        y0 = scroller.scrollTop;
+        // (Only a layer with something on screen here is looked for
+        // through the page, row by row.)
+        for (const f of found) {
+          f.here = layerShows(f.layer);
+          if (f.here) f.shows = true;
+        }
+      }
+      for (const f of found) {
+        if (!f.here || !showsAt(f.layer, y - y0 + 8, 3)) continue;
+        const run = f.runs[f.runs.length - 1];
+        if (run && run.bottom === y) run.bottom = Math.min(H, y + 16);
+        else f.runs.push({ top: y, bottom: Math.min(H, y + 16) });
+      }
+    }
+    layers.forEach((l) => l.removeAttribute('data-cleanshot-hit'));
+    spentOn('layerScan', ts);
+    const y = scroller.scrollTop;
+    const edges = [...new Set(pageSections().flatMap((sec) => {
+      const r = sec.getBoundingClientRect();
+      return [Math.round(r.top + y), Math.round(r.bottom + y)];
+    }))].sort((a, b) => a - b);
+    for (const { layer, runs, shows } of found) {
+      if (!shows) continue;
+      const pieces = [];
+      for (const run of runs) {
+        const cuts = [run.top, ...edges.filter((e) => e > run.top && e < run.bottom), run.bottom];
+        for (let i = 1; i < cuts.length; i++) {
+          const last = pieces[pieces.length - 1];
+          if (last && last.bottom === cuts[i - 1] && cuts[i] - cuts[i - 1] < 100) last.bottom = cuts[i];
+          else pieces.push({ top: cuts[i - 1], bottom: cuts[i], opaqueAbove: i === 1, opaqueBelow: false });
+        }
+        pieces[pieces.length - 1].opaqueBelow = true;
+      }
+      // The first screen shows the layer itself, down to where the copies
+      // start.
+      if (pieces.length && pieces[0].top === vh) pieces[0].opaqueAbove = true;
+      const copies = [];
+      for (const piece of pieces) {
+        if (piece.bottom - piece.top < 100) continue;
+        times.layerPieces = (times.layerPieces || 0) + 1;
+        const tw = performance.now();
+        const at = Math.max(0, Math.min(maxScroll, (piece.top + piece.bottom) / 2 - vh / 2));
+        scroller.scrollTo(0, at);
+        await raf();
+        await raf();
+        await sleep(150);
+        await sceneSettles(layer);
+        spentOn('layerSettle', tw);
+        if (!layerShows(layer)) continue;
+        const node = layer.cloneNode(true);
+        await copyCanvases(layer, node);
+        const cs = getComputedStyle(layer);
+        const r = layer.getBoundingClientRect();
+        const shown = { top: Math.max(piece.top, at + r.top), bottom: Math.min(piece.bottom, at + r.bottom) };
+        copies.push({ piece, node, at, shown, look: { transform: cs.transform, translate: cs.translate, opacity: cs.opacity } });
+      }
+      // (Two copies that meet blend into each other over the fade, each run
+      // on half of it past where they meet.)
+      const fade = 64;
+      let after = layer;
+      copies.forEach((c, i) => {
+        const meets = (o) => !!o && Math.abs(o) < 1;
+        const above = meets(copies[i - 1] && copies[i - 1].shown.bottom - c.shown.top);
+        const below = meets(copies[i + 1] && copies[i + 1].shown.top - c.shown.bottom);
+        const sharpTop = c.shown.top === c.piece.top && c.piece.opaqueAbove;
+        const sharpBottom = c.shown.bottom === c.piece.bottom && c.piece.opaqueBelow;
+        const shown = { top: c.shown.top - (above ? fade / 2 : 0), bottom: c.shown.bottom + (below ? fade / 2 : 0) };
+        after = placeCopy(layer, { ...c, shown }, sharpTop, sharpBottom, fade, after);
+      });
     }
     scroller.scrollTo(0, 0);
+    await sleep(150);
+  }
+
+  // Put a copy of a fixed layer into the page where it sat on screen with
+  // the page scrolled to `at`, showing only the rows `shown`, each end sharp
+  // or faded.
+  function placeCopy(layer, { node, at, shown, look }, sharpTop, sharpBottom, fade, after) {
+    const r = layer.getBoundingClientRect();
+    const sy = scroller.scrollTop;
+    const top = at + r.top;
+    const clipTop = Math.max(0, shown.top - top), clipBottom = Math.max(0, top + r.height - shown.bottom);
+    const a = clipTop + (sharpTop ? 0 : fade), b = r.height - clipBottom - (sharpBottom ? 0 : fade);
+    times.layerCopies = (times.layerCopies || 0) + 1;
+    node.setAttribute('data-cleanshot-clone', '');
+    node.setAttribute('aria-hidden', 'true');
+    for (const [p, v] of [['position', 'absolute'], ['inset', 'auto'], ['top', '0px'], ['left', '0px'],
+      ['width', `${r.width}px`], ['height', `${r.height}px`], ['margin', '0'], ['transform', look.transform],
+      ['translate', look.translate], ['opacity', look.opacity], ['pointer-events', 'none'],
+      ['clip-path', `inset(${clipTop}px 0 ${clipBottom}px 0)`],
+      ['mask-image', `linear-gradient(to bottom, transparent ${clipTop}px, #000 ${a}px, #000 ${b}px, transparent ${r.height - clipBottom}px)`]]) {
+      node.style.setProperty(p, v, 'important');
+    }
+    layer.parentNode.insertBefore(node, after.nextSibling);
+    const placed = node.getBoundingClientRect();
+    node.style.setProperty('top', `${top - (placed.top + sy)}px`, 'important');
+    node.style.setProperty('left', `${r.left - placed.left}px`, 'important');
+    holdCopyStyles(node);
+    return node;
+  }
+
+  // A canvas the page draws on as it scrolls redraws over a few frames as
+  // it eases to the new place. Wait until its picture stops changing, or
+  // has kept changing about as much for 600ms (a drawing that moves on its
+  // own never holds still; a transition still under way changes less and
+  // less, or stops), up to 1.5s.
+  async function sceneSettles(layer) {
+    const canvases = [layer, ...layer.querySelectorAll('canvas')].filter((c) => c.tagName === 'CANVAS');
+    if (!canvases.length) return;
+    let prev = canvasSample(canvases);
+    let was = Infinity, steady = 0;
+    for (let t = 0; prev && t < 1500; t += 100) {
+      await sleep(100);
+      const next = canvasSample(canvases);
+      if (!next) return;
+      let d = 0;
+      for (let i = 0; i < next.length; i++) d += Math.abs(next[i] - prev[i]);
+      d /= next.length;
+      prev = next;
+      if (d < 1) return;
+      steady = d >= was * 0.8 ? steady + 100 : 0;
+      if (steady >= 600) return;
+      was = d;
+    }
+  }
+
+  // Each canvas shrunk to 24x16, RGBA, end to end; null when one can't be
+  // read (drawn from another site).
+  function canvasSample(canvases) {
+    const probe = document.createElement('canvas');
+    probe.width = 24;
+    probe.height = 16;
+    const ctx = probe.getContext('2d', { willReadFrequently: true });
+    const out = [];
+    try {
+      for (const c of canvases) {
+        ctx.clearRect(0, 0, 24, 16);
+        if (c.width && c.height) ctx.drawImage(c, 0, 0, 24, 16);
+        out.push(...ctx.getImageData(0, 0, 24, 16).data);
+      }
+    } catch (_) {
+      return null;
+    }
+    return out;
+  }
+
+  // Whether a layer shows anything on screen now: some part of it, not
+  // hidden or faded out, that paints (text, a picture, a background, a
+  // canvas with something drawn on it). Not counting what floats over the
+  // page inside it: a layer that only holds popups (nuu.no's Angular
+  // overlay container, a modal and its dimming) shows nothing of its own.
+  function layerShows(layer) {
+    const vw = document.documentElement.clientWidth;
+    const vh = window.innerHeight;
+    const seen = (e) => !e.checkVisibility || e.checkVisibility({ opacityProperty: true, visibilityProperty: true });
+    if (!seen(layer)) return false;
+    const floats = (e) => {
+      for (let a = e; a && a !== layer; a = a.parentElement) {
+        if (a.matches(DIALOG) || overlays.get(a) === 'extra' || a.hasAttribute('data-cleanshot-hide')) return true;
+      }
+      return false;
+    };
+    for (const e of [layer, ...layer.querySelectorAll('*')]) {
+      const r = e.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2 || r.right <= 0 || r.left >= vw || r.bottom <= 0 || r.top >= vh || !seen(e) || floats(e)) continue;
+      if (e.tagName === 'CANVAS') {
+        const px = canvasSample([e]);
+        if (!px || px.some((v, i) => i % 4 === 3 && v > 0)) return true;
+        continue;
+      }
+      if (/^(IMG|VIDEO|svg|PICTURE|IFRAME)$/.test(e.tagName)) return true;
+      if (Array.from(e.childNodes).some((n) => n.nodeType === 3 && n.textContent.trim())) return true;
+      const cs = getComputedStyle(e);
+      if (cs.backgroundImage !== 'none' || !/rgba\([^)]*,\s*0\)|transparent/.test(cs.backgroundColor)) return true;
+    }
+    return false;
+  }
+
+  // A copy of an element shows its canvases blank: their pictures aren't
+  // part of the DOM. Draw each into its copy. (A WebGL canvas keeps its
+  // picture only through the frame that drew it, so this runs in a frame
+  // callback, after the page's own.)
+  function copyCanvases(from, to) {
+    const all = (e) => [e, ...e.querySelectorAll('canvas')].filter((c) => c.tagName === 'CANVAS');
+    const src = all(from), dst = all(to);
+    if (!src.length) return Promise.resolve();
+    return new Promise((resolve) => requestAnimationFrame(() => {
+      src.forEach((c, i) => {
+        const d = dst[i];
+        if (!d || !c.width || !c.height) return;
+        d.width = c.width;
+        d.height = c.height;
+        try { d.getContext('2d').drawImage(c, 0, 0); } catch (_) {}
+      });
+      resolve();
+    }));
+  }
+
+  // The page's script can find a copy too and restyle it as it goes
+  // (agcsf.com's slides every row of photos it can find, every frame), so
+  // the copy's inline styles, as they stand, are held through the
+  // stylesheet, where the script's inline writes lose. With `looks` (each
+  // part's opacity and visibility, in document order) the parts keep how
+  // they looked too: a script that swaps pictures by inline opacity.
+  function holdCopyStyles(node, looks) {
+    const parts = Array.from(node.querySelectorAll('*'));
+    const list = looks ? [node, ...parts] : [node, ...node.querySelectorAll('[style]')];
+    const rules = list.map((c) => {
+      const id = String(clones.length);
+      clones.push(c);
+      c.setAttribute('data-cleanshot-cid', id);
+      const props = Array.from(c.style);
+      let decl = props.map((p) => `${p}: ${c.style.getPropertyValue(p)} !important;`).join(' ');
+      const look = looks && c !== node ? looks[parts.indexOf(c)] : null;
+      if (look) {
+        if (!props.includes('opacity')) decl += ` opacity: ${look[0]} !important;`;
+        if (!props.includes('visibility')) decl += ` visibility: ${look[1]} !important;`;
+      }
+      return `[data-cleanshot-cid="${id}"] { ${decl} }`;
+    });
+    styleEl.textContent += `\n${rules.join('\n')}`;
   }
 
   // Scroll through the whole page (top→bottom) once to trigger
@@ -1467,6 +1720,7 @@
 
   const DIALOG = 'dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"]';
   const NAV = 'nav, header, [role="navigation"], [role="banner"]';
+  const CLICKABLE = 'a[href], button, input, select, textarea, iframe, [role="button"], [role="link"], [onclick], [tabindex]:not([tabindex="-1"])';
 
   const shows = (el) => {
     const r = el.getBoundingClientRect();
@@ -1549,7 +1803,25 @@
     // promo). Cookie boxes, chat windows and popups that big are stacked
     // far above everything else.
     if (r.width * r.height >= vw * vh * 0.2 && stackLevel(el) <= 10 && !isScrimOrDialog(el)) return 'backdrop';
+    // A bar across the screen with nothing in it to press or type into
+    // (www.tribe.ai's tagline and row of client logos, fixed to the bottom
+    // of the window) is part of the first screen's design. Cookie and
+    // consent boxes, popups, promo bars, chat and call buttons all have
+    // something to press.
+    if (r.width >= vw * 0.5 && !isScrimOrDialog(el) && !pressable(el)) return 'backdrop';
     return 'extra';
+  }
+
+  // Whether anything in an element can be pressed or typed into: a link, a
+  // button, a field, or anything the page shows a pointer over (a "button"
+  // made of a div with a click handler).
+  function pressable(el) {
+    if (el.matches(CLICKABLE) || el.querySelector(CLICKABLE)) return true;
+    const all = [el, ...el.querySelectorAll('*')];
+    for (let i = 0; i < all.length && i < 300; i++) {
+      if (getComputedStyle(all[i]).cursor === 'pointer') return true;
+    }
+    return false;
   }
 
   // A full-screen layer stacked over the page that paints nothing itself,
@@ -2018,6 +2290,7 @@
         times.filmStages = (times.filmStages || 0) + 1;
         const tc = performance.now();
         const stage = { at: off + travel * k / (n - 1), node: frame.cloneNode(true) };
+        await copyCanvases(frame, stage.node);
         // The panel's own look and place at this stage, for the copies (see
         // below).
         // (Its place is read with its own transform off: the copies carry
@@ -2084,27 +2357,8 @@
           ['opacity', String(rest.opacity)], ['transform', rest.transform], ['translate', rest.translate]]) {
           node.style.setProperty(p, v, 'important');
         }
-        // The page's script finds the copies too and moves them on with the
-        // scroll (agcsf.com's slides every row of photos it can find, every
-        // frame), so each copy's styles as copied are held through the
-        // stylesheet, where the script's inline writes lose.
-        // A panel's parts keep how they looked at that stage as well.
-        const parts = Array.from(node.querySelectorAll('*'));
-        const list = looks ? [node, ...parts] : [node, ...node.querySelectorAll('[style]')];
-        const rules = list.map((c) => {
-          const id = String(clones.length);
-          clones.push(c);
-          c.setAttribute('data-cleanshot-cid', id);
-          const props = Array.from(c.style);
-          let decl = props.map((p) => `${p}: ${c.style.getPropertyValue(p)} !important;`).join(' ');
-          const look = looks && c !== node ? looks[parts.indexOf(c)] : null;
-          if (look) {
-            if (!props.includes('opacity')) decl += ` opacity: ${look[0]} !important;`;
-            if (!props.includes('visibility')) decl += ` visibility: ${look[1]} !important;`;
-          }
-          return `[data-cleanshot-cid="${id}"] { ${decl} }`;
-        });
-        styleEl.textContent += `\n${rules.join('\n')}`;
+        // (Its parts keep how they looked at that stage as well.)
+        holdCopyStyles(node, looks);
         parent.insertBefore(node, after.nextSibling);
         after = node;
       }
@@ -2526,7 +2780,6 @@
           lap('fixedBackgrounds');
           settleOverlays();
           holdFades();
-          placeRevealedBackdrop();
           findStickyHeaders(); // measured at scroll 0, after preScroll settles
           sortOverlays(true);
           lap('overlays');
